@@ -1,0 +1,15 @@
+{
+  "name": "limem",
+  "version": "0.1.0",
+  "description": "LiMem long-term memory for Codex — auto-recall rules, facts, and preferences across sessions and projects.",
+  "author": "gaooooosh",
+  "homepage": "https://limem.gaooooosh.art",
+  "license": "MIT",
+  "skills": "skills/",
+  "mcpServers": {
+    "limem": {
+      "command": "limem-mcp",
+      "args": []
+    }
+  }
+}

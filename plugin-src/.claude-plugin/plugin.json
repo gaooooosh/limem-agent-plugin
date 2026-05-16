@@ -1,0 +1,37 @@
+{
+  "name": "limem",
+  "version": "0.1.0",
+  "description": "LiMem long-term memory for Claude Code — auto-recall rules, facts, and preferences across sessions and projects.",
+  "author": "gaooooosh",
+  "homepage": "https://limem.gaooooosh.art",
+  "license": "MIT",
+  "skills": "skills/",
+  "hooks": {
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "limem hook claude-code UserPromptSubmit"}]}
+    ],
+    "SessionStart": [
+      {"matcher": "startup|resume", "hooks": [{"type": "command", "command": "limem hook claude-code SessionStart"}]}
+    ],
+    "SessionEnd": [
+      {"hooks": [{"type": "command", "command": "limem hook claude-code SessionEnd"}]}
+    ],
+    "PreCompact": [
+      {"hooks": [{"type": "command", "command": "limem hook claude-code PreCompact"}]}
+    ],
+    "PostToolUse": [
+      {"matcher": "Edit|Write|NotebookEdit", "hooks": [{"type": "command", "command": "limem hook claude-code PostToolUse"}]}
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "limem-statusline",
+    "padding": 0
+  },
+  "mcpServers": {
+    "limem": {
+      "command": "limem-mcp",
+      "args": []
+    }
+  }
+}

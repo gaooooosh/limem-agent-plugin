@@ -1,0 +1,11 @@
+{
+  "UserPromptSubmit": [
+    {"hooks": [{"type": "command", "command": "limem hook codex UserPromptSubmit"}]}
+  ],
+  "SessionStart": [
+    {"hooks": [{"type": "command", "command": "limem hook codex SessionStart"}]}
+  ],
+  "Stop": [
+    {"hooks": [{"type": "command", "command": "limem hook codex Stop"}]}
+  ]
+}

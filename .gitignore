@@ -1,0 +1,64 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+pip-wheel-metadata/
+.python-version
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- 工具缓存 ----------
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# ---------- IDE / 编辑器 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# ---------- macOS / Windows ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- LiMem 本地工件 ----------
+*.limem-bak
+.limem/local.json
+.limem-bak/
+
+# ---------- spec-workflow 工作区（含本地任务状态，不入库） ----------
+.spec-workflow/
+
+# ---------- 凭证 / 环境变量 ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# ---------- 临时与日志 ----------
+*.log
+*.tmp
+*.bak
+tmp/
