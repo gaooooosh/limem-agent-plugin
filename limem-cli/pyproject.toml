@@ -39,6 +39,12 @@ limem-statusline = "limem.statusline:main"
 [tool.hatch.build.targets.wheel]
 packages = ["limem"]
 
+# 把仓库根的 plugin-src/skills/ 打到 wheel/sdist 内的 limem/skills/
+# —— installer._bundled_skills_dir() 的第二候选 here.parent / "skills" 由此命中。
+# 顶层 force-include 同时作用于 wheel 与 sdist，避免漏 sdist 场景。
+[tool.hatch.build.force-include]
+"../plugin-src/skills" = "limem/skills"
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
