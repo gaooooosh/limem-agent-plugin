@@ -105,6 +105,33 @@ def test_remember_writes_event_but_no_entity_registration(monkeypatch, tmp_path)
     assert meta.raw_metadata.get("original_text", "").startswith("禁用 npm run dev")
 
 
+def test_remember_ingest_detail_is_natural_context(monkeypatch, tmp_path) -> None:
+    fake = _FakeClient()
+    _patch(monkeypatch, fake)
+    idx = EntityIndex(db_path=tmp_path / "patterns.sqlite")
+
+    remember_impl(
+        text="禁止直接启动本地 dev server。",
+        scope="project:foo/bar",
+        mem_type="rule",
+        importance=0.9,
+        project_id="foo/bar",
+        session_id="sess_1",
+        source="codex:test",
+        detail="用户明确要求 Docker 优先。",
+        creds=_FakeCreds(),
+        idx=idx,
+        skip_redact=True,
+    )
+
+    detail = fake.ingest_calls[0]["detail"]
+    assert "现在的情况是：" in detail
+    assert "当前项目是 foo/bar" in detail
+    assert "工具来源是 codex:test" in detail
+    assert "会话是 sess_1" in detail
+    assert "具体发生的内容是：用户明确要求 Docker 优先。" in detail
+
+
 def test_ten_consecutive_remembers_do_not_inflate_entities(monkeypatch, tmp_path) -> None:
     """连续 10 次 remember 不同 canonical，后端 entity 注册次数仍是 0。"""
     fake = _FakeClient()

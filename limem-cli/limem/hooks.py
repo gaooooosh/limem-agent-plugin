@@ -37,6 +37,7 @@ from .daemon.state import (
     is_degraded_banner_emitted_on_disk,
     read_pause_from_disk,
 )
+from .daemon.writer import build_natural_detail
 from .entity_index import EntityIndex, PrincipalRow
 from .injector import (
     Budgets,
@@ -562,20 +563,33 @@ def _hook_session_end(
     if not creds.api_key or not creds.db_id:
         _log("session_end_skipped", tool, reason="no creds")
         return
+    ts = int(time.time())
+    scope = project_scope()
+    source = f"{tool}:hook:SessionEnd"
+    text = payload.get("transcript_head", "")[:500]
     summary = {
-        "limem_scope": project_scope(),
+        "limem_scope": scope,
         "limem_type": "session_summary",
         "project_id": project_id,
         "session_id": session_id,
-        "source": f"{tool}:hook:SessionEnd",
+        "source": source,
         "importance": 0.3,
-        "text": payload.get("transcript_head", "")[:500],
-        "detail": payload.get("detail") or "",
+        "text": text,
+        "detail": build_natural_detail(
+            text=text,
+            detail=payload.get("detail") or text,
+            scope=scope,
+            mem_type="session_summary",
+            project_id=project_id,
+            session_id=session_id,
+            source=source,
+            timestamp=ts,
+        ),
         "raw_payload_keys": list(payload.keys()),
     }
     client = LimemClient(creds=creds)
     try:
-        res = client.ingest(summary)
+        res = client.ingest(summary, timestamp=ts)
         daemon_client.set_connectivity(status=200, ok=True)
         _log("session_end", tool, event_id=res.event_id)
     except LimemError as e:
@@ -617,18 +631,33 @@ def _flush_codex_session(buf: Path, creds: Credentials, tool: str) -> None:
         return
     events = [json.loads(line) for line in lines if line.strip()]
     sid = buf.stem
+    ts = int(time.time())
+    scope = project_scope()
+    project_id = detect_project_id()
+    source = f"{tool}:stop_flush"
+    text = f"Codex session {sid}, {len(events)} turns"
+    detail = f"first_turn_ts={events[0]['ts']} last_turn_ts={events[-1]['ts']}"
     summary_payload = {
-        "limem_scope": project_scope(),
+        "limem_scope": scope,
         "limem_type": "session_summary",
-        "project_id": detect_project_id(),
+        "project_id": project_id,
         "session_id": sid,
-        "source": f"{tool}:stop_flush",
+        "source": source,
         "importance": 0.3,
-        "text": f"Codex session {sid}, {len(events)} turns",
-        "detail": f"first_turn_ts={events[0]['ts']} last_turn_ts={events[-1]['ts']}",
+        "text": text,
+        "detail": build_natural_detail(
+            text=text,
+            detail=detail,
+            scope=scope,
+            mem_type="session_summary",
+            project_id=project_id,
+            session_id=sid,
+            source=source,
+            timestamp=ts,
+        ),
     }
     try:
-        LimemClient(creds=creds).ingest(summary_payload)
+        LimemClient(creds=creds).ingest(summary_payload, timestamp=ts)
         daemon_client.set_connectivity(status=200, ok=True)
         _log("stop_flush", tool, buffer=str(buf), turns=len(events))
         session_mute.clear(sid)

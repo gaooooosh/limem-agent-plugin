@@ -17,6 +17,8 @@ v3 设计要点（principal-centric）：
 from __future__ import annotations
 
 import time
+from datetime import datetime
+from datetime import timezone
 from typing import Any
 
 from ..client import LimemClient, LimemError, PatternRecallResult
@@ -25,6 +27,42 @@ from ..entity_index import EntityIndex
 from ..principals import ensure_default_principals
 from ..redact import contains_secret
 from ..tag_text import encode_tags
+
+
+def build_natural_detail(
+    *,
+    text: str,
+    detail: str = "",
+    scope: str = "",
+    mem_type: str = "",
+    project_id: str = "",
+    session_id: str = "",
+    source: str = "",
+    timestamp: int | None = None,
+) -> str:
+    """Build a human-readable detail field for LiMem ingest.
+
+    The service consumes ``detail`` as natural context, so keep it prose-like
+    while still including enough provenance to understand the event later.
+    """
+    ts = timestamp if timestamp is not None else int(time.time())
+    time_text = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    project = project_id or (scope.split(":", 1)[1] if scope.startswith("project:") else "")
+    scope_desc = scope or "unknown"
+    source_desc = source or "unknown"
+    type_desc = mem_type or "memory"
+    content = (detail or text or "").strip()
+
+    context_parts = [f"时间为 {time_text}"]
+    if project:
+        context_parts.append(f"当前项目是 {project}")
+    context_parts.append(f"记忆范围是 {scope_desc}")
+    if session_id:
+        context_parts.append(f"会话是 {session_id}")
+    context_parts.append(f"工具来源是 {source_desc}")
+
+    body = f"具体发生的内容是：{content}" if content else "具体发生的内容暂未提供。"
+    return f"现在的情况是：{'，'.join(context_parts)}。这是一条 {type_desc} 类型的 LiMem 记忆。{body}"
 
 
 def _infer_principal_ids(
@@ -152,6 +190,7 @@ def remember_impl(
     )
     composed_text = f"{tag_block} {text}".strip()
 
+    ts = int(time.time())
     data = {
         "source": source,
         "limem_scope": scope,
@@ -160,9 +199,17 @@ def remember_impl(
         "session_id": session_id,
         "importance": importance,
         "text": composed_text,
-        "detail": detail or text,
+        "detail": build_natural_detail(
+            text=text,
+            detail=detail,
+            scope=scope,
+            mem_type=mem_type,
+            project_id=project_id,
+            session_id=session_id,
+            source=source,
+            timestamp=ts,
+        ),
     }
-    ts = int(time.time())
     ingest_res = client.ingest(data, timestamp=ts)
     event_id = ingest_res.event_id
 
