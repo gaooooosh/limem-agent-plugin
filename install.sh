@@ -385,12 +385,13 @@ run_init() {
     return
   fi
 
-  local init_args=()
-  if [[ "$INSTALL_TARGETS" != "auto" ]]; then
-    init_args+=(--targets "$INSTALL_TARGETS")
+  if [[ "$INSTALL_TARGETS" == "auto" ]]; then
+    limem init
+  else
+    limem init --targets "$INSTALL_TARGETS"
   fi
-
-  if ! limem init "${init_args[@]}"; then
+  local init_status=$?
+  if (( init_status != 0 )); then
     if [[ "$INSTALL_TARGETS" == "auto" ]]; then
       die "limem init 失败，可手动重试：limem init" 15
     else
