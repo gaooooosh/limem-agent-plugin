@@ -4,7 +4,8 @@
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --api-key sk-xxx
-#   bash install.sh --ref v0.2.0 --no-bootstrap
+#   bash install.sh --target codex --ref v0.2.0 --no-bootstrap
+#   bash install.sh --update --target both
 #
 # 平台：macOS / Linux / WSL；Windows 请用 WSL。
 
@@ -20,8 +21,12 @@ REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}"
 
 REF="main"
 API_KEY="${LIMEM_API_KEY:-}"
+API_KEY_ARG_SET=0
+ACTION="install"
+INSTALL_TARGETS="auto"
 DO_INIT=1
 DO_BOOTSTRAP=1
+BOOTSTRAP_SET=0
 VERBOSE=0
 
 OS=""
@@ -59,27 +64,58 @@ LiMem Agent Plugin 安装器
 用法：
   curl -fsSL <url> | bash                            # 默认 main，交互式 bootstrap
   curl -fsSL <url> | bash -s -- --api-key sk-xxx     # 一行装完
-  bash install.sh --ref v0.2.0 --no-bootstrap        # 装某 tag，跳过 bootstrap
+  bash install.sh --target codex --no-bootstrap      # 只接入 Codex
+  bash install.sh --target claude-code               # 只接入 Claude Code
+  bash install.sh --target both                      # 同时接入 Claude Code + Codex
+  bash install.sh --update --target both             # 更新 CLI 并刷新两边配置
 
 选项：
   --api-key TOKEN     LiMem API key（也可通过 $LIMEM_API_KEY）
   --ref REF           git 分支或 tag（默认：main）
+  --target TARGET      安装目标：auto / claude-code / codex / both（默认：auto）
+  --targets TARGETS    同 --target；也接受 claude-code,codex
+  --update             更新已安装的 limem-cli，并刷新 hooks / skills（默认不重新 bootstrap）
   --no-init           跳过 limem init
+  --bootstrap          即使 --update 也运行 limem bootstrap
   --no-bootstrap      跳过 limem bootstrap
   --verbose, -v       打印调试信息
   --help, -h          显示本说明
 EOF
 }
 
+normalize_targets() {
+  local raw="${1:-auto}"
+  raw="${raw// /}"
+  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+
+  case "$raw" in
+    ""|auto) echo "auto" ;;
+    claude|claude-code|claudecode) echo "claude-code" ;;
+    codex) echo "codex" ;;
+    both|all|claude-code,codex|codex,claude-code|claude,codex|codex,claude)
+      echo "claude-code,codex"
+      ;;
+    *)
+      die "未知安装目标：$1（可选：auto / claude-code / codex / both）" 2
+      ;;
+  esac
+}
+
 parse_args() {
   while (( $# )); do
     case "$1" in
-      --api-key)        API_KEY="${2:?--api-key 需要一个值}"; shift 2 ;;
-      --api-key=*)      API_KEY="${1#*=}"; shift ;;
+      --api-key)        API_KEY="${2:?--api-key 需要一个值}"; API_KEY_ARG_SET=1; shift 2 ;;
+      --api-key=*)      API_KEY="${1#*=}"; API_KEY_ARG_SET=1; shift ;;
       --ref)            REF="${2:?--ref 需要一个值}"; shift 2 ;;
       --ref=*)          REF="${1#*=}"; shift ;;
+      --target|--targets)
+                         INSTALL_TARGETS="$(normalize_targets "${2:?--target 需要一个值}")"; shift 2 ;;
+      --target=*|--targets=*)
+                         INSTALL_TARGETS="$(normalize_targets "${1#*=}")"; shift ;;
+      --update)         ACTION="update"; shift ;;
       --no-init)        DO_INIT=0; shift ;;
-      --no-bootstrap)   DO_BOOTSTRAP=0; shift ;;
+      --bootstrap)      DO_BOOTSTRAP=1; BOOTSTRAP_SET=1; shift ;;
+      --no-bootstrap)   DO_BOOTSTRAP=0; BOOTSTRAP_SET=1; shift ;;
       --verbose|-v)     VERBOSE=1; shift ;;
       --help|-h)        print_help; exit 0 ;;
       *) die "未知参数：$1（试试 --help）" 2 ;;
@@ -90,12 +126,16 @@ parse_args() {
   if [[ "$REF" == */* ]]; then
     die "ref 不能包含斜杠：$REF（GitHub tarball URL 无法表达带斜杠的 ref）" 2
   fi
+
+  if [[ "$ACTION" == "update" && "$BOOTSTRAP_SET" == "0" && "$API_KEY_ARG_SET" == "0" ]]; then
+    DO_BOOTSTRAP=0
+  fi
 }
 
 print_banner() {
   cat >&2 <<EOF
 ${C_BLUE}┌─────────────────────────────────────────────┐
-│  LiMem Agent Plugin · 一键安装                │
+│  LiMem Agent Plugin · 安装 / 更新              │
 │  ${REPO_URL}                                  │
 └─────────────────────────────────────────────┘${C_RESET}
 EOF
@@ -287,12 +327,18 @@ fetch_source() {
 # ============================================================
 
 install_pkg() {
-  step "安装 limem CLI"
+  if [[ "$ACTION" == "update" ]]; then
+    step "更新 limem CLI"
+  else
+    step "安装 limem CLI"
+  fi
 
   local already_installed=0
   if "$PIPX" list 2>/dev/null | grep -q 'package limem-cli '; then
     already_installed=1
     warn "检测到已安装的 limem-cli，使用 --force 重建 venv（凭证不变）"
+  elif [[ "$ACTION" == "update" ]]; then
+    warn "未检测到已安装的 limem-cli，本次按全新安装处理"
   fi
 
   if (( already_installed )); then
@@ -327,22 +373,31 @@ run_init() {
     warn "已跳过 limem init（--no-init）"
     return
   fi
-  step "运行 limem init（patch ~/.claude / ~/.codex、铺 skills）"
+  step "运行 limem init（刷新 hooks / MCP / skills）"
 
   local has_claude=0 has_codex=0
   [[ -d "$HOME/.claude" ]] && has_claude=1
   [[ -d "$HOME/.codex"  ]] && has_codex=1
 
-  if (( ! has_claude && ! has_codex )); then
+  if [[ "$INSTALL_TARGETS" == "auto" ]] && (( ! has_claude && ! has_codex )); then
     warn "未检测到 ~/.claude 与 ~/.codex"
     warn "limem CLI 已就绪。请先安装 Claude Code 或 Codex CLI，再手动跑：limem init"
     return
   fi
 
-  if ! limem init; then
-    die "limem init 失败，可手动重试：limem init" 15
+  local init_args=()
+  if [[ "$INSTALL_TARGETS" != "auto" ]]; then
+    init_args+=(--targets "$INSTALL_TARGETS")
   fi
-  ok "init 完成（claude=$has_claude, codex=$has_codex）"
+
+  if ! limem init "${init_args[@]}"; then
+    if [[ "$INSTALL_TARGETS" == "auto" ]]; then
+      die "limem init 失败，可手动重试：limem init" 15
+    else
+      die "limem init 失败，可手动重试：limem init --targets $INSTALL_TARGETS" 15
+    fi
+  fi
+  ok "init 完成（targets=$INSTALL_TARGETS, detected claude=$has_claude, codex=$has_codex）"
 }
 
 # ============================================================
@@ -391,9 +446,11 @@ EOF
 # ============================================================
 
 print_next_steps() {
+  local done_word="安装"
+  [[ "$ACTION" == "update" ]] && done_word="更新"
   cat >&2 <<EOF
 
-${C_GREEN}✓ LiMem Agent Plugin 安装完成${C_RESET}
+${C_GREEN}✓ LiMem Agent Plugin ${done_word}完成${C_RESET}
 
 下一步：
   • 重启 Claude Code / Codex 会话，让 SessionStart hook 注入 LiMem skills

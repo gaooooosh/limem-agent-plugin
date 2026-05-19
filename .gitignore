@@ -62,3 +62,5 @@ credentials.json
 *.tmp
 *.bak
 tmp/
+docs/prd-unobtrusive-memory.md
+CLAUDE.md

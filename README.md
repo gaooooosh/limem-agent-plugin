@@ -139,8 +139,24 @@ curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/i
 2. 验证 Python 3.10+。
 3. 安装或复用 `pipx`。
 4. 安装 `limem-cli`。
-5. Patch Claude Code 与 Codex 配置，接入 hooks、MCP server、statusline 和 skills。
+5. 按目标 patch Claude Code 和/或 Codex 配置，接入 hooks、MCP server、statusline 和 skills。
 6. 进入 `limem bootstrap`，配置 LiMem API Key 与数据库。
+
+默认会自动检测本机已有的 `~/.claude` / `~/.codex`。也可以显式选择安装目标：
+
+```bash
+# 只安装 Claude Code 接入
+curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh \
+  | bash -s -- --target claude-code
+
+# 只安装 Codex 接入
+curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh \
+  | bash -s -- --target codex
+
+# 两边同时安装
+curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh \
+  | bash -s -- --target both
+```
 
 ### 非交互安装
 
@@ -167,9 +183,29 @@ curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/i
 |---|---|
 | `--api-key TOKEN` | 传给 `limem bootstrap`，跳过交互输入。 |
 | `--ref REF` | 安装指定分支或 tag，默认 `main`。 |
+| `--target TARGET` | 安装目标：`auto`、`claude-code`、`codex`、`both`。默认 `auto`。 |
+| `--targets TARGETS` | 同 `--target`，也接受 `claude-code,codex`。 |
+| `--update` | 更新已安装的 `limem-cli`，并刷新已选目标的 hooks、MCP 和 skills。默认不重新 bootstrap。 |
 | `--no-init` | 只安装 CLI，不 patch Claude Code / Codex 配置。 |
+| `--bootstrap` | 与 `--update` 一起使用时，强制重新运行 `limem bootstrap`。 |
 | `--no-bootstrap` | 跳过 LiMem API Key 初始化。 |
 | `--verbose` | 输出安装调试信息。 |
+
+### 更新
+
+```bash
+# 更新 CLI，自动刷新已检测到的 Agent 接入配置
+curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh \
+  | bash -s -- --update
+
+# 更新并强制刷新 Claude Code + Codex 两边配置
+curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh \
+  | bash -s -- --update --target both
+
+# 更新后重新验证/选择 LiMem db
+curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh \
+  | bash -s -- --update --bootstrap
+```
 
 ---
 
