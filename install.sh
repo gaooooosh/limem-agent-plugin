@@ -346,17 +346,7 @@ fetch_source() {
 # ============================================================
 
 read_target_version() {
-  TARGET_VERSION="$("$PYTHON" - "$SRC_DIR/pyproject.toml" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-text = Path(sys.argv[1]).read_text(encoding="utf-8")
-match = re.search(r'(?m)^version\s*=\s*["\']([^"\']+)["\']', text)
-if match:
-    print(match.group(1))
-PY
-)"
+  TARGET_VERSION="$(sed -nE "s/^[[:space:]]*version[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\\1/p" "$SRC_DIR/pyproject.toml" | head -n 1 || true)"
   [[ -n "$TARGET_VERSION" ]] || TARGET_VERSION="未知"
 }
 
