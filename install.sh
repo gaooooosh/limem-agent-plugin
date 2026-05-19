@@ -28,6 +28,7 @@ DO_INIT=1
 DO_BOOTSTRAP=1
 BOOTSTRAP_SET=0
 VERBOSE=0
+DRY_RUN=0
 
 OS=""
 ARCH=""
@@ -35,6 +36,8 @@ PYTHON=""
 PIPX=""
 WORKDIR=""
 SRC_DIR=""
+INSTALLED_VERSION=""
+TARGET_VERSION=""
 
 # ============================================================
 # 输出 / 颜色（仅 stderr 是 tty 时上色）
@@ -48,9 +51,9 @@ else
 fi
 
 step() { printf "%s==>%s %s\n" "$C_BLUE"   "$C_RESET" "$*" >&2; }
-ok()   { printf "%s ✓ %s %s\n" "$C_GREEN"  "$C_RESET" "$*" >&2; }
-warn() { printf "%s ! %s %s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
-die()  { printf "%s ✗ %s %s\n" "$C_RED"    "$C_RESET" "$*" >&2; exit "${2:-1}"; }
+ok()   { printf "%s[OK]%s %s\n" "$C_GREEN"  "$C_RESET" "$*" >&2; }
+warn() { printf "%s[!]%s %s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf "%s[ERR]%s %s\n" "$C_RED"   "$C_RESET" "$*" >&2; exit "${2:-1}"; }
 dbg()  { (( VERBOSE )) && printf "%s[debug]%s %s\n" "$C_DIM" "$C_RESET" "$*" >&2 || true; }
 
 # ============================================================
@@ -78,6 +81,7 @@ LiMem Agent Plugin 安装器
   --no-init           跳过 limem init
   --bootstrap          即使 --update 也运行 limem bootstrap
   --no-bootstrap      跳过 limem bootstrap
+  --dry-run           只检测环境、下载源码并显示版本计划，不安装
   --verbose, -v       打印调试信息
   --help, -h          显示本说明
 EOF
@@ -116,6 +120,7 @@ parse_args() {
       --no-init)        DO_INIT=0; shift ;;
       --bootstrap)      DO_BOOTSTRAP=1; BOOTSTRAP_SET=1; shift ;;
       --no-bootstrap)   DO_BOOTSTRAP=0; BOOTSTRAP_SET=1; shift ;;
+      --dry-run)        DRY_RUN=1; shift ;;
       --verbose|-v)     VERBOSE=1; shift ;;
       --help|-h)        print_help; exit 0 ;;
       *) die "未知参数：$1（试试 --help）" 2 ;;
@@ -134,10 +139,9 @@ parse_args() {
 
 print_banner() {
   cat >&2 <<EOF
-${C_BLUE}┌─────────────────────────────────────────────┐
-│  LiMem Agent Plugin · 安装 / 更新              │
-│  ${REPO_URL}                                  │
-└─────────────────────────────────────────────┘${C_RESET}
+${C_BLUE}LiMem Agent Plugin - 安装 / 更新${C_RESET}
+${C_DIM}${REPO_URL}${C_RESET}
+
 EOF
 }
 
@@ -231,27 +235,30 @@ ensure_python() {
 # ensure_pipx
 # ============================================================
 
-ensure_pipx() {
-  step "检查 pipx"
+detect_existing_pipx() {
   if command -v pipx >/dev/null 2>&1; then
     PIPX="$(command -v pipx)"
-    ok "pipx：$PIPX"
     return
   fi
 
-  # 已装但 PATH 未刷新
   local user_base
   user_base="$("$PYTHON" -m site --user-base 2>/dev/null || echo "")"
   if [[ -n "$user_base" && -x "$user_base/bin/pipx" ]]; then
-    warn "检测到 $user_base/bin/pipx，但 PATH 暂未包含；本次会话内联注入"
     export PATH="$user_base/bin:$PATH"
     PIPX="$user_base/bin/pipx"
+  fi
+}
+
+ensure_pipx() {
+  step "检查 pipx"
+  detect_existing_pipx
+  if [[ -n "$PIPX" ]]; then
     ok "pipx：$PIPX"
     return
   fi
 
   warn "未找到 pipx，开始安装"
-  local pip_out
+  local pip_out user_base
   if ! pip_out="$("$PYTHON" -m pip install --user pipx 2>&1)"; then
     if printf '%s' "$pip_out" | grep -q 'externally-managed-environment'; then
       die "当前发行版禁止 pip --user 直接装包（PEP 668）。请改用系统包：
@@ -299,15 +306,27 @@ fetch_source() {
   local tarball_url
   local downloaded=0
 
-  tarball_url="${REPO_URL}/archive/refs/heads/${REF}.tar.gz"
+  tarball_url="https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/${REF}"
   if curl -fsSL "$tarball_url" -o "$WORKDIR/src.tar.gz" 2>/dev/null; then
     downloaded=1
-    dbg "命中分支 tarball：$tarball_url"
+    dbg "命中分支 codeload：$tarball_url"
   else
-    tarball_url="${REPO_URL}/archive/refs/tags/${REF}.tar.gz"
+    tarball_url="https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/tags/${REF}"
     if curl -fsSL "$tarball_url" -o "$WORKDIR/src.tar.gz" 2>/dev/null; then
       downloaded=1
-      dbg "命中 tag tarball：$tarball_url"
+      dbg "命中 tag codeload：$tarball_url"
+    else
+      tarball_url="${REPO_URL}/archive/refs/heads/${REF}.tar.gz"
+      if curl -fL "$tarball_url" -o "$WORKDIR/src.tar.gz"; then
+        downloaded=1
+        dbg "命中分支 archive：$tarball_url"
+      else
+        tarball_url="${REPO_URL}/archive/refs/tags/${REF}.tar.gz"
+        if curl -fL "$tarball_url" -o "$WORKDIR/src.tar.gz"; then
+          downloaded=1
+          dbg "命中 tag archive：$tarball_url"
+        fi
+      fi
     fi
   fi
   (( downloaded )) || die "下载源码失败：${REPO_URL} @ ${REF}（既不是分支也不是 tag？）" 13
@@ -320,6 +339,54 @@ fetch_source() {
   [[ -n "$pkg_pyproject" ]] || die "源码结构异常：找不到 limem-cli/pyproject.toml" 13
   SRC_DIR="$(dirname "$pkg_pyproject")"
   ok "源码：$SRC_DIR"
+}
+
+# ============================================================
+# show_version_plan
+# ============================================================
+
+read_target_version() {
+  TARGET_VERSION="$("$PYTHON" - "$SRC_DIR/pyproject.toml" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r'(?m)^version\s*=\s*["\']([^"\']+)["\']', text)
+if match:
+    print(match.group(1))
+PY
+)"
+  [[ -n "$TARGET_VERSION" ]] || TARGET_VERSION="未知"
+}
+
+read_installed_version() {
+  INSTALLED_VERSION=""
+  if command -v limem >/dev/null 2>&1; then
+    INSTALLED_VERSION="$(limem --version 2>/dev/null | sed -E 's/.* ([0-9][^[:space:]]*)$/\1/' || true)"
+  fi
+
+  if [[ -z "$INSTALLED_VERSION" && -z "${PIPX:-}" ]]; then
+    detect_existing_pipx
+  fi
+  if [[ -z "$INSTALLED_VERSION" && -n "${PIPX:-}" ]]; then
+    INSTALLED_VERSION="$("$PIPX" list 2>/dev/null | sed -nE 's/.*package limem-cli ([^, ]+).*/\1/p' | head -n 1 || true)"
+  fi
+
+  [[ -n "$INSTALLED_VERSION" ]] || INSTALLED_VERSION="未安装"
+}
+
+show_version_plan() {
+  read_installed_version
+  read_target_version
+
+  if [[ "$ACTION" == "update" ]]; then
+    step "版本计划"
+  else
+    step "安装版本"
+  fi
+  printf "    当前版本：%s\n" "$INSTALLED_VERSION" >&2
+  printf "    目标版本：%s (ref=%s)\n" "$TARGET_VERSION" "$REF" >&2
 }
 
 # ============================================================
@@ -451,13 +518,13 @@ print_next_steps() {
   [[ "$ACTION" == "update" ]] && done_word="更新"
   cat >&2 <<EOF
 
-${C_GREEN}✓ LiMem Agent Plugin ${done_word}完成${C_RESET}
+${C_GREEN}[DONE] LiMem Agent Plugin ${done_word}完成${C_RESET}
 
 下一步：
-  • 重启 Claude Code / Codex 会话，让 SessionStart hook 注入 LiMem skills
-  • 试说一句 "remember 我用 pnpm 不用 npm" 验证记忆链路
-  • 查看已存规则：${C_BLUE}/limem.list${C_RESET}
-  • 文档：${C_BLUE}${REPO_URL}${C_RESET}
+  - 重启 Claude Code / Codex 会话，让 SessionStart hook 注入 LiMem skills
+  - 试说一句 "remember 我用 pnpm 不用 npm" 验证记忆链路
+  - 查看已存规则：${C_BLUE}/limem.list${C_RESET}
+  - 文档：${C_BLUE}${REPO_URL}${C_RESET}
 
 如果新终端找不到 limem 命令：
   source ~/.bashrc      # bash
@@ -476,8 +543,15 @@ main() {
   detect_platform
   ensure_curl_tar
   ensure_python
-  ensure_pipx
   fetch_source
+  show_version_plan
+  if (( DRY_RUN )); then
+    warn "dry-run：已停止在安装前"
+    cleanup_workdir
+    trap - EXIT
+    return
+  fi
+  ensure_pipx
   install_pkg
   cleanup_workdir
   trap - EXIT

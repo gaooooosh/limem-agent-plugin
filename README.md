@@ -189,6 +189,7 @@ curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/i
 | `--no-init` | 只安装 CLI，不 patch Claude Code / Codex 配置。 |
 | `--bootstrap` | 与 `--update` 一起使用时，强制重新运行 `limem bootstrap`。 |
 | `--no-bootstrap` | 跳过 LiMem API Key 初始化。 |
+| `--dry-run` | 只检测环境、下载源码并显示当前版本与目标版本，不安装。 |
 | `--verbose` | 输出安装调试信息。 |
 
 ### 更新
