@@ -35,7 +35,7 @@ class FileLock:
             self._fh.close()
             self._fh = None
 
-    def __enter__(self) -> "FileLock":
+    def __enter__(self) -> FileLock:
         if not self.acquire():
             raise BlockingIOError(f"lock held: {self.path}")
         return self

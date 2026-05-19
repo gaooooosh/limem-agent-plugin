@@ -11,7 +11,6 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-
 AGENTS_BEGIN = "<!-- limem:rules begin -->"
 AGENTS_END = "<!-- limem:rules end -->"
 CLAUDE_LINK_LINE = "See AGENTS.md `limem:rules` block for project memory rules managed by LiMem."

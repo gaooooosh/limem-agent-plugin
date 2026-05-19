@@ -103,6 +103,38 @@ def _project_basename(project_id: str) -> str:
     return re.sub(r"-[0-9a-f]{8}$", "", tail)
 
 
+# 跨项目歧义的"本项目/this project"指代词。两处用途：
+# 1) 从 project principal 的 aliases 中**剔除**这些字面量（否则多个项目都自称"本项目"）。
+# 2) 在 remember_impl 写入前把文本内的这些指代词**替换**为当前项目 basename，避免 BM25
+#    索引与召回注入文本里出现指代不明的串。
+_PROJECT_DEICTICS: tuple[str, ...] = ("本项目", "当前项目", "this project")
+
+
+def normalize_project_deictics(
+    text: str,
+    *,
+    project_id: str,
+    basename: str = "",
+) -> str:
+    """把文本中跨项目歧义的指代词替换为当前项目 basename。
+
+    仅在 ``project_id`` 与 ``text`` 均非空时启用；否则原样返回。``basename`` 缺省时按
+    ``_project_basename(project_id)`` 自算，再 fallback 到 ``project_id`` 全串。
+
+    匹配是大小写不敏感的字面量替换；按字面量长度倒序处理，避免短串误吞长串。
+    """
+    if not text or not project_id:
+        return text or ""
+    label = basename or _project_basename(project_id) or project_id
+    if not label:
+        return text
+    out = text
+    # 长度倒序：保证 "this project" 先于潜在更短的英文指代词被替换
+    for pat in sorted(_PROJECT_DEICTICS, key=len, reverse=True):
+        out = re.sub(re.escape(pat), label, out, flags=re.IGNORECASE)
+    return out
+
+
 def default_principals(
     creds: Credentials | None,
     project_id: str,
@@ -143,7 +175,9 @@ def default_principals(
 
     if project_id:
         basename = _project_basename(project_id) or project_id
-        aliases = list({project_id, basename, "this project", "本项目", "当前项目"})
+        # 只保留可唯一识别该项目的字符串；指代词（"本项目"/"当前项目"/"this project"）
+        # 是跨项目歧义的，统一在 normalize_project_deictics 里做文本侧归一化。
+        aliases = list({a for a in (project_id, basename) if a})
         out.append(
             PrincipalSpec(
                 principal_type="project",
@@ -364,6 +398,7 @@ __all__ = [
     "default_principals",
     "ensure_default_principals",
     "entity_id_for",
+    "normalize_project_deictics",
     "principal_alias_to_id",
     "register_principal",
     "sha8",

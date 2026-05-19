@@ -37,7 +37,7 @@ def test_patterns_recall_called_once_per_active_principal(monkeypatch, tmp_path)
         principal_type="project",
         slug="foo/bar",
         canonical="project:bar",
-        aliases=["本项目"],
+        aliases=["bar"],
         description="测试项目",
         scope="project:foo/bar",
         project_id="foo/bar",

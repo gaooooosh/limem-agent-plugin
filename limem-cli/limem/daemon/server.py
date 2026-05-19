@@ -33,7 +33,7 @@ from .connectivity import (
     record_failure,
     record_success,
 )
-from .eventbus import EventTail, rotate_if_needed
+from .eventbus import EventTail, emit_event, rotate_if_needed
 from .learner import (
     archive_old,
     load_suggestions,
@@ -43,7 +43,7 @@ from .learner import (
     save_suggestions,
 )
 from .lock import FileLock, write_pid
-from .state import DaemonState
+from .state import DaemonState, RecalledItem, RecallEmittedRecord
 from .writer import fix_impl, forget_impl, remember_impl
 
 VERSION = "0.1.0"
@@ -69,6 +69,9 @@ class Daemon:
         self.state.pause = self.state.pause.load_from_disk()
         self.state.active_memories = self.pidx.stats().get("events_active", 0)
         self.state.suggestion_count = len([s for s in load_suggestions() if s.get("status") == "pending"])
+        # 注入 runtime 控制的 recent_recalls 上限，并从磁盘恢复上次环形缓冲
+        self.state.set_recent_recalls_max(int(self.runtime.recent_recalls_max))
+        self.state.load_recent_recalls_from_disk()
         self.event_tail = EventTail()
         # 环形 buffer：满了自动丢最旧而非丢最新（修复 server.py 旧版本 `len < _buf_max` 丢新事件的 bug）；
         # 实际时间窗剪裁由 learner.run_correction_analyzer / run_ngram_analyzer 在每次 tick 用 window_seconds 完成。
@@ -150,6 +153,9 @@ class Daemon:
             "fix_memory": self._h_fix_memory,
             "lookup_short_id": self._h_lookup_short_id,
             "auto_init_project": self._h_auto_init_project,
+            "report_recall": self._h_report_recall,
+            "list_recent_recalls": self._h_list_recent_recalls,
+            "consume_pending_recall": self._h_consume_pending_recall,
             "shutdown": self._h_shutdown,
         }
         h = handlers.get(method)
@@ -171,6 +177,7 @@ class Daemon:
             "connectivity": self.state.connectivity.to_public(),
             "init_pending_until_ts": self.state.init_pending_until_ts,
             "inited_now_ts": self.state.inited_now_ts,
+            "last_recall": self.state.last_recall_to_dict(),
         }
 
     async def _h_list_suggestions(self, p: dict[str, Any]) -> list[dict[str, Any]]:
@@ -313,6 +320,149 @@ class Daemon:
             self.state.inited_now_ts = int(time.time()) + 300
         return result
 
+    async def _h_report_recall(self, p: dict[str, Any]) -> dict[str, Any]:
+        """记录一次 hook 的注入产物；同步更新 state + 写一行 recall_emitted 审计。
+
+        envelope schema 不变；recall_emitted 这个 kind 由 ``_handle_event_row`` 入口忽略，
+        避免 EventTail 回放重复累加 state。
+        """
+        items_raw = p.get("items") or []
+        items: list[RecalledItem] = []
+        for raw in items_raw:
+            if not isinstance(raw, dict):
+                continue
+            items.append(
+                RecalledItem(
+                    short_id=str(raw.get("short_id") or ""),
+                    event_id=str(raw.get("event_id") or ""),
+                    src=str(raw.get("src") or ""),
+                    mem_type=str(raw.get("mem_type") or ""),
+                    scope=str(raw.get("scope") or ""),
+                    summary_head=str(raw.get("summary_head") or "")[:60],
+                    canonical=str(raw.get("canonical") or ""),
+                    heading=str(raw.get("heading") or ""),
+                )
+            )
+        record = RecallEmittedRecord(
+            ts=int(p.get("ts") or time.time()),
+            session_id=str(p.get("session_id") or ""),
+            project_id=str(p.get("project_id") or ""),
+            scope=str(p.get("scope") or ""),
+            items=items,
+            via_patterns=list(p.get("via_patterns") or []),
+            via_keywords=list(p.get("via_keywords") or []),
+            prompt_head=str(p.get("prompt_head") or "")[:60],
+            injected_chars=int(p.get("injected_chars") or 0),
+        )
+        self.state.record_recall(record)
+        # 审计行：写 events.ndjson 但被 _handle_event_row 入口忽略
+        counts: dict[str, int] = {}
+        for it in record.items:
+            if it.src:
+                counts[it.src] = counts.get(it.src, 0) + 1
+        try:
+            emit_event(
+                "recall_emitted",
+                tool="",
+                session_id=record.session_id,
+                project_id=record.project_id,
+                scope=record.scope,
+                payload={
+                    "items": [
+                        {
+                            "short_id": it.short_id,
+                            "event_id": it.event_id,
+                            "src": it.src,
+                            "mem_type": it.mem_type,
+                            "scope": it.scope,
+                            "summary_head": it.summary_head,
+                            "canonical": it.canonical,
+                            "heading": it.heading,
+                        }
+                        for it in record.items
+                    ],
+                    "via_patterns": record.via_patterns,
+                    "via_keywords": record.via_keywords,
+                    "prompt_head": record.prompt_head,
+                    "injected_chars": record.injected_chars,
+                    "counts": counts,
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            _log("recall_emit_audit_failed", err=str(e))
+        return {"ok": True}
+
+    async def _h_consume_pending_recall(
+        self, p: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Stop hook 用：取出某 session 的待消费 record（取一次后即清除）。
+
+        params: {"session_id": str, "dedupe": bool = True}
+        result: 返回 record dict（同 _h_list_recent_recalls 单条 schema），或 null
+        """
+        session_id = str(p.get("session_id") or "")
+        dedupe = bool(p.get("dedupe", True))
+        if not session_id:
+            return None
+        rec = self.state.consume_pending_recall(session_id, dedupe=dedupe)
+        if rec is None:
+            return None
+        return {
+            "ts": rec.ts,
+            "session_id": rec.session_id,
+            "project_id": rec.project_id,
+            "scope": rec.scope,
+            "prompt_head": rec.prompt_head,
+            "injected_chars": rec.injected_chars,
+            "via_patterns": list(rec.via_patterns),
+            "via_keywords": list(rec.via_keywords),
+            "items": [
+                {
+                    "short_id": it.short_id,
+                    "event_id": it.event_id,
+                    "src": it.src,
+                    "mem_type": it.mem_type,
+                    "scope": it.scope,
+                    "summary_head": it.summary_head,
+                    "canonical": it.canonical,
+                    "heading": it.heading,
+                }
+                for it in rec.items
+            ],
+        }
+
+    async def _h_list_recent_recalls(self, p: dict[str, Any]) -> list[dict[str, Any]]:
+        limit = int(p.get("limit") or 20)
+        limit = max(1, min(limit, self.state.recent_recalls_max))
+        out: list[dict[str, Any]] = []
+        for r in list(self.state.recent_recalls)[:limit]:
+            out.append(
+                {
+                    "ts": r.ts,
+                    "session_id": r.session_id,
+                    "project_id": r.project_id,
+                    "scope": r.scope,
+                    "prompt_head": r.prompt_head,
+                    "injected_chars": r.injected_chars,
+                    "via_patterns": list(r.via_patterns),
+                    "via_keywords": list(r.via_keywords),
+                    "items": [
+                        {
+                            "short_id": it.short_id,
+                            "event_id": it.event_id,
+                            "src": it.src,
+                            "mem_type": it.mem_type,
+                            "scope": it.scope,
+                            "summary_head": it.summary_head,
+                            "canonical": it.canonical,
+                            "heading": it.heading,
+                        }
+                        for it in r.items
+                    ],
+                }
+            )
+        return out
+
     async def _h_shutdown(self, _p: dict[str, Any]) -> dict[str, Any]:
         self._shutdown.set()
         return {"ok": True}
@@ -331,6 +481,9 @@ class Daemon:
 
     def _handle_event_row(self, row: dict[str, Any]) -> None:
         kind = row.get("kind")
+        # daemon 自己 emit 的审计行，不回放（防 state 重复累加）
+        if kind == "recall_emitted":
+            return
         payload = row.get("payload") or {}
         evidence_seed = json.dumps(row, ensure_ascii=False, sort_keys=True)
         evidence_id = hashlib.sha1(evidence_seed.encode("utf-8")).hexdigest()[:12]
@@ -525,12 +678,15 @@ class Daemon:
         while not self._shutdown.is_set():
             try:
                 self._write_statusline_cache()
+                # 顺带刷一次 recent_recalls.json（开销 < 1ms，省一个独立 loop）
+                self.state.save_recent_recalls_to_disk()
             except Exception as e:  # noqa: BLE001
                 _log("statusline_loop_error", err=str(e))
             await asyncio.sleep(period)
 
     def _write_statusline_cache(self) -> None:
         from ..statusline import format_text
+        last_recall = self.state.last_recall_to_dict()
         text = format_text(
             active=self.state.active_memories,
             hits=self.state.total_hits(),
@@ -541,6 +697,11 @@ class Daemon:
             reason=self.state.connectivity.reason,
             init_pending_until_ts=self.state.init_pending_until_ts,
             inited_now_ts=self.state.inited_now_ts,
+            last_recall=last_recall,
+            last_recall_enabled=bool(self.runtime.statusline_last_recall_enabled),
+            last_recall_short_ids_max=int(
+                self.runtime.statusline_last_recall_short_ids_max
+            ),
         )
         payload = {
             "ts": int(time.time()),
@@ -555,6 +716,7 @@ class Daemon:
                 "reason": self.state.connectivity.reason,
                 "init_pending_until_ts": self.state.init_pending_until_ts,
                 "inited_now_ts": self.state.inited_now_ts,
+                "last_recall": last_recall,
             },
         }
         STATUSLINE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)

@@ -199,7 +199,7 @@ def test_learner_correction_suggestion_has_review_context() -> None:
     )
     assert len(out) == 1
     suggestion = out[0]
-    assert suggestion["candidate_text"].startswith("在本项目中")
+    assert suggestion["candidate_text"].startswith("在 repo 中")
     assert "rationale" in suggestion
     assert suggestion["evidence"]
     assert "abcdef123456" in suggestion["evidence"][0]
@@ -221,7 +221,7 @@ def test_accept_suggestion_uses_candidate_text_only(monkeypatch, tmp_path) -> No
                 "id": "sug_1",
                 "kind": "rule",
                 "scope": "project:demo",
-                "candidate_text": "在本项目中，避免运行 npm run dev。",
+                "candidate_text": "在 demo 中，避免运行 npm run dev。",
                 "rationale": "用户多次纠正。",
                 "evidence": ["2026-01-01 [codex] #abc: 不要 npm run dev"],
                 "status": "pending",
@@ -248,7 +248,7 @@ def test_accept_suggestion_uses_candidate_text_only(monkeypatch, tmp_path) -> No
     )
     result = asyncio.run(server.Daemon._h_accept_suggestion(daemon, {"id": "sug_1"}))
     assert result == {"event_id": "evt_1"}
-    assert captured["text"] == "在本项目中，避免运行 npm run dev。"
+    assert captured["text"] == "在 demo 中，避免运行 npm run dev。"
     assert "用户多次纠正" not in captured["text"]
     assert "#abc" not in captured["text"]
 
@@ -261,7 +261,7 @@ def test_merge_suggestions_dedupes_learned_items() -> None:
             "id": "sug_old",
             "kind": "rule",
             "scope": "project:demo",
-            "candidate_text": "在本项目中，避免运行 npm run dev。",
+            "candidate_text": "在 demo 中，避免运行 npm run dev。",
             "status": "learned",
         }
     ]
@@ -270,7 +270,7 @@ def test_merge_suggestions_dedupes_learned_items() -> None:
             "id": "sug_new",
             "kind": "rule",
             "scope": "project:demo",
-            "candidate_text": "在本项目中，避免运行 npm run dev。",
+            "candidate_text": "在 demo 中，避免运行 npm run dev。",
             "status": "pending",
         }
     ]
@@ -307,7 +307,7 @@ def test_passive_learning_submits_pending_suggestion(monkeypatch) -> None:
             "id": "sug_1",
             "kind": "rule",
             "scope": "project:demo",
-            "candidate_text": "在本项目中，避免运行 npm run dev。",
+            "candidate_text": "在 demo 中，避免运行 npm run dev。",
             "rationale": "用户多次纠正。",
             "evidence": ["2026-01-01 [codex] #abc: 不要 npm run dev"],
             "confidence": 0.91,
@@ -320,6 +320,6 @@ def test_passive_learning_submits_pending_suggestion(monkeypatch) -> None:
     assert items[0]["status"] == "learned"
     assert items[0]["learned_event_id"] == "evt_passive_1"
     assert captured["source"] == "daemon:passive_learning"
-    assert captured["text"] == "在本项目中，避免运行 npm run dev。"
+    assert captured["text"] == "在 demo 中，避免运行 npm run dev。"
     assert captured["detail"].startswith("passive learning observation")
     assert captured["project_id"] == "demo"

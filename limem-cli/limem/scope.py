@@ -12,8 +12,9 @@ import hashlib
 import json
 import re
 import subprocess
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 from .config import ProjectConfig
 

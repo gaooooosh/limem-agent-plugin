@@ -17,6 +17,7 @@ from ..config import (
     SUGGESTIONS_ARCHIVE_PATH,
     SUGGESTIONS_PATH,
 )
+from ..principals import _project_basename
 from .jaccard import cluster_by_similarity, jaccard, trigrams
 from .ngram import aggregate as ngram_aggregate
 
@@ -97,22 +98,32 @@ def format_evidence(event: dict[str, Any]) -> str:
     return f"{_format_ts(int(event.get('ts', 0) or 0))} [{tool}] #{_evidence_ref(event)}: {prompt}"
 
 
-def build_candidate_text(cluster: list[dict[str, Any]], *, kind: str = "correction") -> str:
-    """Build a natural-language memory candidate, not structured pattern data."""
+def build_candidate_text(
+    cluster: list[dict[str, Any]],
+    *,
+    kind: str = "correction",
+    project_label: str = "",
+) -> str:
+    """Build a natural-language memory candidate, not structured pattern data.
+
+    ``project_label`` 是当前项目的短标签（通常为 ``_project_basename(project_id)``）。
+    传入时输出 ``"在 <label> 中…"``；为空时降级为 ``"在当前会话中…"``，避免使用跨项目歧义的"本项目"。
+    """
+    locus = f"在 {project_label} 中" if project_label else "在当前会话中"
     sample = cluster[-1] if cluster else {}
     text = _clean_inline(sample.get("prompt", ""), limit=180)
     if not text:
-        return "在本项目中，遵循用户最近反复纠正的工作方式。"
+        return f"{locus}，遵循用户最近反复纠正的工作方式。"
 
     if _NEGATIVE_HINT.search(text) and _PREFER_HINT.search(text):
-        return f"在本项目中，按用户纠正执行：{text}"
+        return f"{locus}，按用户纠正执行：{text}"
     if _NEGATIVE_HINT.search(text):
-        return f"在本项目中，避免重复这个被用户纠正的做法：{text}"
+        return f"{locus}，避免重复这个被用户纠正的做法：{text}"
     if _PREFER_HINT.search(text):
-        return f"在本项目中，优先遵循这个用户偏好：{text}"
+        return f"{locus}，优先遵循这个用户偏好：{text}"
     if kind == "preference":
-        return f"在本项目中，优先采用这个反复出现的代码偏好：{text}"
-    return f"在本项目中，遵循这个用户反复纠正的规则：{text}"
+        return f"{locus}，优先采用这个反复出现的代码偏好：{text}"
+    return f"{locus}，遵循这个用户反复纠正的规则：{text}"
 
 
 def build_rationale(cluster: list[dict[str, Any]], *, kind: str = "correction") -> str:
@@ -183,11 +194,12 @@ def run_correction_analyzer(
 
     suggestions: list[dict[str, Any]] = []
     for proj, events in by_proj.items():
+        project_label = _project_basename(proj) or proj
         items = [(e.get("prompt", ""), e) for e in events]
         clusters = cluster_by_similarity(items, threshold=jaccard_threshold)
         for cluster in clusters:
             sample = cluster[0]
-            text = build_candidate_text(cluster)
+            text = build_candidate_text(cluster, project_label=project_label)
             subj = extract_subject(sample.get("prompt", ""))
             scope = sample.get("scope", f"project:{proj}") if proj else "global"
             cluster_conf = min(0.95, 0.4 + 0.1 * len(cluster))
@@ -238,6 +250,7 @@ def run_ngram_analyzer(
 
     suggestions: list[dict[str, Any]] = []
     for proj, events in by_proj.items():
+        project_label = _project_basename(proj) or proj
         # A1.3：若 daemon 在 PreToolUse↔PostToolUse 配对时挂载了 intent_summary，
         # 把它拼到 diff_summary 之前作为 n-gram 输入（语义："用户原本要的 + 实际改的"一起聚合）。
         # 仍是 pure 函数：仅按 dict 读字段，不引入外部依赖。
@@ -257,7 +270,8 @@ def run_ngram_analyzer(
             min_accept_rate=min_accept_rate,
         )
         for ng in ngs:
-            text = f"在本项目中，优先采用这个反复出现的代码偏好：{ng['ngram']}"
+            locus = f"在 {project_label} 中" if project_label else "在当前会话中"
+            text = f"{locus}，优先采用这个反复出现的代码偏好：{ng['ngram']}"
             suggestions.append(
                 {
                     "id": f"sug_{uuid.uuid4().hex[:10]}",

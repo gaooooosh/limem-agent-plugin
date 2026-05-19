@@ -418,26 +418,29 @@ def init(project: bool, targets: str, no_hooks: bool, no_mcp: bool, no_skills: b
         if not (plan.local_json_written or plan.gitignore_patched):
             console.print("[yellow](no changes — already initialized)[/yellow]")
 
-        # v3：注册 project principal（失败静默）
+        # v3：注册默认 principals（失败静默）。aliases 行为的 source-of-truth 统一在
+        # principals.default_principals()；此处不再手工构造 PrincipalSpec，避免漂移。
         try:
+            from .client import LimemClient
             from .entity_index import EntityIndex
-            from .principals import PrincipalSpec, register_principal
+            from .principals import ensure_default_principals
 
             creds = Credentials.load()
             if creds.api_key and creds.db_id and plan.project_id:
                 idx = EntityIndex()
-                basename = plan.project_id.rsplit("/", 1)[-1] or plan.project_id
-                spec = PrincipalSpec(
-                    principal_type="project",
-                    slug=plan.project_id,
+                client = LimemClient(creds=creds, timeout=2.0)
+                eids = ensure_default_principals(
+                    creds,
                     project_id=plan.project_id,
-                    description=f"当前工作的项目：{plan.project_id}",
-                    aliases=list({plan.project_id, basename, "this project", "本项目", "当前项目"}),
-                    scope=f"project:{plan.project_id}",
-                    canonical=f"project:{basename}",
+                    tool="claude-code",
+                    idx=idx,
+                    client=client,
                 )
-                eid = register_principal(spec, creds=creds, idx=idx, swallow=True)
-                console.print(f"[green]principal project → {eid}[/green]")
+                proj_eid = next(
+                    (e for e in eids if e.startswith("principal_project_")), ""
+                )
+                if proj_eid:
+                    console.print(f"[green]principal project → {proj_eid}[/green]")
         except Exception as e:  # noqa: BLE001
             console.print(f"[yellow]principal project 注册失败（已忽略）：{e}[/yellow]")
         return

@@ -33,6 +33,8 @@ SUGGESTIONS_ARCHIVE_PATH = USER_CACHE_DIR / "suggestions.archive.ndjson"
 PAUSE_PATH = USER_CACHE_DIR / "pause.json"
 DEGRADED_SEEN_PATH = USER_CACHE_DIR / "degraded_seen.json"
 SESSION_MUTE_PATH = USER_CACHE_DIR / "session_mute.json"
+# 最近召回环形缓冲落盘（daemon 5s 原子写；daemon 重启 / 用户工具 fallback 读）
+RECENT_RECALLS_PATH = USER_CACHE_DIR / "recent_recalls.json"
 
 PROJECT_CONFIG_FILENAME = ".limem/local.json"
 
@@ -142,6 +144,12 @@ class RuntimeConfig:
     # PreToolUse / PostToolUse 配对窗口与采集截断（仅在 daemon 内存中使用）
     pre_post_pair_window_seconds: int = 60
     pre_tool_intent_chars: int = 200
+    # 最近召回环形缓冲长度（statusline / dash 消费）
+    recent_recalls_max: int = 20
+    # statusline 是否在尾部追加 ✨ <短ID> 摘要
+    statusline_last_recall_enabled: bool = True
+    # statusline 摘要里最多列几个 short_id，超出用 (+N) 表示
+    statusline_last_recall_short_ids_max: int = 2
     # UserPromptSubmit 中 transcript_path tail 采集的 assistant 上一轮回复截断长度
     prev_assistant_chars: int = 200
     # is_correction 改进版的最低置信度阈值（< 此值不入 correction buffer）

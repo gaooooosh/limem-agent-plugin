@@ -41,10 +41,12 @@ from .daemon.writer import build_natural_detail
 from .entity_index import EntityIndex, PrincipalRow
 from .injector import (
     Budgets,
+    InjectItem,
     PatternRecallSlice,
     hard_recall_to_items,
     pattern_recall_to_items,
     render_inject,
+    render_inject_with_diagnostics,
     soft_recall_to_items,
 )
 from .principals import ensure_default_principals
@@ -85,6 +87,64 @@ def _emit_inject(event_name: str, text: str) -> None:
         }
     }
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+
+
+def _report_recall_safe(
+    *,
+    rendered: list[InjectItem],
+    session_id: str,
+    project_id: str,
+    scope: str,
+    prompt: str,
+    via_patterns: list[str] | None,
+    via_keywords: list[str] | None,
+    injected_chars: int,
+) -> None:
+    """fire-and-forget 上报「本轮实际渲染出去」的 items 给 daemon。
+
+    永不抛、永不阻塞 hook；daemon 不可达静默放弃（statusline / dash 最多显示上次缓存）。
+    """
+    if not rendered:
+        return
+    try:
+        items_payload: list[dict[str, Any]] = []
+        for it in rendered:
+            short = it.short_id or (it.event_id[:12] if it.event_id else "")
+            # injector.render_line 里 src 文案对 soft 用 "soft"，但为统一展示
+            # （README + statusline 习惯 "bm25"），转换一次
+            src = "bm25" if it.kind == "soft" else it.kind
+            if it.kind == "pattern":
+                summary_head = (it.pattern_content or "").strip()[:60]
+            else:
+                summary_head = (it.summary or "").strip()[:60]
+            items_payload.append(
+                {
+                    "short_id": short,
+                    "event_id": it.event_id,
+                    "src": src,
+                    "mem_type": it.mem_type,
+                    "scope": it.scope,
+                    "summary_head": summary_head,
+                    "canonical": it.canonical,
+                    "heading": it.heading,
+                }
+            )
+        daemon_client.report_recall(
+            {
+                "ts": int(time.time()),
+                "session_id": session_id,
+                "project_id": project_id,
+                "scope": scope,
+                "items": items_payload,
+                "via_patterns": list(via_patterns or []),
+                "via_keywords": list(via_keywords or []),
+                "prompt_head": (prompt or "")[:60],
+                "injected_chars": int(injected_chars or 0),
+            }
+        )
+    except Exception:
+        # 上报失败永不阻塞 hook
+        pass
 
 
 # ---------- 召回辅助 ----------
@@ -351,7 +411,7 @@ def _hook_user_prompt_submit(
         pattern=runtime.inject_budget_pattern,
         soft=runtime.inject_budget_soft,
     )
-    text = render_inject(
+    text, rendered_items = render_inject_with_diagnostics(
         items,
         project_id=project_id,
         budgets=budgets,
@@ -360,6 +420,18 @@ def _hook_user_prompt_submit(
     )
     if items:
         daemon_client.bump_hit(session_id)
+    # 注入完成后 fire-and-forget 上报本轮实际渲染的 items（含 short_id），
+    # 供 statusline / dash 显示「上轮 / 最近召回」反馈。失败永不阻塞。
+    _report_recall_safe(
+        rendered=rendered_items,
+        session_id=session_id,
+        project_id=project_id,
+        scope=scope,
+        prompt=prompt,
+        via_patterns=via_patterns,
+        via_keywords=via_keywords,
+        injected_chars=len(text),
+    )
     _log(
         "user_prompt_submit",
         tool,
@@ -373,6 +445,7 @@ def _hook_user_prompt_submit(
         soft_hits=len(soft_results),
         soft_filtered=len(soft_filtered),
         injected_chars=len(text),
+        rendered=len(rendered_items),
     )
     _emit_event_safe(
         "user_prompt_submit",
@@ -544,6 +617,95 @@ def _hook_session_start(
     _emit_inject("SessionStart", text)
 
 
+# ---------- Stop hook：本轮回答结束后给用户提示用了哪些记忆 ----------
+
+
+def _format_stop_recall_systemmessage(record: dict[str, Any]) -> str:
+    """渲染 `📚 LiMem · 本次使用 N 条记忆：#a3f #9b2 (+1)` 单行文案。
+
+    输入是 daemon ``consume_pending_recall`` 返回的 dict（即一条 RecallEmittedRecord
+    的序列化形态）。空 items 返回空串，由调用方决定是否发 systemMessage。
+    """
+    items = record.get("items") or []
+    if not items:
+        return ""
+    n = len(items)
+    short_ids = [it.get("short_id") for it in items if it.get("short_id")]
+    head = short_ids[:2]
+    if head:
+        extra = len(short_ids) - len(head)
+        sid_part = " ".join(f"#{s}" for s in head)
+        if extra > 0:
+            return f"📚 LiMem · 本次使用 {n} 条记忆：{sid_part} (+{extra})"
+        if n > len(head):
+            # 有 short_id 但 n > head；剩余可能是 pattern 无 short_id 条目
+            return f"📚 LiMem · 本次使用 {n} 条记忆：{sid_part} (+{n - len(head)})"
+        return f"📚 LiMem · 本次使用 {n} 条记忆：{sid_part}"
+    # 全部 pattern（无 short_id）
+    return f"📚 LiMem · 本次使用 {n} 条记忆（pattern 切片）"
+
+
+def _emit_stop_systemmessage(text: str) -> None:
+    """写一行 Claude Code Stop hook 协议要求的 JSON 到 stdout。
+
+    协议参考（已经 claude-code-guide 验证）：
+        {"decision": "allow", "systemMessage": "<text>", "suppressOutput": false}
+    """
+    if not text:
+        # 无内容 → 不打扰，stdout 空字符串（Claude Code 不展示）
+        sys.stdout.write("")
+        return
+    sys.stdout.write(
+        json.dumps(
+            {
+                "decision": "allow",
+                "systemMessage": text,
+                "suppressOutput": False,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def _stop_recall_message(session_id: str) -> str:
+    """从 daemon 取出本 session 待消费的 record 并渲染。
+    静默条件：(a) 无 session_id (b) pause 中 (c) daemon 返回 None
+    （daemon 内部已处理 dedupe 与"已消费"标记）。
+    """
+    if not session_id:
+        return ""
+    if read_pause_from_disk().is_active():
+        return ""
+    try:
+        rec = daemon_client.consume_pending_recall(session_id, dedupe=True)
+    except Exception:
+        return ""
+    if not rec:
+        return ""
+    return _format_stop_recall_systemmessage(rec)
+
+
+def _hook_stop_claude(
+    tool: str, payload: dict[str, Any], creds: Credentials, runtime: RuntimeConfig
+) -> None:
+    """Claude Code Stop hook：每轮回答结束时输出一行 systemMessage 提示本次使用的记忆。
+
+    永不阻塞回答；任何异常均 swallow，输出空字符串。
+    """
+    session_id = payload.get("session_id") or payload.get("sessionId") or ""
+    try:
+        text = _stop_recall_message(session_id)
+    except Exception:
+        text = ""
+    _emit_stop_systemmessage(text)
+    _log(
+        "stop_claude",
+        tool,
+        session_id=session_id,
+        emitted=bool(text),
+    )
+
+
 # ---------- SessionEnd / Stop / Misc ----------
 
 
@@ -619,6 +781,22 @@ def _hook_stop_codex(
         if mtime >= threshold:
             continue
         _flush_codex_session(p, creds, tool)
+
+    # 每轮 Codex Stop 也尝试给出「本次使用了哪些记忆」提示，与 Claude Code 端体验一致：
+    # - stdout 输出 systemMessage JSON（与 Claude Code 协议同形态；Codex 若不识别则被忽略，无副作用）
+    # - stderr 输出一行 ASCII fallback（多数 CLI 会把 stderr 显示给用户，作为 stdout 不被识别时的兜底）
+    try:
+        text = _stop_recall_message(sid if sid != "unknown" else "")
+    except Exception:
+        text = ""
+    _emit_stop_systemmessage(text)
+    if text:
+        try:
+            ascii_fallback = text.encode("ascii", errors="ignore").decode("ascii").strip()
+            if ascii_fallback:
+                sys.stderr.write(ascii_fallback + "\n")
+        except Exception:
+            pass
 
 
 def _flush_codex_session(buf: Path, creds: Credentials, tool: str) -> None:
@@ -785,6 +963,8 @@ def main(argv: list[str] | None = None) -> int:
             _hook_session_end(args.tool, payload, creds, runtime)
         elif args.event == "Stop" and args.tool == "codex":
             _hook_stop_codex(args.tool, payload, creds, runtime)
+        elif args.event == "Stop" and args.tool == "claude-code":
+            _hook_stop_claude(args.tool, payload, creds, runtime)
         elif args.event == "Stop":
             _log("stop_noop", args.tool)
         elif args.event == "PreCompact":

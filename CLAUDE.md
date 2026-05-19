@@ -120,6 +120,8 @@ pytest                                  # tests/ 现有 6 个用例（bootstrap 
 - **时间衰减**：`injector._half_life_score = importance × 0.9 ** 月数` 用于 hard/soft 排序；pattern 切片用后端 `matched_sections` 总分。
 - **via header**：列出本轮命中的 pattern triggers 与 BM25 top 关键词（`_via_keywords`）。
 - **short_id**：每条记忆末尾追加 `#xxxx`（12 位 sha1 前缀，冲突时扩到 14 位），存 `EntityIndex.ensure_short_id` → `short_id_map` 表，供 `/limem.fix` 与 `/limem.no` 引用。
+- **使用反馈通道**：hook 渲染完 `<limem_memory>` 后会 fire-and-forget 调 daemon RPC `report_recall`（`render_inject_with_diagnostics` 返回的 `rendered_items` 经 budget/去重过滤后保留的条目），daemon 把记录入 `DaemonState.recent_recalls`（环形 N=20）并 emit 一行 `kind="recall_emitted"` 审计到 `events.ndjson`（envelope schema 不变；daemon 入口忽略该 kind 防回放）。daemon 周期刷盘到 `~/.cache/limem/recent_recalls.json`，供 statusline 显示尾部 `· ✨ #xxx #yyy` 摘要、MCP 工具 `limem_recent_recalls` 查询、daemon 重启冷启动恢复。daemon 不可达时 hook 静默放弃上报（不阻塞）；statusline / MCP 工具自动 fallback 到 cache 文件。
+- **Stop hook 回答末尾主动提示**：每轮助手回答结束时（Claude Code Stop / Codex Stop），hook 调 daemon RPC `consume_pending_recall(session_id)` 取该 session 待消费的最新注入记录（一次性，取后即清），渲染为单行 `📚 LiMem · 本次使用 N 条记忆：#a3f #9b2 (+1)` 文本，通过 Stop hook 协议的 `systemMessage` 字段（独立于 LLM 上下文，不污染对话历史）显示给用户。静默条件：本轮无注入、`limem pause` 中、或 short_id 集合与上次已展示完全相同（daemon 内 `last_displayed_signature_by_session` 维护，签名相同时返回 None）。Codex 端额外写一行 ASCII 兜底到 stderr。
 
 ### 本地 SQLite 镜像（`limem/entity_index.py`）
 
@@ -176,11 +178,11 @@ Codex 没有 `SessionEnd` 事件——`_hook_stop_codex` 用 ndjson 缓冲池模
 
 ### MCP 工具（`limem/mcp_server.py`）
 
-注册 16 个工具，按域分组：
+注册 17 个工具，按域分组：
 
 | 域 | 工具 |
 |---|---|
-| 查询 | `limem_search` / `limem_list` |
+| 查询 | `limem_search` / `limem_list` / `limem_recent_recalls` |
 | 写入 | `limem_write` / `limem_forget` / `limem_fix` |
 | 会话控制 | `limem_pause` / `limem_resume` / `limem_mute` |
 | 诊断 | `limem_ping` / `limem_stats` |
@@ -188,6 +190,8 @@ Codex 没有 `SessionEnd` 事件——`_hook_stop_codex` 用 ndjson 缓冲池模
 | Principal 管理 | `limem_principal_list` / `limem_principal_register` / `limem_principal_activate` / `limem_principal_deactivate` |
 
 所有工具都直接调 `memory_writer` 或 `entity_index`，**不复制业务逻辑**、**不直接拼 HTTP**。
+
+`limem_recent_recalls` 是「使用反馈」的对话内出口：用户问"上轮用了哪些记忆"或助手要确认 short_id 才能 `/limem.fix #xxx` 时调用，先走 daemon RPC `list_recent_recalls`，daemon 不可达自动 fallback 到 `recent_recalls.json`。
 
 ### Daemon 子系统（`limem/daemon/`）
 

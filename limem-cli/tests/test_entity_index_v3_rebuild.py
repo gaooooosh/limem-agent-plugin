@@ -160,7 +160,7 @@ def test_principal_crud_roundtrip(tmp_path) -> None:
         principal_type="project",
         slug="github.com/foo/bar",
         canonical="project:bar",
-        aliases=["bar", "本项目"],
+        aliases=["bar"],
         description="测试项目",
         scope="project:github.com/foo/bar",
         project_id="github.com/foo/bar",

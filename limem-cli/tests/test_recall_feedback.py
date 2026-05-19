@@ -1,0 +1,887 @@
+"""记忆使用反馈链路：注入产物 → daemon 上报 → statusline / dash 消费。
+
+测试覆盖：
+- injector: 双签名 / rendered_items 与 short_id 对齐
+- hooks: render 后 fire-and-forget 上报；daemon 不可达不阻塞
+- daemon: report_recall / list_recent_recalls / 防回放 / 落盘
+- statusline: ✨ 摘要拼接 / 向后兼容
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from typing import Any
+
+from limem.injector import (
+    Budgets,
+    InjectItem,
+    render_inject,
+    render_inject_with_diagnostics,
+)
+
+# ---------- injector ----------
+
+
+def _hard_item(*, event_id: str, short_id: str, summary: str, score: float) -> InjectItem:
+    return InjectItem(
+        kind="hard",
+        score=score,
+        event_id=event_id,
+        mem_type="rule",
+        scope="global",
+        summary=summary,
+        importance=0.9,
+        ts=1700000000,
+        short_id=short_id,
+    )
+
+
+def test_render_inject_with_diagnostics_returns_rendered_items() -> None:
+    items = [
+        _hard_item(event_id="evt_a", short_id="aaaaaaaaaaaa", summary="A 规则", score=0.9),
+        _hard_item(event_id="evt_b", short_id="bbbbbbbbbbbb", summary="B 规则", score=0.8),
+    ]
+    text, rendered = render_inject_with_diagnostics(
+        items,
+        budgets=Budgets(hard=400, pattern=0, soft=0),
+    )
+    assert text != ""
+    assert len(rendered) == 2
+    # recall="N" 的 N == rendered 数
+    assert 'recall="2"' in text
+
+
+def test_render_inject_drops_items_when_budget_too_small() -> None:
+    """budget 只够 1 条时第二条被丢；rendered 与 text 中的 recall 数严格一致。"""
+    items = [
+        _hard_item(event_id="evt_a", short_id="aaaaaaaaaaaa", summary="A" * 100, score=0.9),
+        _hard_item(event_id="evt_b", short_id="bbbbbbbbbbbb", summary="B" * 100, score=0.8),
+    ]
+    # 每条 render_line 约 ~70-110 字（含 metadata），预算 200 大约只够 1 条
+    text, rendered = render_inject_with_diagnostics(
+        items, budgets=Budgets(hard=200, pattern=0, soft=0), per_item_chars=120,
+    )
+    # 第一条至少进得去，第二条被丢
+    assert len(rendered) == 1
+    assert rendered[0].event_id == "evt_a"
+    assert 'recall="1"' in text
+    assert "#aaaaaaaaaaaa" in text
+    assert "#bbbbbbbbbbbb" not in text
+
+
+def test_render_inject_diagnostics_short_id_alignment() -> None:
+    items = [
+        _hard_item(event_id="evt_a", short_id="aaaaaaaaaaaa", summary="X", score=0.9),
+        _hard_item(event_id="evt_b", short_id="bbbbbbbbbbbb", summary="Y", score=0.8),
+    ]
+    text, rendered = render_inject_with_diagnostics(
+        items, budgets=Budgets(hard=600, pattern=0, soft=0)
+    )
+    for it in rendered:
+        assert f"#{it.short_id}" in text
+
+
+def test_render_inject_text_unchanged_via_wrapper() -> None:
+    """render_inject 薄包装产出的文本与 diagnostics 路径完全一致（防回归）。"""
+    items = [
+        _hard_item(event_id="evt_a", short_id="aaaaaaaaaaaa", summary="A", score=0.9),
+        _hard_item(event_id="evt_b", short_id="bbbbbbbbbbbb", summary="B", score=0.8),
+    ]
+    text_a = render_inject(items, budgets=Budgets(hard=400, pattern=0, soft=0))
+    text_b, _ = render_inject_with_diagnostics(
+        items, budgets=Budgets(hard=400, pattern=0, soft=0)
+    )
+    assert text_a == text_b
+
+
+def test_render_inject_empty_items_returns_empty_string_and_list() -> None:
+    text, rendered = render_inject_with_diagnostics([])
+    assert text == ""
+    assert rendered == []
+
+
+# ---------- statusline ----------
+
+
+def test_statusline_format_with_last_recall() -> None:
+    from limem.statusline import format_text
+
+    out = format_text(
+        active=5,
+        hits=12,
+        sug=3,
+        pause_on=False,
+        pause_until_ts=None,
+        connectivity="healthy",
+        reason=None,
+        init_pending_until_ts=None,
+        inited_now_ts=None,
+        last_recall={
+            "ts": 1700000000,
+            "count": 3,
+            "short_ids_head": ["a3f1c0a3f1c0", "9b22d79b22d7"],
+            "counts_by_src": {"hard": 1, "pattern": 1, "bm25": 1},
+        },
+    )
+    assert "✨" in out
+    assert "#a3f1c0a3f1c0" in out
+    assert "#9b22d79b22d7" in out
+    assert "(+1)" in out  # count=3, head=2 → 溢出 1
+
+
+def test_statusline_format_without_last_recall_backward_compat() -> None:
+    from limem.statusline import format_text
+
+    out_old = format_text(
+        active=5,
+        hits=12,
+        sug=3,
+        pause_on=False,
+        pause_until_ts=None,
+        connectivity="healthy",
+        reason=None,
+        init_pending_until_ts=None,
+        inited_now_ts=None,
+    )
+    out_none = format_text(
+        active=5,
+        hits=12,
+        sug=3,
+        pause_on=False,
+        pause_until_ts=None,
+        connectivity="healthy",
+        reason=None,
+        init_pending_until_ts=None,
+        inited_now_ts=None,
+        last_recall=None,
+    )
+    assert "✨" not in out_old
+    assert out_old == out_none
+
+
+def test_statusline_format_disabled_skips_last_recall() -> None:
+    from limem.statusline import format_text
+
+    out = format_text(
+        active=1,
+        hits=1,
+        sug=0,
+        pause_on=False,
+        pause_until_ts=None,
+        connectivity="healthy",
+        reason=None,
+        init_pending_until_ts=None,
+        inited_now_ts=None,
+        last_recall={"count": 2, "short_ids_head": ["aaa"]},
+        last_recall_enabled=False,
+    )
+    assert "✨" not in out
+
+
+def test_statusline_format_pattern_only_shows_count() -> None:
+    """pattern 没有 short_id 时显示 `✨ N 条`。"""
+    from limem.statusline import format_text
+
+    out = format_text(
+        active=1,
+        hits=1,
+        sug=0,
+        pause_on=False,
+        pause_until_ts=None,
+        connectivity="healthy",
+        reason=None,
+        init_pending_until_ts=None,
+        inited_now_ts=None,
+        last_recall={"count": 2, "short_ids_head": [], "counts_by_src": {"pattern": 2}},
+    )
+    assert "✨ 2 条" in out
+
+
+# ---------- daemon state ----------
+
+
+def _make_state(tmp_cache_dir, monkeypatch):
+    """构造 DaemonState 实例，并把 RECENT_RECALLS_PATH 指向 tmp。"""
+    new_path = tmp_cache_dir / "recent_recalls.json"
+    monkeypatch.setattr(
+        "limem.daemon.state.RECENT_RECALLS_PATH", new_path, raising=True
+    )
+    from limem.daemon.state import DaemonState
+
+    st = DaemonState()
+    st.set_recent_recalls_max(20)
+    return st, new_path
+
+
+def _make_record(
+    *, ts: int, items: list[dict[str, Any]] | None = None, scope: str = "global"
+) -> Any:
+    from limem.daemon.state import RecalledItem, RecallEmittedRecord
+
+    return RecallEmittedRecord(
+        ts=ts,
+        session_id=f"sess-{ts}",
+        project_id="proj",
+        scope=scope,
+        items=[RecalledItem(**it) for it in (items or [])],
+        via_patterns=["proj"],
+        via_keywords=["docker"],
+        prompt_head=f"prompt {ts}",
+        injected_chars=100,
+    )
+
+
+def test_daemon_state_record_recall_updates_last_recall(tmp_path, monkeypatch) -> None:
+    st, _ = _make_state(tmp_path, monkeypatch)
+    rec = _make_record(
+        ts=1700000000,
+        items=[
+            {"short_id": "aaa111aaa111", "event_id": "e_a", "src": "hard", "mem_type": "rule",
+             "scope": "global", "summary_head": "rule body"},
+            {"short_id": "bbb222bbb222", "event_id": "e_b", "src": "bm25", "mem_type": "note",
+             "scope": "global", "summary_head": "note body"},
+            {"short_id": "", "event_id": "", "src": "pattern", "mem_type": "",
+             "scope": "global", "summary_head": "pattern slice", "canonical": "project:proj",
+             "heading": "命令规约"},
+        ],
+    )
+    st.record_recall(rec)
+    assert len(st.recent_recalls) == 1
+    assert st.last_recall is not None
+    assert st.last_recall.count == 3
+    assert st.last_recall.counts_by_src == {"hard": 1, "bm25": 1, "pattern": 1}
+    # short_ids 只取有 short_id 的两条，且最多 2 个
+    assert st.last_recall.short_ids_head == ["aaa111aaa111", "bbb222bbb222"]
+
+
+def test_daemon_state_recent_recalls_capped_at_max(tmp_path, monkeypatch) -> None:
+    st, _ = _make_state(tmp_path, monkeypatch)
+    st.set_recent_recalls_max(5)
+    for i in range(10):
+        st.record_recall(_make_record(ts=1700000000 + i))
+    assert len(st.recent_recalls) == 5
+    # newest first
+    assert st.recent_recalls[0].ts == 1700000009
+    assert st.recent_recalls[-1].ts == 1700000005
+
+
+def test_daemon_state_persist_and_load(tmp_path, monkeypatch) -> None:
+    st, path = _make_state(tmp_path, monkeypatch)
+    st.record_recall(
+        _make_record(
+            ts=1700000123,
+            items=[
+                {"short_id": "ssss11112222", "event_id": "e1", "src": "hard",
+                 "mem_type": "rule", "scope": "global", "summary_head": "x"}
+            ],
+        )
+    )
+    st.save_recent_recalls_to_disk()
+    assert path.exists()
+    data = json.loads(path.read_text())
+    assert data["records"][0]["items"][0]["short_id"] == "ssss11112222"
+
+    # 新 state 从盘恢复
+    from limem.daemon.state import DaemonState
+
+    st2 = DaemonState()
+    st2.set_recent_recalls_max(20)
+    st2.load_recent_recalls_from_disk()
+    assert len(st2.recent_recalls) == 1
+    assert st2.recent_recalls[0].ts == 1700000123
+    assert st2.last_recall is not None
+    assert st2.last_recall.count == 1
+
+
+# ---------- daemon RPC handlers ----------
+
+
+class _FakeDaemon:
+    """最小化 Daemon stub，只放必需字段，供 _h_report_recall / _h_list_recent_recalls 调用。"""
+
+    def __init__(self, state, runtime) -> None:
+        self.state = state
+        self.runtime = runtime
+
+
+def test_daemon_h_report_recall_updates_state_and_emits_event(
+    tmp_path, monkeypatch
+) -> None:
+    # 隔离 RECENT_RECALLS_PATH 和 EVENTS_LOG_PATH
+    rr_path = tmp_path / "recent_recalls.json"
+    events_path = tmp_path / "hooks.log"
+    monkeypatch.setattr("limem.daemon.state.RECENT_RECALLS_PATH", rr_path)
+    monkeypatch.setattr("limem.daemon.eventbus.EVENTS_LOG_PATH", events_path)
+
+    from limem.config import RuntimeConfig
+    from limem.daemon.server import Daemon
+    from limem.daemon.state import DaemonState
+
+    # 跳过 Daemon.__init__ 内重资源（PatternIndex 等），手动构造
+    fake = Daemon.__new__(Daemon)
+    fake.state = DaemonState()
+    fake.state.set_recent_recalls_max(20)
+    fake.runtime = RuntimeConfig()
+
+    payload = {
+        "ts": 1700000000,
+        "session_id": "sess-1",
+        "project_id": "proj",
+        "scope": "project:proj",
+        "items": [
+            {"short_id": "aaaa11112222", "event_id": "e1", "src": "hard",
+             "mem_type": "rule", "scope": "project:proj",
+             "summary_head": "禁止 npm run dev"},
+            {"short_id": "bbbb33334444", "event_id": "e2", "src": "bm25",
+             "mem_type": "note", "scope": "global", "summary_head": "另一条"},
+        ],
+        "via_patterns": ["project:proj"],
+        "via_keywords": ["docker"],
+        "prompt_head": "起一下 dev",
+        "injected_chars": 1234,
+    }
+    result = asyncio.run(fake._h_report_recall(payload))
+    assert result == {"ok": True}
+    assert len(fake.state.recent_recalls) == 1
+    assert fake.state.last_recall.count == 2
+    assert fake.state.last_recall.short_ids_head == ["aaaa11112222", "bbbb33334444"]
+
+    # 审计行写到了 events.ndjson
+    assert events_path.exists()
+    lines = [ln for ln in events_path.read_text().splitlines() if ln.strip()]
+    assert lines, "expected at least one audit line"
+    row = json.loads(lines[-1])
+    assert row["kind"] == "recall_emitted"
+    assert row["payload"]["counts"] == {"hard": 1, "bm25": 1}
+    assert row["payload"]["prompt_head"] == "起一下 dev"
+
+
+def test_daemon_recall_emitted_not_replayed(tmp_path, monkeypatch) -> None:
+    """_handle_event_row 收到 kind=='recall_emitted' 时直接 return，不污染 state。"""
+    monkeypatch.setattr("limem.daemon.state.RECENT_RECALLS_PATH", tmp_path / "rr.json")
+    monkeypatch.setattr("limem.daemon.eventbus.EVENTS_LOG_PATH", tmp_path / "ev.log")
+
+    from limem.daemon.server import Daemon
+    from limem.daemon.state import DaemonState
+
+    fake = Daemon.__new__(Daemon)
+    fake.state = DaemonState()
+    fake.state.set_recent_recalls_max(20)
+    fake.runtime = type("R", (), {})()  # 不需要
+
+    before = len(fake.state.recent_recalls)
+    fake._handle_event_row(
+        {
+            "ts": 1700000000,
+            "kind": "recall_emitted",
+            "tool": "",
+            "session_id": "s",
+            "project_id": "p",
+            "scope": "global",
+            "payload": {"items": [], "counts": {}, "prompt_head": ""},
+            "redacted": False,
+        }
+    )
+    after = len(fake.state.recent_recalls)
+    assert before == after  # 没变化 → 没回放
+
+
+def test_daemon_h_list_recent_recalls_newest_first(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("limem.daemon.state.RECENT_RECALLS_PATH", tmp_path / "rr.json")
+    monkeypatch.setattr("limem.daemon.eventbus.EVENTS_LOG_PATH", tmp_path / "ev.log")
+    from limem.config import RuntimeConfig
+    from limem.daemon.server import Daemon
+    from limem.daemon.state import DaemonState
+
+    fake = Daemon.__new__(Daemon)
+    fake.state = DaemonState()
+    fake.state.set_recent_recalls_max(20)
+    fake.runtime = RuntimeConfig()
+
+    for ts in (1700000001, 1700000002, 1700000003):
+        asyncio.run(
+            fake._h_report_recall(
+                {
+                    "ts": ts,
+                    "session_id": f"s-{ts}",
+                    "project_id": "proj",
+                    "scope": "global",
+                    "items": [
+                        {"short_id": f"sid_{ts:08x}", "event_id": f"e_{ts}",
+                         "src": "hard", "mem_type": "rule", "scope": "global",
+                         "summary_head": "x"}
+                    ],
+                    "prompt_head": str(ts),
+                }
+            )
+        )
+    out = asyncio.run(fake._h_list_recent_recalls({"limit": 10}))
+    assert len(out) == 3
+    assert [r["ts"] for r in out] == [1700000003, 1700000002, 1700000001]
+
+
+def test_daemon_h_get_status_includes_last_recall(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("limem.daemon.state.RECENT_RECALLS_PATH", tmp_path / "rr.json")
+    monkeypatch.setattr("limem.daemon.eventbus.EVENTS_LOG_PATH", tmp_path / "ev.log")
+    from limem.config import RuntimeConfig
+    from limem.daemon.server import Daemon
+    from limem.daemon.state import DaemonState
+
+    fake = Daemon.__new__(Daemon)
+    fake.state = DaemonState()
+    fake.state.set_recent_recalls_max(20)
+    fake.runtime = RuntimeConfig()
+
+    asyncio.run(
+        fake._h_report_recall(
+            {
+                "ts": 1700000099,
+                "session_id": "s",
+                "project_id": "p",
+                "scope": "global",
+                "items": [
+                    {"short_id": "ssss00001111", "event_id": "e", "src": "hard",
+                     "mem_type": "rule", "scope": "global", "summary_head": ""}
+                ],
+                "prompt_head": "",
+            }
+        )
+    )
+    status = asyncio.run(fake._h_get_status({}))
+    assert "last_recall" in status
+    lr = status["last_recall"]
+    assert lr is not None
+    assert lr["count"] == 1
+    assert lr["short_ids_head"] == ["ssss00001111"]
+
+
+# ---------- hook 上报 ----------
+
+
+def test_hook_report_recall_safe_calls_daemon(monkeypatch) -> None:
+    """_report_recall_safe 走 daemon_client.report_recall；items 为空时不调。"""
+    from limem import hooks as hmod
+
+    calls: list[dict[str, Any]] = []
+
+    def _capture(params):
+        calls.append(params)
+
+    monkeypatch.setattr(hmod.daemon_client, "report_recall", _capture)
+
+    # 空 items：不上报
+    hmod._report_recall_safe(
+        rendered=[],
+        session_id="s",
+        project_id="p",
+        scope="global",
+        prompt="x",
+        via_patterns=[],
+        via_keywords=[],
+        injected_chars=0,
+    )
+    assert calls == []
+
+    # 有 items：上报一次，items src 映射 soft → bm25
+    items = [
+        InjectItem(
+            kind="hard", score=1.0, event_id="e1", mem_type="rule",
+            scope="global", summary="hello", short_id="aaaa11112222",
+        ),
+        InjectItem(
+            kind="soft", score=0.5, event_id="e2", mem_type="note",
+            scope="global", summary="world", short_id="bbbb33334444",
+        ),
+        InjectItem(
+            kind="pattern", score=0.9, entity_id="p_proj",
+            canonical="project:foo", heading="规约", pattern_content="内容",
+        ),
+    ]
+    hmod._report_recall_safe(
+        rendered=items,
+        session_id="s",
+        project_id="p",
+        scope="global",
+        prompt="起一下 dev",
+        via_patterns=["project:foo"],
+        via_keywords=["docker"],
+        injected_chars=120,
+    )
+    assert len(calls) == 1
+    p = calls[0]
+    assert p["session_id"] == "s"
+    assert p["prompt_head"] == "起一下 dev"
+    srcs = [it["src"] for it in p["items"]]
+    assert srcs == ["hard", "bm25", "pattern"]  # soft → bm25
+    # pattern 条的 summary_head 取 pattern_content
+    assert p["items"][2]["summary_head"] == "内容"
+    assert p["items"][2]["canonical"] == "project:foo"
+    assert p["items"][2]["heading"] == "规约"
+
+
+def test_hook_report_recall_safe_swallows_daemon_exception(monkeypatch) -> None:
+    from limem import hooks as hmod
+
+    def _boom(params):
+        raise RuntimeError("daemon down")
+
+    monkeypatch.setattr(hmod.daemon_client, "report_recall", _boom)
+
+    items = [
+        InjectItem(
+            kind="hard", score=1.0, event_id="e1", mem_type="rule",
+            scope="global", summary="x", short_id="aaaa11112222",
+        )
+    ]
+    # 不抛
+    hmod._report_recall_safe(
+        rendered=items,
+        session_id="s",
+        project_id="p",
+        scope="global",
+        prompt="x",
+        via_patterns=[],
+        via_keywords=[],
+        injected_chars=0,
+    )
+
+
+def test_mcp_recent_recalls_calls_daemon_first(monkeypatch) -> None:
+    """daemon 命中时使用 daemon 数据，source 标记为 daemon。"""
+    from limem import mcp_server
+
+    sample = [
+        {"ts": 1700000005, "scope": "global", "prompt_head": "p1",
+         "items": [{"short_id": "abc", "src": "hard"}]},
+        {"ts": 1700000003, "scope": "project:foo", "prompt_head": "p2",
+         "items": [{"short_id": "def", "src": "bm25"}]},
+    ]
+    monkeypatch.setattr(
+        mcp_server.daemon_client,
+        "list_recent_recalls",
+        lambda limit=20: list(sample),
+    )
+    out = mcp_server._t_recent_recalls(limit=5)
+    data = json.loads(out)
+    assert data["source"] == "daemon"
+    assert data["count"] == 2
+    assert data["records"][0]["prompt_head"] == "p1"
+
+
+def test_mcp_recent_recalls_fallback_to_cache(monkeypatch, tmp_path) -> None:
+    """daemon 不可达时读 RECENT_RECALLS_PATH，source 标记为 cache。"""
+    from limem import mcp_server
+
+    rr_path = tmp_path / "recent_recalls.json"
+    rr_path.write_text(
+        json.dumps(
+            {
+                "updated_ts": 1700000000,
+                "records": [
+                    {"ts": 1700000000, "scope": "global", "prompt_head": "cached",
+                     "items": []}
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(mcp_server, "RECENT_RECALLS_PATH", rr_path)
+    monkeypatch.setattr(
+        mcp_server.daemon_client, "list_recent_recalls", lambda limit=20: None
+    )
+    out = mcp_server._t_recent_recalls(limit=5)
+    data = json.loads(out)
+    assert data["source"] == "cache"
+    assert data["count"] == 1
+    assert data["records"][0]["prompt_head"] == "cached"
+
+
+def test_mcp_recent_recalls_current_project_only_filter(monkeypatch) -> None:
+    from limem import mcp_server
+
+    sample = [
+        {"ts": 1700000005, "scope": "project:foo", "items": []},
+        {"ts": 1700000004, "scope": "global", "items": []},
+        {"ts": 1700000003, "scope": "project:other", "items": []},
+    ]
+    monkeypatch.setattr(
+        mcp_server.daemon_client, "list_recent_recalls", lambda limit=20: list(sample)
+    )
+    monkeypatch.setattr(mcp_server, "detect_project_id", lambda: "foo")
+
+    out = mcp_server._t_recent_recalls(limit=10, current_project_only=True)
+    data = json.loads(out)
+    scopes = {r["scope"] for r in data["records"]}
+    assert scopes == {"project:foo", "global"}  # other project filtered out
+
+
+def test_daemon_consume_pending_recall_one_shot(tmp_path, monkeypatch) -> None:
+    """consume 取出后 daemon 清除 pending；二次调用返回 None。"""
+    st, _ = _make_state(tmp_path, monkeypatch)
+    rec = _make_record(
+        ts=1700000001,
+        items=[
+            {"short_id": "aaaa11112222", "event_id": "e1", "src": "hard",
+             "mem_type": "rule", "scope": "global", "summary_head": "x"},
+        ],
+    )
+    rec.session_id = "sess-A"
+    st.record_recall(rec)
+    out1 = st.consume_pending_recall("sess-A")
+    assert out1 is not None
+    assert out1.items[0].short_id == "aaaa11112222"
+    # 第二次：已消费，pending 已清
+    out2 = st.consume_pending_recall("sess-A")
+    assert out2 is None
+
+
+def test_daemon_consume_pending_recall_dedupe(tmp_path, monkeypatch) -> None:
+    """两轮注入相同 short_id 集合时，第二轮 consume 返回 None（去重）。"""
+    st, _ = _make_state(tmp_path, monkeypatch)
+    same_items = [
+        {"short_id": "aaaa11112222", "event_id": "e1", "src": "hard",
+         "mem_type": "rule", "scope": "global", "summary_head": "x"},
+    ]
+    r1 = _make_record(ts=1700000001, items=same_items)
+    r1.session_id = "sess-B"
+    st.record_recall(r1)
+    assert st.consume_pending_recall("sess-B") is not None
+
+    r2 = _make_record(ts=1700000002, items=same_items)
+    r2.session_id = "sess-B"
+    st.record_recall(r2)
+    # 签名相同 → 去重，不再展示
+    assert st.consume_pending_recall("sess-B") is None
+
+
+def test_daemon_consume_pending_recall_different_session_independent(
+    tmp_path, monkeypatch
+) -> None:
+    """不同 session 的 pending 独立维护。"""
+    st, _ = _make_state(tmp_path, monkeypatch)
+    r_a = _make_record(
+        ts=1700000001,
+        items=[
+            {"short_id": "aaaa11112222", "event_id": "e1", "src": "hard",
+             "mem_type": "rule", "scope": "global", "summary_head": "x"},
+        ],
+    )
+    r_a.session_id = "sess-A"
+    st.record_recall(r_a)
+
+    r_b = _make_record(
+        ts=1700000002,
+        items=[
+            {"short_id": "bbbb33334444", "event_id": "e2", "src": "hard",
+             "mem_type": "rule", "scope": "global", "summary_head": "y"},
+        ],
+    )
+    r_b.session_id = "sess-B"
+    st.record_recall(r_b)
+
+    out_a = st.consume_pending_recall("sess-A")
+    out_b = st.consume_pending_recall("sess-B")
+    assert out_a is not None and out_a.items[0].short_id == "aaaa11112222"
+    assert out_b is not None and out_b.items[0].short_id == "bbbb33334444"
+
+
+def test_daemon_h_consume_pending_recall_via_rpc(tmp_path, monkeypatch) -> None:
+    """同时验证 daemon RPC handler 行为。"""
+    monkeypatch.setattr("limem.daemon.state.RECENT_RECALLS_PATH", tmp_path / "rr.json")
+    monkeypatch.setattr("limem.daemon.eventbus.EVENTS_LOG_PATH", tmp_path / "ev.log")
+    from limem.config import RuntimeConfig
+    from limem.daemon.server import Daemon
+    from limem.daemon.state import DaemonState
+
+    fake = Daemon.__new__(Daemon)
+    fake.state = DaemonState()
+    fake.state.set_recent_recalls_max(20)
+    fake.runtime = RuntimeConfig()
+    asyncio.run(
+        fake._h_report_recall(
+            {
+                "ts": 1700000099,
+                "session_id": "sess-C",
+                "project_id": "p",
+                "scope": "global",
+                "items": [
+                    {"short_id": "cccc55556666", "event_id": "e3", "src": "hard",
+                     "mem_type": "rule", "scope": "global", "summary_head": "z"},
+                ],
+                "prompt_head": "q",
+            }
+        )
+    )
+    out = asyncio.run(
+        fake._h_consume_pending_recall({"session_id": "sess-C", "dedupe": True})
+    )
+    assert out is not None
+    assert out["items"][0]["short_id"] == "cccc55556666"
+    out_again = asyncio.run(
+        fake._h_consume_pending_recall({"session_id": "sess-C", "dedupe": True})
+    )
+    assert out_again is None
+
+
+def test_format_stop_recall_systemmessage_with_short_ids() -> None:
+    from limem import hooks as hmod
+
+    record = {
+        "items": [
+            {"short_id": "aaa111aaa111", "src": "hard"},
+            {"short_id": "bbb222bbb222", "src": "bm25"},
+            {"short_id": "ccc333ccc333", "src": "hard"},
+        ]
+    }
+    out = hmod._format_stop_recall_systemmessage(record)
+    assert "📚 LiMem · 本次使用 3 条记忆" in out
+    assert "#aaa111aaa111" in out
+    assert "#bbb222bbb222" in out
+    assert "(+1)" in out  # head 2, total 3 → 溢出 1
+
+
+def test_format_stop_recall_systemmessage_pattern_only() -> None:
+    """纯 pattern src（无 short_id）时显示 N 条记忆（pattern 切片）。"""
+    from limem import hooks as hmod
+
+    record = {
+        "items": [
+            {"short_id": "", "src": "pattern"},
+            {"short_id": "", "src": "pattern"},
+        ]
+    }
+    out = hmod._format_stop_recall_systemmessage(record)
+    assert "本次使用 2 条记忆" in out
+    assert "pattern" in out
+
+
+def test_format_stop_recall_systemmessage_empty() -> None:
+    from limem import hooks as hmod
+
+    assert hmod._format_stop_recall_systemmessage({"items": []}) == ""
+    assert hmod._format_stop_recall_systemmessage({}) == ""
+
+
+def test_emit_stop_systemmessage_writes_json(capsys) -> None:
+    from limem import hooks as hmod
+
+    hmod._emit_stop_systemmessage("📚 LiMem · test")
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["decision"] == "allow"
+    assert data["systemMessage"] == "📚 LiMem · test"
+    assert data["suppressOutput"] is False
+
+
+def test_emit_stop_systemmessage_empty_text_writes_empty(capsys) -> None:
+    """空 text → stdout 写空串，不输出 JSON（避免对 Claude Code 显示干扰）。"""
+    from limem import hooks as hmod
+
+    hmod._emit_stop_systemmessage("")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
+def test_stop_recall_message_returns_empty_when_no_session_id() -> None:
+    from limem import hooks as hmod
+
+    assert hmod._stop_recall_message("") == ""
+
+
+def test_stop_recall_message_returns_empty_when_daemon_returns_none(monkeypatch) -> None:
+    from limem import hooks as hmod
+
+    monkeypatch.setattr(
+        hmod.daemon_client, "consume_pending_recall", lambda *_, **__: None
+    )
+    # pause 关闭
+    class _NotPaused:
+        def is_active(self):
+            return False
+
+    monkeypatch.setattr(hmod, "read_pause_from_disk", lambda: _NotPaused())
+    assert hmod._stop_recall_message("sess-x") == ""
+
+
+def test_stop_recall_message_returns_empty_when_paused(monkeypatch) -> None:
+    from limem import hooks as hmod
+
+    class _Paused:
+        def is_active(self):
+            return True
+
+    monkeypatch.setattr(hmod, "read_pause_from_disk", lambda: _Paused())
+    # 即便 daemon 有 record，pause 中也不展示
+    monkeypatch.setattr(
+        hmod.daemon_client,
+        "consume_pending_recall",
+        lambda *_, **__: {"items": [{"short_id": "x", "src": "hard"}]},
+    )
+    assert hmod._stop_recall_message("sess-x") == ""
+
+
+def test_hook_stop_claude_full_path(monkeypatch, capsys) -> None:
+    """端到端：daemon 返回 record → hook 输出含 systemMessage 的 JSON。"""
+    from limem import hooks as hmod
+
+    monkeypatch.setattr(
+        hmod.daemon_client,
+        "consume_pending_recall",
+        lambda *_, **__: {
+            "items": [
+                {"short_id": "abcd00001111", "src": "hard"},
+                {"short_id": "ef0022223333", "src": "bm25"},
+            ]
+        },
+    )
+
+    class _NotPaused:
+        def is_active(self):
+            return False
+
+    monkeypatch.setattr(hmod, "read_pause_from_disk", lambda: _NotPaused())
+
+    from limem.config import Credentials, RuntimeConfig
+
+    hmod._hook_stop_claude(
+        "claude-code",
+        {"session_id": "sess-z"},
+        Credentials(api_key="k", db_id="db", user_id="u"),
+        RuntimeConfig(),
+    )
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert "本次使用 2 条记忆" in data["systemMessage"]
+    assert "#abcd00001111" in data["systemMessage"]
+
+
+def test_hook_report_recall_safe_completes_under_50ms(monkeypatch) -> None:
+    """daemon 失败时整个上报路径仍快于 50ms（hook 预算）。"""
+    from limem import hooks as hmod
+
+    def _slow_failure(params):
+        # 模拟 daemon_client.safe_call 失败但快速返回（safe_call 内部 200ms 上限，
+        # 我们这里直接抛出，因为 _report_recall_safe 自带 try/except）
+        raise RuntimeError("simulated")
+
+    monkeypatch.setattr(hmod.daemon_client, "report_recall", _slow_failure)
+    items = [
+        InjectItem(
+            kind="hard", score=1.0, event_id="e1", mem_type="rule",
+            scope="global", summary="x", short_id="aaaa11112222",
+        )
+    ]
+    t0 = time.time()
+    hmod._report_recall_safe(
+        rendered=items,
+        session_id="s",
+        project_id="p",
+        scope="global",
+        prompt="x",
+        via_patterns=[],
+        via_keywords=[],
+        injected_chars=0,
+    )
+    elapsed_ms = (time.time() - t0) * 1000
+    assert elapsed_ms < 50, f"上报路径耗时 {elapsed_ms:.1f}ms > 50ms"

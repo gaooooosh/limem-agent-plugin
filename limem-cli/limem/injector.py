@@ -105,7 +105,7 @@ class _Section:
     per_item_chars: int = 180
 
 
-def render_inject(
+def render_inject_with_diagnostics(
     items: list[InjectItem],
     *,
     project_id: str = "",
@@ -114,10 +114,15 @@ def render_inject(
     per_item_chars: int = 180,
     via_patterns: list[str] | None = None,
     via_keywords: list[str] | None = None,
-) -> str:
-    """渲染 additionalContext 文本。返回空串表示没有记忆可注入。"""
+) -> tuple[str, list[InjectItem]]:
+    """与 ``render_inject`` 同义，但同时返回实际渲染出去的 items 列表，
+    供 hook 上报「本轮真正注入的 short_id」给 daemon。
+
+    rendered_items 包含 budget/去重过滤后保留的条目，顺序与文本一致：
+    先 hard、再 pattern、再 soft，组内按 score 降序。
+    """
     if not items:
-        return ""
+        return "", []
 
     if budgets is None:
         if total_budget is None:
@@ -151,6 +156,7 @@ def render_inject(
             sec.items.append(it)
 
     rendered_blocks: list[str] = []
+    rendered_items: list[InjectItem] = []
     total_used = 0
     recall_count = 0
     for kind in ("hard", "pattern", "soft"):
@@ -159,21 +165,24 @@ def render_inject(
             continue
         used = 0
         lines: list[str] = []
+        section_rendered: list[InjectItem] = []
         for it in sec.items:
             line = it.render_line(per_item_chars=sec.per_item_chars)
             cost = len(line) + 1
             if used + cost > sec.budget:
                 continue  # pattern 段：按 score 降序逐条丢弃，不切坏 markdown 中段
             lines.append(line)
+            section_rendered.append(it)
             used += cost
             recall_count += 1
         if lines:
             rendered_blocks.append(sec.title)
             rendered_blocks.extend(lines)
+            rendered_items.extend(section_rendered)
             total_used += used + len(sec.title) + 1
 
     if not rendered_blocks:
-        return ""
+        return "", []
 
     proj = f" project={project_id!r}" if project_id else ""
     via_parts: list[str] = []
@@ -192,7 +201,34 @@ def render_inject(
         "或 `/limem.no #<id>` 本会话静音。\n"
         "</limem_memory>"
     )
-    return "\n".join([head, *rendered_blocks, foot])
+    return "\n".join([head, *rendered_blocks, foot]), rendered_items
+
+
+def render_inject(
+    items: list[InjectItem],
+    *,
+    project_id: str = "",
+    budgets: _Budgets | None = None,
+    total_budget: int | None = None,
+    per_item_chars: int = 180,
+    via_patterns: list[str] | None = None,
+    via_keywords: list[str] | None = None,
+) -> str:
+    """渲染 additionalContext 文本。返回空串表示没有记忆可注入。
+
+    向后兼容的薄包装；调用方需要拿到实际渲染条目（含 short_id）时
+    请改用 ``render_inject_with_diagnostics``。
+    """
+    text, _ = render_inject_with_diagnostics(
+        items,
+        project_id=project_id,
+        budgets=budgets,
+        total_budget=total_budget,
+        per_item_chars=per_item_chars,
+        via_patterns=via_patterns,
+        via_keywords=via_keywords,
+    )
+    return text
 
 
 # ---------- helpers ----------

@@ -12,10 +12,10 @@ v2 起 pattern 数据由后端整篇 markdown 持有，本地不再维护 trigge
 from __future__ import annotations
 
 from .entity_index import (  # noqa: F401
+    SCHEMA_VERSION,
     EntityHit,
     EntityIndex,
     EventMetadata,
-    SCHEMA_VERSION,
 )
 
 # 旧名兼容（class 标识符级别 alias）

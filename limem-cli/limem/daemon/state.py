@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..config import (
     DEGRADED_SEEN_PATH,
     PAUSE_PATH,
+    RECENT_RECALLS_PATH,
 )
 
 
@@ -51,7 +53,7 @@ class PauseState:
     session_id: str | None = None
 
     @classmethod
-    def load_from_disk(cls) -> "PauseState":
+    def load_from_disk(cls) -> PauseState:
         try:
             data = json.loads(PAUSE_PATH.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
@@ -100,6 +102,75 @@ class PauseState:
 
 
 @dataclass
+class RecalledItem:
+    """单条「本轮注入」记录；hard/soft 走 event_id+short_id，pattern 走 canonical+heading。"""
+
+    short_id: str = ""  # 不带 "#" 前缀；pattern src 可空
+    event_id: str = ""  # pattern src 可空
+    src: str = ""  # "hard" | "pattern" | "bm25"
+    mem_type: str = ""  # rule / feedback / preference / note / ""
+    scope: str = ""
+    summary_head: str = ""  # ≤60 chars
+    canonical: str = ""  # 仅 pattern
+    heading: str = ""  # 仅 pattern
+
+
+@dataclass
+class RecallEmittedRecord:
+    """一次 UserPromptSubmit 注入产出的元数据快照，供 dash / statusline 反向消费。"""
+
+    ts: int = 0
+    session_id: str = ""
+    project_id: str = ""
+    scope: str = ""
+    items: list[RecalledItem] = field(default_factory=list)
+    via_patterns: list[str] = field(default_factory=list)
+    via_keywords: list[str] = field(default_factory=list)
+    prompt_head: str = ""  # ≤60 chars
+    injected_chars: int = 0
+
+
+@dataclass
+class LastRecallSummary:
+    """statusline 直接消费的最小摘要；存活在 DaemonState.last_recall。"""
+
+    ts: int = 0
+    count: int = 0
+    short_ids_head: list[str] = field(default_factory=list)  # 最多 2 个
+    counts_by_src: dict[str, int] = field(default_factory=dict)
+
+
+def _record_from_dict(data: dict[str, Any]) -> RecallEmittedRecord:
+    items = []
+    for it in data.get("items") or []:
+        if not isinstance(it, dict):
+            continue
+        items.append(
+            RecalledItem(
+                short_id=str(it.get("short_id") or ""),
+                event_id=str(it.get("event_id") or ""),
+                src=str(it.get("src") or ""),
+                mem_type=str(it.get("mem_type") or ""),
+                scope=str(it.get("scope") or ""),
+                summary_head=str(it.get("summary_head") or ""),
+                canonical=str(it.get("canonical") or ""),
+                heading=str(it.get("heading") or ""),
+            )
+        )
+    return RecallEmittedRecord(
+        ts=int(data.get("ts") or 0),
+        session_id=str(data.get("session_id") or ""),
+        project_id=str(data.get("project_id") or ""),
+        scope=str(data.get("scope") or ""),
+        items=items,
+        via_patterns=list(data.get("via_patterns") or []),
+        via_keywords=list(data.get("via_keywords") or []),
+        prompt_head=str(data.get("prompt_head") or ""),
+        injected_chars=int(data.get("injected_chars") or 0),
+    )
+
+
+@dataclass
 class DaemonState:
     started_ts: int = field(default_factory=lambda: int(time.time()))
     active_memories: int = 0
@@ -109,6 +180,19 @@ class DaemonState:
     suggestion_count: int = 0
     init_pending_until_ts: int | None = None  # F1 dirty repo 提示截止
     inited_now_ts: int | None = None  # F1 刚 init 提示截止
+    # 「最近召回」环形缓冲（newest-first appendleft）；maxlen 在 record_recall 内强制
+    recent_recalls: deque[RecallEmittedRecord] = field(
+        default_factory=lambda: deque(maxlen=20)
+    )
+    # statusline 摘要（仅最近一轮的精简形态）
+    last_recall: LastRecallSummary | None = None
+    # 缓冲上限（不可在 dataclass field 内引用 RuntimeConfig；由 Daemon.__init__ 注入）
+    recent_recalls_max: int = 20
+    # Stop hook 主动提示链路：session_id -> 待消费的 RecallEmittedRecord（每次 report_recall 时刷新）
+    # 注意：仅在内存中维护；daemon 重启后丢失（下一次注入会重新填充，无回放需求）
+    pending_recall_by_session: dict[str, RecallEmittedRecord] = field(default_factory=dict)
+    # Stop hook 去重签名：session_id -> 上次已展示给用户的 record 签名（hash of short_ids+counts）
+    last_displayed_signature_by_session: dict[str, str] = field(default_factory=dict)
 
     # ----- session 维度 -----
 
@@ -161,6 +245,145 @@ class DaemonState:
         tmp.write_text(json.dumps(kept, ensure_ascii=False))
         tmp.replace(DEGRADED_SEEN_PATH)
         return len(data) - len(kept)
+
+    # ----- recent_recalls -----
+
+    def set_recent_recalls_max(self, max_len: int) -> None:
+        """由 Daemon.__init__ 注入 runtime 配置后调用，重建 deque。"""
+        max_len = max(1, int(max_len))
+        if max_len == self.recent_recalls.maxlen:
+            self.recent_recalls_max = max_len
+            return
+        new_deque: deque[RecallEmittedRecord] = deque(maxlen=max_len)
+        # 保留最新 max_len 条
+        for rec in list(self.recent_recalls)[:max_len]:
+            new_deque.append(rec)
+        self.recent_recalls = new_deque
+        self.recent_recalls_max = max_len
+
+    def record_recall(self, record: RecallEmittedRecord) -> None:
+        """记录一次注入；newest-first 入队 + 更新 last_recall 摘要 + 刷新 session pending。"""
+        self.recent_recalls.appendleft(record)
+        counts: dict[str, int] = {}
+        short_ids: list[str] = []
+        for it in record.items:
+            if it.src:
+                counts[it.src] = counts.get(it.src, 0) + 1
+            if it.short_id:
+                short_ids.append(it.short_id)
+        self.last_recall = LastRecallSummary(
+            ts=record.ts,
+            count=len(record.items),
+            short_ids_head=short_ids[:2],
+            counts_by_src=counts,
+        )
+        # Stop hook 主动提示用：把该 session 的最新 record 标记为 pending（未消费）。
+        # 若同一 session 两轮间均无 Stop 触达，新 record 覆盖旧的 —— 这是预期行为：用户只关心最近一轮。
+        if record.session_id:
+            self.pending_recall_by_session[record.session_id] = record
+
+    @staticmethod
+    def _record_signature(record: RecallEmittedRecord) -> str:
+        """同内容判定签名：用 (sorted short_ids tuple + counts_by_src) 做 hash。
+
+        判定语义：两轮注入的 short_id 集合与各源条数完全一致即视为「相同」，
+        不引入纯文本对比（避免顺序、scope 等抖动）。
+        """
+        import hashlib
+        short_ids = sorted({it.short_id for it in record.items if it.short_id})
+        counts: dict[str, int] = {}
+        for it in record.items:
+            if it.src:
+                counts[it.src] = counts.get(it.src, 0) + 1
+        seed = (
+            "|".join(short_ids)
+            + "::"
+            + ";".join(f"{k}={counts[k]}" for k in sorted(counts.keys()))
+            + f"::pattern_only={1 if not short_ids and record.items else 0}"
+        )
+        return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+
+    def consume_pending_recall(
+        self, session_id: str, *, dedupe: bool = True
+    ) -> RecallEmittedRecord | None:
+        """取出该 session 待消费的 record；调用后从 pending 中移除（防止重复推送）。
+
+        - 无 pending → None
+        - dedupe=True 且签名与上次已展示完全相同 → None（去重）
+        - 否则返回 record 并更新 last_displayed_signature_by_session[session_id]
+        """
+        if not session_id:
+            return None
+        rec = self.pending_recall_by_session.pop(session_id, None)
+        if rec is None:
+            return None
+        if dedupe:
+            sig = self._record_signature(rec)
+            last = self.last_displayed_signature_by_session.get(session_id)
+            if sig == last:
+                return None
+            self.last_displayed_signature_by_session[session_id] = sig
+        return rec
+
+    def last_recall_to_dict(self) -> dict[str, Any] | None:
+        return asdict(self.last_recall) if self.last_recall is not None else None
+
+    def load_recent_recalls_from_disk(self) -> None:
+        """daemon 启动时调用；文件不存在 / 损坏均静默忽略，state 保持空。"""
+        try:
+            data = json.loads(RECENT_RECALLS_PATH.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        if not isinstance(data, dict):
+            return
+        records_raw = data.get("records") or []
+        if not isinstance(records_raw, list):
+            return
+        max_len = self.recent_recalls.maxlen or 20
+        new_deque: deque[RecallEmittedRecord] = deque(maxlen=max_len)
+        for r in records_raw[:max_len]:
+            if not isinstance(r, dict):
+                continue
+            try:
+                new_deque.append(_record_from_dict(r))
+            except Exception:
+                continue
+        self.recent_recalls = new_deque
+        # 重算 last_recall 摘要（直接读 deque 头一条，不再 appendleft）
+        if new_deque:
+            latest = new_deque[0]
+            counts: dict[str, int] = {}
+            short_ids: list[str] = []
+            for it in latest.items:
+                if it.src:
+                    counts[it.src] = counts.get(it.src, 0) + 1
+                if it.short_id:
+                    short_ids.append(it.short_id)
+            self.last_recall = LastRecallSummary(
+                ts=latest.ts,
+                count=len(latest.items),
+                short_ids_head=short_ids[:2],
+                counts_by_src=counts,
+            )
+
+    def save_recent_recalls_to_disk(self) -> None:
+        """原子写 RECENT_RECALLS_PATH；按 PauseState.save_to_disk 范式。"""
+        path = RECENT_RECALLS_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "updated_ts": int(time.time()),
+            "records": [asdict(r) for r in list(self.recent_recalls)],
+        }
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False))
+            tmp.replace(path)
+        except OSError:
+            # 落盘失败不致命；下次周期再试
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def read_pause_from_disk() -> PauseState:

@@ -97,6 +97,9 @@ _CLAUDE_HOOKS: dict[str, list[dict[str, Any]]] = {
     "SessionEnd": [
         {"hooks": [{"type": "command", "command": "limem hook claude-code SessionEnd"}]}
     ],
+    "Stop": [
+        {"hooks": [{"type": "command", "command": "limem hook claude-code Stop"}]}
+    ],
     "PreCompact": [
         {"hooks": [{"type": "command", "command": "limem hook claude-code PreCompact"}]}
     ],

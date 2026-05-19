@@ -17,14 +17,13 @@ v3 设计要点（principal-centric）：
 from __future__ import annotations
 
 import time
-from datetime import datetime
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from ..client import LimemClient, LimemError, PatternRecallResult
 from ..config import Credentials, RuntimeConfig
 from ..entity_index import EntityIndex
-from ..principals import ensure_default_principals
+from ..principals import ensure_default_principals, normalize_project_deictics
 from ..redact import contains_secret
 from ..tag_text import encode_tags
 
@@ -158,6 +157,18 @@ def remember_impl(
 
     if not creds.api_key or not creds.db_id:
         raise LimemError(0, "missing credentials: run `limem bootstrap` or `limem init` first")
+
+    # 指代词归一化：仅在 scope 已锁定 project 时启用。
+    # global / session: scope 下用户讲"本项目"通常是抽象修饰，无明确 project context
+    # 不可贸然替换。同步覆盖 text / detail，让 composed_text、BM25 索引、
+    # raw_metadata.original_text 三处保持一致；build_natural_detail 自带的 provenance
+    # 句不参与归一化。
+    if scope.startswith("project:"):
+        effective_proj_id = scope.split(":", 1)[1] or project_id
+        if effective_proj_id:
+            text = normalize_project_deictics(text, project_id=effective_proj_id)
+            if detail:
+                detail = normalize_project_deictics(detail, project_id=effective_proj_id)
 
     canonicals = [e["canonical"] for e in entities or [] if e.get("canonical")]
 

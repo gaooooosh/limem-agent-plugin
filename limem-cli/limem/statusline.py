@@ -10,8 +10,34 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Any
 
-from .config import STATUSLINE_CACHE_PATH
+from .config import STATUSLINE_CACHE_PATH, RuntimeConfig
+
+
+def _format_last_recall(
+    last_recall: dict[str, Any] | None,
+    *,
+    short_ids_max: int = 2,
+) -> str:
+    """把 daemon 的 last_recall 摘要拼成 statusline 尾段，例如 `✨ #a3f #9b2 (+1)`。
+
+    返回空串表示无需追加（last_recall 为空 / count==0）。
+    """
+    if not last_recall:
+        return ""
+    count = int(last_recall.get("count") or 0)
+    if count <= 0:
+        return ""
+    short_ids = list(last_recall.get("short_ids_head") or [])[:short_ids_max]
+    if short_ids:
+        tail = " ".join(f"#{s}" for s in short_ids)
+        extra = count - len(short_ids)
+        if extra > 0:
+            return f"✨ {tail} (+{extra})"
+        return f"✨ {tail}"
+    # 仅有计数（pattern-only 场景：pattern 没有 short_id）
+    return f"✨ {count} 条"
 
 
 def format_text(
@@ -25,6 +51,9 @@ def format_text(
     reason: str | None,
     init_pending_until_ts: int | None,
     inited_now_ts: int | None,
+    last_recall: dict[str, Any] | None = None,
+    last_recall_enabled: bool = True,
+    last_recall_short_ids_max: int = 2,
 ) -> str:
     if connectivity == "degraded":
         return f"⚠ LiMem degraded ({reason or 'unknown'}) · run `limem ping`"
@@ -40,6 +69,12 @@ def format_text(
     else:
         extra = "⏸ off"
     parts = [f"📚 {active}", f"▶ {hits}", f"💡 {sug}", extra]
+    if last_recall_enabled:
+        piece = _format_last_recall(
+            last_recall, short_ids_max=last_recall_short_ids_max
+        )
+        if piece:
+            parts.append(piece)
     base = " · ".join(parts)
     # F1 提示位
     if init_pending_until_ts and init_pending_until_ts > now:
@@ -51,6 +86,15 @@ def format_text(
 
 def render() -> str:
     """主入口：返回 statusline 单行文本。"""
+    # 读 runtime 配置控制 last_recall 是否显示 + 多少个 short_id
+    try:
+        rt = RuntimeConfig.load()
+        last_recall_enabled = bool(rt.statusline_last_recall_enabled)
+        last_recall_short_ids_max = int(rt.statusline_last_recall_short_ids_max)
+    except Exception:
+        last_recall_enabled = True
+        last_recall_short_ids_max = 2
+
     # 尝试 daemon
     try:
         from . import daemon_client
@@ -71,6 +115,9 @@ def render() -> str:
             reason=conn.get("reason"),
             init_pending_until_ts=status.get("init_pending_until_ts"),
             inited_now_ts=status.get("inited_now_ts"),
+            last_recall=status.get("last_recall"),
+            last_recall_enabled=last_recall_enabled,
+            last_recall_short_ids_max=last_recall_short_ids_max,
         )
 
     # fallback：cache.json
@@ -87,6 +134,9 @@ def render() -> str:
             reason=raw.get("reason"),
             init_pending_until_ts=raw.get("init_pending_until_ts"),
             inited_now_ts=raw.get("inited_now_ts"),
+            last_recall=raw.get("last_recall"),
+            last_recall_enabled=last_recall_enabled,
+            last_recall_short_ids_max=last_recall_short_ids_max,
         )
     except (FileNotFoundError, json.JSONDecodeError):
         pass

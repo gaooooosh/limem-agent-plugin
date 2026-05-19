@@ -24,7 +24,7 @@ from mcp.types import TextContent, Tool
 
 from . import daemon_client, session_mute
 from .client import LimemClient, LimemError
-from .config import Credentials, RuntimeConfig
+from .config import RECENT_RECALLS_PATH, Credentials, RuntimeConfig
 from .entity_index import EntityIndex
 from .memory_writer import (
     EntitySpec,
@@ -308,6 +308,37 @@ async def _list_tools() -> list[Tool]:
                 "required": ["entity_id"],
             },
         ),
+        Tool(
+            name="limem_recent_recalls",
+            description=(
+                "Show which LiMem memories were injected into the most recent prompts. "
+                "Use when the user asks things like 'what memory did you use just now?', "
+                "'show me the last recall', '上一轮用了哪些记忆', or to audit which "
+                "short_ids were active so you can reference them with /limem.fix or "
+                "/limem.no. Returns newest-first; each record contains items with "
+                "short_id / src (hard|pattern|bm25) / mem_type / scope / summary_head."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 5,
+                    },
+                    "current_project_only": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "If true, filter records whose scope is the current "
+                            "project or global (drops other-project recalls)."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -348,6 +379,8 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             text = _t_principal_activate(**arguments)
         elif name == "limem_principal_deactivate":
             text = _t_principal_deactivate(**arguments)
+        elif name == "limem_recent_recalls":
+            text = _t_recent_recalls(**arguments)
         else:
             text = json.dumps({"error": f"unknown tool: {name}"}, ensure_ascii=False)
     except (LimemError, ValueError) as e:
@@ -761,6 +794,43 @@ def _t_principal_deactivate(entity_id: str) -> str:
     eid = _resolve_principal_id(entity_id, idx=idx)
     idx.deactivate_principal(eid)
     return json.dumps({"entity_id": eid, "active": False}, ensure_ascii=False)
+
+
+def _read_recent_recalls_fallback() -> list[dict[str, Any]]:
+    """daemon 不可达时，从 ~/.cache/limem/recent_recalls.json 读快照。"""
+    try:
+        data = json.loads(RECENT_RECALLS_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    records = data.get("records") if isinstance(data, dict) else None
+    return list(records) if isinstance(records, list) else []
+
+
+def _t_recent_recalls(
+    *,
+    limit: int = 5,
+    current_project_only: bool = False,
+) -> str:
+    limit = max(1, min(int(limit or 5), 20))
+    source = "daemon"
+    records = daemon_client.list_recent_recalls(limit=limit)
+    if records is None:
+        records = _read_recent_recalls_fallback()
+        source = "cache"
+    if current_project_only:
+        proj = detect_project_id()
+        allowed = {"global"} | ({f"project:{proj}"} if proj else set())
+        records = [r for r in records if (r.get("scope") or "") in allowed]
+    # 截断到 limit（daemon 已截但 fallback 没截）
+    records = list(records)[:limit]
+    return json.dumps(
+        {
+            "source": source,
+            "count": len(records),
+            "records": records,
+        },
+        ensure_ascii=False,
+    )
 
 
 # 保留导入以便扩展模块复用（避免 lint 警告）

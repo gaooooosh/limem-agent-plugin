@@ -8,7 +8,7 @@
 
 允许的差异（写死）：
 - Claude Code 有 SessionEnd / PreCompact / PostToolUse；Codex 没有
-- Codex 有 Stop；Claude Code 没有
+- Claude Code 与 Codex 都配置了 Stop（Stop hook 用于回答结束时给用户提示「本次使用了哪些记忆」）
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ CLAUDE_EXPECTED = {
     "UserPromptSubmit",
     "SessionStart",
     "SessionEnd",
+    "Stop",
     "PreCompact",
     "PreToolUse",
     "PostToolUse",

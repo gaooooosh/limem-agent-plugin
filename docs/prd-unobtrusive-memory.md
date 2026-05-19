@@ -371,6 +371,24 @@
 }
 ```
 
+**`recall_emitted` payload**（由 daemon `_h_report_recall` emit；daemon `_handle_event_row` 入口忽略此 kind 防回放）：
+
+```json
+{
+  "items": [
+    {"short_id": "a3f1c0a3f1c0", "event_id": "evt_...", "src": "hard",
+     "mem_type": "rule", "scope": "project:...", "summary_head": "≤60 chars"},
+    {"short_id": "", "event_id": "", "src": "pattern",
+     "canonical": "project:foo-bar", "heading": "命令规约", "summary_head": "..."}
+  ],
+  "via_patterns": ["project:foo", "user:u_42"],
+  "via_keywords": ["docker", "rebuild"],
+  "prompt_head": "起一下 dev",
+  "injected_chars": 1832,
+  "counts": {"hard": 1, "pattern": 1, "bm25": 1}
+}
+```
+
 ## 附录 B：suggestions.json schema
 
 ```json
@@ -395,12 +413,19 @@
 
 | method | params | result |
 |---|---|---|
-| `get_status` | `{}` | `{active_memories, hit_count, suggestion_count, pause, connectivity}` |
+| `get_status` | `{}` | `{active_memories, hit_count, suggestion_count, pause, connectivity, last_recall?}` |
 | `list_suggestions` | `{status?: "pending"\|"all"}` | `[Suggestion, ...]` |
 | `accept_suggestion` | `{id, edited_text?, edited_entities?}` | `{event_id}` |
 | `discard_suggestion` | `{id}` | `{ok: true}` |
 | `get_recall_stats` | `{since_ts?: int}` | `{hits_by_kind, top_triggers}` |
 | `bump_hit` | `{session_id}` | `{ok}` |
 | `set_connectivity` | `{state, reason?}` | `{ok}` |
+| `report_recall` | `{ts, session_id, project_id, scope, items[], via_patterns[], via_keywords[], prompt_head, injected_chars}` | `{ok: true}` |
+| `list_recent_recalls` | `{limit?: int = 20}` | `[RecallEmittedRecord, ...]` newest-first |
+| `consume_pending_recall` | `{session_id, dedupe?: bool = true}` | `RecallEmittedRecord \| null`（取后即清；签名与上次相同时返回 null）|
 
-调用方：hook、statusline、dash 全部走这一套，禁止任何模块直接读 sqlite 以外的 daemon 状态。
+调用方：hook、statusline、dash、MCP server 全部走这一套，禁止任何模块直接读 sqlite 以外的 daemon 状态。
+
+**`report_recall`** 是 hook 在 `_hook_user_prompt_submit` 中 fire-and-forget 调用的；payload 来自 `render_inject_with_diagnostics` 返回的 `rendered_items`（即经 budget / 去重过滤后实际渲染到 `<limem_memory>` 内的条目）。daemon 收到后：① 写入 `DaemonState.recent_recalls` 环形 deque（`runtime.recent_recalls_max` 默认 20）+ 更新 `last_recall` 摘要；② 把同一 record 标记为 `pending_recall_by_session[session_id]` 等待 Stop hook 消费；③ 同步 emit 一行 `kind="recall_emitted"` 审计到 events.ndjson；④ `statusline_loop` 周期把 `recent_recalls` 原子写到 `~/.cache/limem/recent_recalls.json` 供冷启动恢复与 daemon 不可达时 fallback。**`list_recent_recalls`** 由 MCP 工具 `limem_recent_recalls` 调用（daemon 不可达时回退读 `recent_recalls.json`）。
+
+**`consume_pending_recall`** 是 Claude Code / Codex Stop hook 用来在回答结束时主动给用户提示的入口：daemon 维护 `session_id → 待消费 record`，每次 `report_recall` 时刷新；Stop hook 取出后 daemon 立即清除 pending 并在 `last_displayed_signature_by_session[session_id]` 记下签名（基于 short_id 集合 + 来源计数的 sha1 前缀），下一轮如果两个签名一致 → 返回 null（静默去重，避免连续两轮提示同样内容）。失败 / pause / 空 items 时 hook 输出空 stdout，对用户不可见。

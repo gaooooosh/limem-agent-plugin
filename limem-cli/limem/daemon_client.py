@@ -14,7 +14,6 @@ import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Any
 
 from .config import (
@@ -73,7 +72,7 @@ def call(
             err = resp["error"]
             raise RPCError(int(err.get("code", -1)), err.get("message", ""), err.get("data"))
         return resp.get("result")
-    except (FileNotFoundError, ConnectionRefusedError, OSError, socket.timeout) as e:
+    except (TimeoutError, FileNotFoundError, ConnectionRefusedError, OSError) as e:
         raise DaemonUnavailable(str(e)) from e
     finally:
         try:
@@ -224,6 +223,31 @@ def accept_suggestion(sid: str, edited_text: str | None = None, edited_entities:
 
 def discard_suggestion(sid: str) -> dict[str, Any] | None:
     return safe_call("discard_suggestion", {"id": sid})
+
+
+def report_recall(params: dict[str, Any]) -> None:
+    """fire-and-forget：daemon 不可达静默；hook 调用永不阻塞。"""
+    safe_call("report_recall", params)
+
+
+def list_recent_recalls(limit: int = 20) -> list[dict[str, Any]] | None:
+    """供 dash / CLI；daemon 不可达返回 None，调用方自行读 recent_recalls.json fallback。"""
+    r = safe_call("list_recent_recalls", {"limit": limit})
+    return r if isinstance(r, list) else None
+
+
+def consume_pending_recall(
+    session_id: str, *, dedupe: bool = True
+) -> dict[str, Any] | None:
+    """Stop hook 用：取出该 session 待消费的最新注入记录，取出后 daemon 即清除。
+    daemon 不可达 / 无 pending / 签名去重命中 → 返回 None。
+    """
+    if not session_id:
+        return None
+    r = safe_call(
+        "consume_pending_recall", {"session_id": session_id, "dedupe": dedupe}
+    )
+    return r if isinstance(r, dict) else None
 
 
 def shutdown() -> dict[str, Any] | None:
