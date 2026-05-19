@@ -124,7 +124,7 @@ parse_args() {
 
   # 简单合法性
   if [[ "$REF" == */* ]]; then
-    die "ref 不能包含斜杠：$REF（GitHub tarball URL 无法表达带斜杠的 ref）" 2
+    die "ref 不能包含斜杠：${REF}（GitHub tarball URL 无法表达带斜杠的 ref）" 2
   fi
 
   if [[ "$ACTION" == "update" && "$BOOTSTRAP_SET" == "0" && "$API_KEY_ARG_SET" == "0" ]]; then
@@ -157,10 +157,10 @@ detect_platform() {
         OS="wsl"
       fi
       ;;
-    *) die "暂不支持的系统：$uname_s（仅支持 macOS / Linux / WSL）" 10 ;;
+    *) die "暂不支持的系统：${uname_s}（仅支持 macOS / Linux / WSL）" 10 ;;
   esac
   ARCH="$(uname -m)"
-  dbg "OS=$OS  ARCH=$ARCH"
+  dbg "OS=${OS}  ARCH=${ARCH}"
   ok "环境：$OS / $ARCH"
 }
 
@@ -220,11 +220,11 @@ ensure_python() {
   ver="$("$py" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "0.0")"
   IFS=. read -r major minor <<<"$ver"
   if (( major < 3 || (major == 3 && minor < 10) )); then
-    warn "$py 版本 $ver 过低（LiMem 要求 ≥ 3.10）"
+    warn "${py} 版本 ${ver} 过低（LiMem 要求 ≥ 3.10）"
     python_missing
   fi
   PYTHON="$py"
-  ok "Python：$py ($ver)"
+  ok "Python：${py} (${ver})"
 }
 
 # ============================================================
@@ -292,25 +292,25 @@ cleanup_workdir() {
 }
 
 fetch_source() {
-  step "获取源码（ref=$REF）"
+  step "获取源码（ref=${REF}）"
   WORKDIR="$(mktemp -d -t limem-install.XXXXXX)"
   trap cleanup_workdir EXIT
 
   local tarball_url
   local downloaded=0
 
-  tarball_url="$REPO_URL/archive/refs/heads/$REF.tar.gz"
+  tarball_url="${REPO_URL}/archive/refs/heads/${REF}.tar.gz"
   if curl -fsSL "$tarball_url" -o "$WORKDIR/src.tar.gz" 2>/dev/null; then
     downloaded=1
     dbg "命中分支 tarball：$tarball_url"
   else
-    tarball_url="$REPO_URL/archive/refs/tags/$REF.tar.gz"
+    tarball_url="${REPO_URL}/archive/refs/tags/${REF}.tar.gz"
     if curl -fsSL "$tarball_url" -o "$WORKDIR/src.tar.gz" 2>/dev/null; then
       downloaded=1
       dbg "命中 tag tarball：$tarball_url"
     fi
   fi
-  (( downloaded )) || die "下载源码失败：$REPO_URL @ $REF（既不是分支也不是 tag？）" 13
+  (( downloaded )) || die "下载源码失败：${REPO_URL} @ ${REF}（既不是分支也不是 tag？）" 13
 
   tar -xzf "$WORKDIR/src.tar.gz" -C "$WORKDIR" || die "解压源码失败" 13
 
@@ -394,10 +394,10 @@ run_init() {
     if [[ "$INSTALL_TARGETS" == "auto" ]]; then
       die "limem init 失败，可手动重试：limem init" 15
     else
-      die "limem init 失败，可手动重试：limem init --targets $INSTALL_TARGETS" 15
+      die "limem init 失败，可手动重试：limem init --targets ${INSTALL_TARGETS}" 15
     fi
   fi
-  ok "init 完成（targets=$INSTALL_TARGETS, detected claude=$has_claude, codex=$has_codex）"
+  ok "init 完成（targets=${INSTALL_TARGETS}, detected claude=${has_claude}, codex=${has_codex}）"
 }
 
 # ============================================================
