@@ -8,7 +8,10 @@
 - Query body：{query, top_k}（**无 filters**，客户端必须二次过滤）
 - summary 由 LLM 生成，不含原始 tag token；客户端需本地镜像 event_metadata
 
-Entity / Pattern（v2 Breaking Change，2026-04 上线）
+Entity / Pattern（v3 Principal-Centric Model，2026-05-19）
+- v3：**pattern markdown 只挂在少量 principal 主体上**（user / agent / project，可选
+  team / service），mention（命令/路径/术语）只作为 event 文本与 tag-token，不注册后端
+  entity。`/limem.remember` 不再为每个 canonical 注册 entity。
 - 每个 entity 至多 1 篇 markdown 文档；卡片粒度 CRUD 已下线
 - POST /api/entities 可内联 `pattern: {content: "..."}`（**单对象**，不是数组）
   旧 `patterns: [...]` 字段 → 422
@@ -18,6 +21,7 @@ Entity / Pattern（v2 Breaking Change，2026-04 上线）
   返回同构 RecallEntityPatternResponse
 - DELETE /api/entities/{id}/patterns 硬删（无 archive；404 表示该实体当前无 pattern）
 - 无主检索 pipeline 消费 pattern；仅通过 /patterns/recall 独立召回（H2 切片打分）
+- DELETE /api/entities/{id} 硬删 entity 本体（v3 仅 `limem entity prune-legacy` 使用）
 """
 
 from __future__ import annotations
@@ -367,6 +371,21 @@ class LimemClient:
     def entity_list(self, *, db_id: str | None = None) -> dict[str, Any]:
         db = self._require_db(db_id)
         return self._request("GET", f"/db/{db}/api/entities")
+
+    def entity_delete(self, entity_id: str, *, db_id: str | None = None) -> dict[str, Any]:
+        """硬删 entity 本体（v3 prune-legacy 调试命令使用）。
+
+        正常 v3 链路不调用此方法；只在 `limem entity prune-legacy --delete` 内由用户
+        二次确认后触发。404 视为已不存在，返回空 dict。
+        """
+        db = self._require_db(db_id)
+        try:
+            r = self._request("DELETE", f"/db/{db}/api/entities/{entity_id}")
+        except LimemError as e:
+            if e.status == 404:
+                return {}
+            raise
+        return r or {}
 
     # ----- Entity Pattern markdown（v2） -----
 

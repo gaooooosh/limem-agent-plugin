@@ -46,33 +46,34 @@ def test_render_inject_via_and_short_id() -> None:
 
     items = [
         InjectItem(
+            kind="hard",
+            score=0.81,
             event_id="evt_abcdef1234567890",
             mem_type="rule",
             scope="project:foo/bar",
             summary="禁用 npm run dev，改 docker rebuild",
             importance=0.9,
             ts=1700000000,
-            source="pattern",
             short_id="abc123def456",
         ),
     ]
     text = render_inject(items, via_patterns=["npm dev"], via_keywords=["docker", "rebuild"])
-    assert 'via="pattern:npm dev | bm25:docker rebuild"' in text
+    assert 'via="entity:npm dev | bm25:docker rebuild"' in text
     assert "#abc123def456" in text
-    assert "src=pattern" in text
+    assert "src=hard" in text
 
 
-def test_pattern_index_short_id_roundtrip(tmp_path, monkeypatch) -> None:
+def test_entity_index_short_id_roundtrip(tmp_path) -> None:
+    from limem.entity_index import EntityIndex
+
     db = tmp_path / "patterns.sqlite"
-    from limem.pattern_index import PatternIndex
-
-    pidx = PatternIndex(db_path=db)
-    short = pidx.ensure_short_id("evt_xxxxxxxxxxxxxxxxxxxxxxxxx")
+    idx = EntityIndex(db_path=db)
+    short = idx.ensure_short_id("evt_xxxxxxxxxxxxxxxxxxxxxxxxx")
     assert len(short) >= 12
-    same = pidx.ensure_short_id("evt_xxxxxxxxxxxxxxxxxxxxxxxxx")
+    same = idx.ensure_short_id("evt_xxxxxxxxxxxxxxxxxxxxxxxxx")
     assert same == short
-    assert pidx.lookup_event_by_short_id(short) == "evt_xxxxxxxxxxxxxxxxxxxxxxxxx"
-    assert pidx.lookup_event_by_short_id("#" + short) == "evt_xxxxxxxxxxxxxxxxxxxxxxxxx"
+    assert idx.lookup_event_by_short_id(short) == "evt_xxxxxxxxxxxxxxxxxxxxxxxxx"
+    assert idx.lookup_event_by_short_id("#" + short) == "evt_xxxxxxxxxxxxxxxxxxxxxxxxx"
 
 
 def test_jaccard_clusters() -> None:
@@ -158,7 +159,7 @@ def test_pause_state_disk_roundtrip(tmp_path, monkeypatch) -> None:
 
 
 def test_learner_correction_detection() -> None:
-    from limem.daemon.learner import is_correction, extract_subject
+    from limem.daemon.learner import extract_subject, is_correction
     assert is_correction("不对，应该用 docker")
     assert is_correction("Don't use npm dev")
     assert not is_correction("hello world")

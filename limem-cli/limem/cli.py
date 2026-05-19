@@ -190,6 +190,26 @@ def bootstrap(api_key: str, base_url: str, db_name: str, select_db: str, save: b
         )
         creds.save()
         console.print(f"[green]saved to {USER_CREDENTIALS_PATH} (chmod 600)[/green]")
+
+        # v3：bootstrap 成功后注册 user principal（失败静默）
+        try:
+            from .entity_index import EntityIndex
+            from .principals import PrincipalSpec, register_principal
+
+            if result.user_id:
+                idx = EntityIndex()
+                spec = PrincipalSpec(
+                    principal_type="user",
+                    slug=result.user_id,
+                    description=f"当前 LiMem 账号用户：{result.user_id}",
+                    aliases=["我", "用户", "the user", "myself", result.user_id],
+                    scope="global",
+                    canonical=f"user:{result.user_id}",
+                )
+                eid = register_principal(spec, creds=creds, idx=idx, swallow=True)
+                console.print(f"[green]principal user → {eid}[/green]")
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[yellow]principal user 注册失败（已忽略）：{e}[/yellow]")
     else:
         console.print("[yellow]--no-save：未写入凭证文件[/yellow]")
 
@@ -311,9 +331,18 @@ def hook(tool: str, event: str) -> None:
 @click.option("--scope", default="", help="形如 project:owner/repo 或 global；默认按 cwd 检测")
 @click.option("--type", "mem_type", default="rule")
 @click.option("--importance", default=0.9, type=float)
-@click.option("--entity", "entities", multiple=True, help='canonical|role|p1,p2,p3；可重复')
+@click.option(
+    "--entity",
+    "entities",
+    multiple=True,
+    help="mention：canonical 或 canonical|role 或 canonical|role|alias1,alias2；可重复",
+)
 def remember(text: str, scope: str, mem_type: str, importance: float, entities: tuple[str, ...]) -> None:
-    """快速写入一条记忆（CLI 调试用）。"""
+    """快速写入一条记忆（CLI 调试用）。
+
+    v3：``--entity`` 描述一个 mention，**不会注册后端 entity**。第三段是 mention 别名。
+    若要为 user / agent / project 沉淀长期档案，用 ``limem pattern put <alias>``。
+    """
     from .memory_writer import EntitySpec
     from .memory_writer import remember as do_remember
     from .scope import detect_project_id
@@ -322,13 +351,16 @@ def remember(text: str, scope: str, mem_type: str, importance: float, entities: 
     effective_scope = scope or f"project:{project_id}"
     ents: list[EntitySpec] = []
     for raw in entities:
-        try:
-            canonical, role, patterns_csv = raw.split("|", 2)
-        except ValueError:
+        parts = raw.split("|", 2)
+        canonical = parts[0].strip()
+        if not canonical:
             console.print(f"[red]entity 格式错误[/red]: {raw}")
             sys.exit(2)
-        patterns = [p.strip() for p in patterns_csv.split(",") if p.strip()]
-        ents.append(EntitySpec(canonical=canonical.strip(), role=role.strip(), patterns=patterns))
+        role = parts[1].strip() if len(parts) > 1 else "neutral"
+        aliases: list[str] = []
+        if len(parts) > 2:
+            aliases = [a.strip() for a in parts[2].split(",") if a.strip()]
+        ents.append(EntitySpec(canonical=canonical, role=role, aliases=aliases))
 
     try:
         res = do_remember(
@@ -341,9 +373,14 @@ def remember(text: str, scope: str, mem_type: str, importance: float, entities: 
         sys.exit(1)
 
     console.print(
-        f"[green]✓ saved[/green] event_id={res.event_id} entities={len(res.entity_ids)} patterns={res.pattern_count}"
+        f"[green]✓ saved[/green] event_id={res.event_id} "
+        f"principals={len(res.principal_ids)} mentions={len(res.canonicals)}"
     )
     console.print(f"  scope={res.scope}")
+    if res.principal_ids:
+        console.print(f"  principal_ids: {', '.join(res.principal_ids)}")
+    if res.canonicals:
+        console.print(f"  canonicals: {', '.join(res.canonicals)}")
     console.print(f"  summary={res.summary}")
 
 
@@ -372,6 +409,29 @@ def init(project: bool, targets: str, no_hooks: bool, no_mcp: bool, no_skills: b
         console.print(t)
         if not (plan.local_json_written or plan.gitignore_patched):
             console.print("[yellow](no changes — already initialized)[/yellow]")
+
+        # v3：注册 project principal（失败静默）
+        try:
+            from .entity_index import EntityIndex
+            from .principals import PrincipalSpec, register_principal
+
+            creds = Credentials.load()
+            if creds.api_key and creds.db_id and plan.project_id:
+                idx = EntityIndex()
+                basename = plan.project_id.rsplit("/", 1)[-1] or plan.project_id
+                spec = PrincipalSpec(
+                    principal_type="project",
+                    slug=plan.project_id,
+                    project_id=plan.project_id,
+                    description=f"当前工作的项目：{plan.project_id}",
+                    aliases=list({plan.project_id, basename, "this project", "本项目", "当前项目"}),
+                    scope=f"project:{plan.project_id}",
+                    canonical=f"project:{basename}",
+                )
+                eid = register_principal(spec, creds=creds, idx=idx, swallow=True)
+                console.print(f"[green]principal project → {eid}[/green]")
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[yellow]principal project 注册失败（已忽略）：{e}[/yellow]")
         return
 
     target_list = [t.strip() for t in targets.split(",") if t.strip()] or detect_targets()
@@ -458,9 +518,26 @@ def evolve() -> None:
         sys.exit(1)
 
 
+def _resolve_principal_cli(alias_or_id: str) -> str:
+    """CLI 内的 alias → entity_id 解析。"""
+    from .entity_index import EntityIndex
+    from .principals import principal_alias_to_id
+    from .scope import detect_project_id
+
+    creds = Credentials.load()
+    project_id = detect_project_id()
+    idx = EntityIndex()
+    return principal_alias_to_id(
+        alias_or_id, creds=creds, project_id=project_id, tool="claude-code", idx=idx
+    )
+
+
 @main.group()
 def pattern() -> None:
-    """entity markdown 档案 CRUD（调试/调用 /limem.pattern skill 的等价 CLI）。"""
+    """principal markdown 档案 CRUD。
+
+    第一个参数支持 alias：``project`` / ``user`` / ``agent`` 或 stable entity_id。
+    """
 
 
 @pattern.command("get")
@@ -470,15 +547,16 @@ def pattern_get_cmd(entity_id: str) -> None:
     if not creds.api_key or not creds.db_id:
         console.print("[red]缺凭证/db_id[/red]")
         sys.exit(2)
+    eid = _resolve_principal_cli(entity_id)
     try:
-        res = LimemClient(creds=creds).patterns_get(entity_id)
+        res = LimemClient(creds=creds).patterns_get(eid)
     except LimemError as e:
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
     if not res.has_content():
-        console.print(f"[yellow]entity {entity_id} 暂无档案[/yellow]")
+        console.print(f"[yellow]principal {eid} 暂无档案[/yellow]")
         return
-    console.print(f"[bold]entity:[/bold] {entity_id}  ({res.total_chars} chars)")
+    console.print(f"[bold]principal:[/bold] {eid}  ({res.total_chars} chars)")
     console.print(res.content)
 
 
@@ -490,7 +568,7 @@ def pattern_get_cmd(entity_id: str) -> None:
     help="从文件读取 markdown（覆盖 stdin）",
 )
 def pattern_put_cmd(entity_id: str, file_path: str | None) -> None:
-    """整篇 upsert entity markdown。从 --file 或 stdin 读取内容。"""
+    """整篇 upsert principal markdown。从 --file 或 stdin 读取内容。"""
     from pathlib import Path
     if file_path:
         content = Path(file_path).read_text(encoding="utf-8")
@@ -500,28 +578,194 @@ def pattern_put_cmd(entity_id: str, file_path: str | None) -> None:
         console.print("[red]content is blank; 提供 --file 或在 stdin 输入[/red]")
         sys.exit(2)
     creds = Credentials.load()
+    eid = _resolve_principal_cli(entity_id)
     try:
-        action, p = LimemClient(creds=creds).patterns_upsert(entity_id, content)
+        action, p = LimemClient(creds=creds).patterns_upsert(eid, content)
     except LimemError as e:
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
     console.print(
-        f"[green]{action}[/green] entity={entity_id} pattern_id={p.pattern_id if p else '-'} "
+        f"[green]{action}[/green] principal={eid} pattern_id={p.pattern_id if p else '-'} "
         f"chars={len(content)}"
     )
 
 
 @pattern.command("delete")
 @click.argument("entity_id")
-@click.confirmation_option(prompt="确认硬删除 entity 档案？此操作不可撤销")
+@click.confirmation_option(prompt="确认硬删除 principal 档案？此操作不可撤销")
 def pattern_delete_cmd(entity_id: str) -> None:
     creds = Credentials.load()
+    eid = _resolve_principal_cli(entity_id)
     try:
-        snap = LimemClient(creds=creds).patterns_delete(entity_id)
+        snap = LimemClient(creds=creds).patterns_delete(eid)
     except LimemError as e:
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
-    console.print(f"[green]deleted[/green] entity={entity_id} previous_id={snap.pattern_id if snap else '-'}")
+    console.print(f"[green]deleted[/green] principal={eid} previous_id={snap.pattern_id if snap else '-'}")
+
+
+# ---------- v3：entity / principal 管理 ----------
+
+
+@main.group()
+def entity() -> None:
+    """principal 管理：list / register / activate / deactivate / prune-legacy。"""
+
+
+@entity.command("list")
+@click.option("--all", "show_all", is_flag=True, help="包含未激活的 principals")
+@click.option("--type", "principal_types", multiple=True, help="按类型过滤")
+def entity_list_cmd(show_all: bool, principal_types: tuple[str, ...]) -> None:
+    from .entity_index import EntityIndex
+
+    idx = EntityIndex()
+    rows = idx.list_principals(
+        active_only=not show_all,
+        principal_types=list(principal_types) or None,
+    )
+    if not rows:
+        console.print("[dim]no principals registered yet[/dim]")
+        return
+    t = Table(title=f"Principals ({len(rows)})")
+    t.add_column("type")
+    t.add_column("entity_id")
+    t.add_column("canonical")
+    t.add_column("pattern", justify="center")
+    t.add_column("active", justify="center")
+    for r in rows:
+        t.add_row(
+            r.principal_type,
+            r.entity_id,
+            (r.canonical or r.slug)[:48],
+            "✓" if r.has_pattern else "",
+            "✓" if r.active else "·",
+        )
+    console.print(t)
+
+
+@entity.command("register")
+@click.argument("principal_type", type=click.Choice(["user", "agent", "project", "team", "service"]))
+@click.argument("slug")
+@click.option("--description", default="", help="人类可读说明")
+@click.option("--alias", "aliases", multiple=True, help="可重复；写到后端 entity.aliases")
+@click.option("--scope", default="global")
+def entity_register_cmd(
+    principal_type: str, slug: str, description: str, aliases: tuple[str, ...], scope: str
+) -> None:
+    from .entity_index import EntityIndex
+    from .principals import PrincipalSpec, register_principal
+
+    creds = Credentials.load()
+    if not creds.api_key or not creds.db_id:
+        console.print("[red]缺凭证/db_id[/red]")
+        sys.exit(2)
+    idx = EntityIndex()
+    spec = PrincipalSpec(
+        principal_type=principal_type,  # type: ignore[arg-type]
+        slug=slug,
+        description=description or f"{principal_type}:{slug}",
+        aliases=list(aliases),
+        scope=scope,
+        canonical=f"{principal_type}:{slug}",
+    )
+    try:
+        eid = register_principal(spec, creds=creds, idx=idx, swallow=False)
+    except LimemError as e:
+        console.print(f"[red]register failed: {e}[/red]")
+        sys.exit(1)
+    console.print(f"[green]registered[/green] {eid}")
+
+
+@entity.command("activate")
+@click.argument("entity_id")
+def entity_activate_cmd(entity_id: str) -> None:
+    from .entity_index import EntityIndex
+
+    idx = EntityIndex()
+    eid = _resolve_principal_cli(entity_id)
+    idx.activate_principal(eid)
+    console.print(f"[green]activated[/green] {eid}")
+
+
+@entity.command("deactivate")
+@click.argument("entity_id")
+def entity_deactivate_cmd(entity_id: str) -> None:
+    from .entity_index import EntityIndex
+
+    idx = EntityIndex()
+    eid = _resolve_principal_cli(entity_id)
+    idx.deactivate_principal(eid)
+    console.print(f"[yellow]deactivated[/yellow] {eid}")
+
+
+@entity.command("prune-legacy")
+@click.option("--delete", is_flag=True, help="实际删除（默认仅 dry-run）")
+@click.confirmation_option(
+    prompt="确认要删除后端遗留 v2 dense entity？此操作不可撤销", default=False,
+    help="--yes 跳过确认（仅 --delete 需要）",
+)
+def entity_prune_legacy_cmd(delete: bool) -> None:
+    """列出/删除后端遗留 v2 dense entity（``entity_type != 'principal'`` 且含 linked_event_id）。"""
+    creds = Credentials.load()
+    if not creds.api_key or not creds.db_id:
+        console.print("[red]缺凭证/db_id[/red]")
+        sys.exit(2)
+    client = LimemClient(creds=creds)
+    try:
+        resp = client.entity_list()
+    except LimemError as e:
+        console.print(f"[red]entity_list failed: {e}[/red]")
+        sys.exit(1)
+
+    entities_raw: list[dict] = []
+    if isinstance(resp, dict):
+        entities_raw = list(resp.get("entities") or [])
+    elif isinstance(resp, list):
+        entities_raw = resp
+
+    legacy: list[dict] = []
+    for ent in entities_raw:
+        if not isinstance(ent, dict):
+            continue
+        etype = ent.get("entity_type") or ent.get("type") or ""
+        meta = ent.get("metadata") or {}
+        eid = ent.get("entity_id") or ent.get("id")
+        if not eid:
+            continue
+        if etype == "principal":
+            continue
+        if str(eid).startswith("principal_"):
+            continue
+        if "linked_event_id" in meta or "limem_scope" in meta:
+            legacy.append({"entity_id": eid, "entity_type": etype, "metadata": meta})
+
+    t = Table(title=f"Legacy entities ({len(legacy)})")
+    t.add_column("entity_id")
+    t.add_column("entity_type")
+    t.add_column("scope")
+    for ent in legacy[:50]:
+        t.add_row(
+            str(ent["entity_id"]),
+            ent["entity_type"] or "-",
+            (ent["metadata"] or {}).get("limem_scope", "-"),
+        )
+    console.print(t)
+    if len(legacy) > 50:
+        console.print(f"[dim]... and {len(legacy) - 50} more[/dim]")
+    if not legacy:
+        console.print("[green]nothing to prune[/green]")
+        return
+    if not delete:
+        console.print("[yellow]dry-run: 添加 --delete 实际删除[/yellow]")
+        return
+    deleted = 0
+    for ent in legacy:
+        try:
+            client.entity_delete(str(ent["entity_id"]))
+            deleted += 1
+        except LimemError as e:
+            console.print(f"[red]delete {ent['entity_id']} failed: {e}[/red]")
+    console.print(f"[green]deleted {deleted}/{len(legacy)} legacy entities[/green]")
 
 
 # ---------- daemon ----------

@@ -1,13 +1,15 @@
-"""四件写入业务逻辑（v2）：``remember`` / ``forget`` / ``fix`` / ``pattern``。
+"""四件写入业务逻辑（v3）：``remember`` / ``forget`` / ``fix`` / ``pattern``。
 
 阶段 1 决策：本地 SQLite 写路径统一走 daemon RPC。daemon 不可达时 fallback 到原同步路径。
 真正实现在 ``limem.daemon.writer``；本模块是**客户端薄层**。
 
-v2 变化（决策 3）：
-- ``EntitySpec`` 移除 ``patterns: list[str]``（trigger 短语数组已下线）；改成可选 ``aliases``/``description``。
-- 新增 ``update_pattern`` / ``get_pattern`` / ``delete_pattern``——entity markdown 档案的唯一写入入口
-  （供新 skill ``/limem.pattern`` 与 MCP 工具 ``limem_pattern_put`` 使用）。
-- ``fix`` 语义不变：只改 event 文本；要改 entity 档案请走 pattern API。
+v3 变化（principal-centric）：
+- ``EntitySpec`` 现在表示一个 **mention**（命令 / 路径 / 术语），而**不是后端 entity**。
+  字段保留 ``aliases / description / entity_type`` 以兼容旧 MCP/CLI 入参格式。
+- ``remember`` 返回 ``RememberResult{event_id, summary, principal_ids, canonicals, scope}``；
+  旧字段 ``entity_ids / pattern_count`` 仍保留但语义变为 principal_ids 的镜像。
+- ``update_pattern / get_pattern / delete_pattern`` 只接受 principal 的 stable entity_id；
+  CLI / MCP 层调用前应已用 ``principals.principal_alias_to_id`` 解析过别名。
 """
 
 from __future__ import annotations
@@ -31,9 +33,11 @@ from .entity_index import EntityIndex
 
 @dataclass
 class EntitySpec:
-    """注册到后端的 entity 描述。
+    """一个 mention（命令 / 路径 / 术语）的描述。
 
-    v2：不再包含 trigger 短语数组；aliases/description 是可选元信息。
+    v3：**不再注册为后端 entity**。``aliases`` 进入 BM25 tag-token 与本地
+    ``raw_metadata.canonicals`` / ``mentions`` 镜像；``description`` 仅记入本地 mentions
+    元信息，不上行。``entity_type`` 保留兼容但 writer 不再消费。
     """
 
     canonical: str
@@ -54,11 +58,26 @@ class EntitySpec:
 
 @dataclass
 class RememberResult:
+    """v3 remember 返回值。
+
+    - ``principal_ids``：本次 event 关联的 principal stable entity_ids
+    - ``canonicals``：被记录的 mention canonical 列表
+    - ``entity_ids`` / ``pattern_count``：v2 字段，等同于 principal_ids；仅为向后兼容
+    """
+
     event_id: str
     summary: str
-    entity_ids: list[str]
-    pattern_count: int  # 含义：本次镜像到本地 entity_index 的实体数（保留旧字段名）
     scope: str
+    principal_ids: list[str] = field(default_factory=list)
+    canonicals: list[str] = field(default_factory=list)
+
+    @property
+    def entity_ids(self) -> list[str]:
+        return list(self.principal_ids)
+
+    @property
+    def pattern_count(self) -> int:
+        return len(self.principal_ids)
 
 
 def remember(
@@ -100,9 +119,9 @@ def remember(
             return RememberResult(
                 event_id=rpc_result.get("event_id", ""),
                 summary=rpc_result.get("summary", ""),
-                entity_ids=list(rpc_result.get("entities_registered") or []),
-                pattern_count=int(rpc_result.get("patterns_indexed", 0)),
                 scope=rpc_result.get("scope", scope),
+                principal_ids=list(rpc_result.get("principal_ids") or []),
+                canonicals=list(rpc_result.get("canonicals") or []),
             )
 
     out = remember_impl(
@@ -123,9 +142,9 @@ def remember(
     return RememberResult(
         event_id=out["event_id"],
         summary=out["summary"],
-        entity_ids=list(out["entities_registered"]),
-        pattern_count=int(out["patterns_indexed"]),
         scope=out["scope"],
+        principal_ids=list(out.get("principal_ids") or []),
+        canonicals=list(out.get("canonicals") or []),
     )
 
 
@@ -165,7 +184,7 @@ def fix(
     return fix_impl(event_id=event_id, new_text=new_text, creds=creds, idx=idx)
 
 
-# ---------- v2 新增：entity markdown 档案 ----------
+# ---------- v3：principal markdown 档案 ----------
 
 
 def update_pattern(
@@ -175,7 +194,7 @@ def update_pattern(
     creds: Credentials | None = None,
     idx: EntityIndex | None = None,
 ) -> dict[str, Any]:
-    """整篇 upsert entity markdown 档案。不走 daemon（操作幂等且短）。"""
+    """整篇 upsert principal markdown 档案。不走 daemon（操作幂等且短）。"""
     return update_pattern_impl(entity_id=entity_id, content=content, creds=creds, idx=idx)
 
 
@@ -197,7 +216,6 @@ def delete_pattern(
     return delete_pattern_impl(entity_id=entity_id, creds=creds, idx=idx)
 
 
-# 暴露 LimemError 以便 skill / CLI 捕获时无需多 import
 __all__ = [
     "EntitySpec",
     "RememberResult",

@@ -105,15 +105,16 @@ class RuntimeConfig:
     """非敏感配置，可进 settings.json 但默认放 ~/.config/limem/config.json。"""
 
     inject_budget_hard: int = 800
-    inject_budget_pattern: int = 700  # v2：entity markdown 切片独立预算（决策 4）
+    inject_budget_pattern: int = 700  # principal markdown 切片独立预算
     inject_budget_soft: int = 1200
     soft_min_score: float = 0.6
+    # v2 遗留键：本地 entity FTS candidate 召回已下线（v3 直接对 active principals 并发），
+    # 保留字段防止旧 config.json 反序列化失败
     pattern_min_tokens: int = 2
-    # v2：本地 entity FTS 召回 top-N 个候选实体送去后端 /patterns/recall
     pattern_top_entities: int = 5
-    # v2：单个 entity /patterns/recall 的 HTTP 超时（毫秒），并发期间任何一个超时即跳过
+    # 单个 principal /patterns/recall 的 HTTP 超时（毫秒），并发期间任何一个超时即跳过
     patterns_recall_timeout_ms: int = 80
-    # v2：每个 entity 的 markdown 召回最多取前 N 个 H2 段（后端默认 3，此处缩小避免噪声）
+    # 每个 principal 的 markdown 召回最多取前 N 个 H2 段（后端默认 3，此处缩小避免噪声）
     patterns_recall_top_k_sections: int = 2
     hook_timeout_ms: int = 500
     bm25_query_top_k: int = 20

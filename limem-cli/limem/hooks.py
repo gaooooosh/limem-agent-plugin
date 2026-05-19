@@ -1,9 +1,12 @@
 """Hook 调度入口：``limem hook <tool> <event>``。
 
-v2 重写要点：
-- UserPromptSubmit 拆为 **3 路完全并发**：hard（本地）/ pattern（entity FTS + 后端 markdown 切片）
-  / soft（BM25），独立超时、独立预算。
-- SessionStart 仍只跑 hard（避免重复噪声）。
+v3 重写要点（principal-centric）：
+- UserPromptSubmit 拆为 **3 路完全并发**：hard / pattern（active principals 并发
+  ``patterns_recall``）/ soft（BM25），独立超时、独立预算。
+- SessionStart 跑 hard + pattern（对 active principals 用 "session start <project>
+  <tool>" 查询拉档案切片），不跑 soft。
+- 每次 hook 触发都会 lazy ``ensure_default_principals``（首次注册 user / agent /
+  project），失败永远 swallow。
 - SessionEnd / Codex Stop 缓冲池 / PostToolUse / PreCompact 行为保留。
 - 失败永远 swallow（hook 不能阻塞用户 prompt）。
 """
@@ -15,7 +18,8 @@ import json
 import sys
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutTimeout
 from pathlib import Path
 from typing import Any
 
@@ -23,17 +27,17 @@ from . import daemon_client, session_mute
 from .client import LimemClient, LimemError
 from .config import (
     EVENTS_LOG_PATH,
+    SESSIONS_DIR,
     Credentials,
     ProjectConfig,
     RuntimeConfig,
-    SESSIONS_DIR,
 )
 from .daemon.eventbus import emit_event
 from .daemon.state import (
     is_degraded_banner_emitted_on_disk,
     read_pause_from_disk,
 )
-from .entity_index import EntityHit, EntityIndex
+from .entity_index import EntityIndex, PrincipalRow
 from .injector import (
     Budgets,
     PatternRecallSlice,
@@ -42,10 +46,10 @@ from .injector import (
     render_inject,
     soft_recall_to_items,
 )
+from .principals import ensure_default_principals
 from .redact import contains_secret
 from .scope import detect_project_id, project_scope
 from .tag_text import build_recall_query
-
 
 # ---------- 日志 ----------
 
@@ -124,36 +128,36 @@ def _degraded_banner(reason: str) -> str:
     )
 
 
-def _patterns_recall_for_entities(
-    entity_hits: list[EntityHit],
+def _patterns_recall_for_principals(
+    principals: list[PrincipalRow],
     prompt: str,
     creds: Credentials,
     runtime: RuntimeConfig,
 ) -> list[PatternRecallSlice]:
-    """对候选实体并发拉取 markdown 切片。单 entity 超时即跳过，永不抛错。"""
-    if not entity_hits or not creds.api_key or not creds.db_id:
+    """对 active principals 并发拉取 markdown 切片。单 principal 超时即跳过。"""
+    if not principals or not creds.api_key or not creds.db_id:
         return []
 
     per_timeout_s = max(0.02, runtime.patterns_recall_timeout_ms / 1000.0)
     client = LimemClient(creds=creds, timeout=per_timeout_s)
 
-    def _fetch(eh: EntityHit) -> tuple[EntityHit, Any]:
+    def _fetch(p: PrincipalRow) -> tuple[PrincipalRow, Any]:
         try:
             res = client.patterns_recall(
-                eh.entity_id,
+                p.entity_id,
                 prompt,
-                mode="auto",
+                mode="section",
                 top_k_sections=runtime.patterns_recall_top_k_sections,
                 timeout=per_timeout_s,
             )
-            return eh, res
+            return p, res
         except Exception:
-            return eh, None
+            return p, None
 
     slices: list[PatternRecallSlice] = []
-    workers = min(8, max(1, len(entity_hits)))
+    workers = min(8, max(1, len(principals)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for eh, res in pool.map(_fetch, entity_hits):
+        for p, res in pool.map(_fetch, principals):
             if res is None or not res.has_content():
                 continue
             if res.matched_sections:
@@ -161,17 +165,45 @@ def _patterns_recall_for_entities(
                 score = sum(s.score for s in res.matched_sections)
             else:
                 head = ""
-                score = max(float(eh.importance or 0.0), 0.5)
+                score = 0.5
+            label = f"{p.principal_type}:{p.canonical or p.slug}"
             slices.append(
                 PatternRecallSlice(
-                    entity_id=eh.entity_id,
-                    canonical=eh.canonical,
+                    entity_id=p.entity_id,
+                    canonical=label,
                     heading=head,
                     content=res.content,
                     score=float(score),
                 )
             )
     return slices
+
+
+def _active_principals(
+    idx: EntityIndex,
+    creds: Credentials,
+    project_id: str,
+    tool: str,
+    *,
+    lazy_ensure: bool = True,
+) -> list[PrincipalRow]:
+    """读取 active principals；若空且允许，触发 ensure_default_principals 后再读一次。"""
+    try:
+        principals = idx.list_principals(active_only=True)
+    except Exception:
+        principals = []
+    if principals or not lazy_ensure:
+        return principals
+    try:
+        ensure_default_principals(
+            creds, project_id=project_id, tool=tool, idx=idx, client=None
+        )
+    except Exception:
+        pass
+    try:
+        return idx.list_principals(active_only=True)
+    except Exception:
+        return []
 
 
 # ---------- UserPromptSubmit ----------
@@ -224,9 +256,12 @@ def _hook_user_prompt_submit(
 
     idx = EntityIndex()
     scopes = _allowed_scopes(project_id)
+    active_principals = _active_principals(
+        idx, creds, project_id, tool, lazy_ensure=True
+    )
+    principal_id_set = {p.entity_id for p in active_principals}
 
     hard_metas = []
-    entity_hits: list[EntityHit] = []
     pattern_slices: list[PatternRecallSlice] = []
     soft_results: list = []
 
@@ -239,15 +274,12 @@ def _hook_user_prompt_submit(
         )
 
     def _do_pattern() -> None:
-        nonlocal entity_hits, pattern_slices
-        entity_hits = idx.search_entities(
-            prompt,
-            allowed_scopes=scopes,
-            limit=runtime.pattern_top_entities,
-            require_pattern=True,  # 没挂 markdown 的 entity 跳过，省一次 HTTP
+        nonlocal pattern_slices
+        if not active_principals:
+            return
+        pattern_slices = _patterns_recall_for_principals(
+            active_principals, prompt, creds, runtime
         )
-        if entity_hits:
-            pattern_slices = _patterns_recall_for_entities(entity_hits, prompt, creds, runtime)
 
     def _do_soft() -> None:
         nonlocal soft_results
@@ -255,7 +287,7 @@ def _hook_user_prompt_submit(
             return
         client = LimemClient(creds=creds, timeout=runtime.hook_timeout_ms / 1000.0)
         try:
-            q = build_recall_query(prompt, scopes=[], types=[], canonical_hints=None)
+            q = build_recall_query(prompt)
             soft_results = client.query(q, top_k=runtime.bm25_query_top_k)
             daemon_client.set_connectivity(status=200, ok=True)
         except LimemError as e:
@@ -280,6 +312,7 @@ def _hook_user_prompt_submit(
         soft_results,
         allowed_scopes=set(scopes),
         excluded_types={"rule", "feedback", "preference"},
+        allowed_principals=principal_id_set or None,
     )
 
     items = (
@@ -292,7 +325,7 @@ def _hook_user_prompt_submit(
     if muted:
         items = [it for it in items if (it.short_id or it.event_id[:12]) not in muted]
 
-    via_patterns = [eh.canonical for eh in entity_hits[:3]]
+    via_patterns = [p.canonical or p.slug for p in active_principals[:3]]
     via_keywords = _via_keywords(prompt, limit=2)
 
     budgets = Budgets(
@@ -317,7 +350,7 @@ def _hook_user_prompt_submit(
         scope=scope,
         prompt_head=prompt[:60],
         hard_hits=len(hard_metas),
-        entity_hits=len(entity_hits),
+        principals=len(active_principals),
         pattern_slices=len(pattern_slices),
         soft_hits=len(soft_results),
         soft_filtered=len(soft_filtered),
@@ -390,16 +423,35 @@ def _hook_session_start(
         allowed_types=["rule", "feedback", "preference"],
         min_importance=runtime.hard_min_importance,
     )
-    items = hard_recall_to_items(metas, idx=idx)
-    # SessionStart 仅 hard 段；pattern/soft 都为 0
-    budgets = Budgets(hard=runtime.inject_budget_hard, pattern=0, soft=0)
+
+    # 注册 / 刷新默认 principals（user / agent / project）
+    active_principals = _active_principals(
+        idx, creds, project_id, tool, lazy_ensure=True
+    )
+    pattern_slices: list[PatternRecallSlice] = []
+    if active_principals and creds.api_key and creds.db_id:
+        q = f"session start {project_id} {tool}".strip()
+        try:
+            pattern_slices = _patterns_recall_for_principals(
+                active_principals, q, creds, runtime
+            )
+        except Exception:
+            pattern_slices = []
+
+    items = hard_recall_to_items(metas, idx=idx) + pattern_recall_to_items(pattern_slices)
+    budgets = Budgets(
+        hard=runtime.inject_budget_hard,
+        pattern=runtime.inject_budget_pattern if pattern_slices else 0,
+        soft=0,
+    )
     text = render_inject(items, project_id=project_id, budgets=budgets)
     if items:
         daemon_client.bump_hit(session_id)
     _log(
         "session_start", tool,
         session_id=session_id, project_id=project_id, scope=scope,
-        hard_recall=len(metas), injected_chars=len(text),
+        hard_recall=len(metas), principals=len(active_principals),
+        pattern_slices=len(pattern_slices), injected_chars=len(text),
     )
     emit_event(
         "session_start", tool=tool, session_id=session_id,

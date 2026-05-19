@@ -2,29 +2,36 @@
 
 格式约定：
 - ``[limem.<key>=<value>]`` — 单值（如 scope/type）
-- ``[limem.<key>= <a> | <b> | <c>]`` — 列表（如 patterns/canonical）
+- ``[limem.<key>= <a> | <b> | <c>]`` — 列表（如 canonical / principal）
 
-设计动机：LiMem 后端 query 端点不接 filters，scope/type 过滤必须靠 BM25 命中 + 客户端二次过滤。
+v3：``encode_tags`` 在**写入侧**把 scope / type / canonical / principal 一并 token 化嵌入
+event 文本，让 BM25 同时索引内容与元信息；**查询侧不再追加这些 hint token**（语义噪声大），
+权威过滤由 ``EntityIndex.filter_query_results`` 用本地镜像完成。
 """
 
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from collections.abc import Iterable
 
 _TAG_RE = re.compile(r"\[limem\.([a-z_]+)=([^\]]*)\]")
 
 
 def encode_tags(**kwargs: str | Iterable[str] | None) -> str:
-    """把扁平 kv 转成 token 串。值为列表时用 ``|`` 分隔，前后各加空格确保 BM25 分词。"""
+    """把扁平 kv 转成 token 串。值为列表时用 ``|`` 分隔，前后各加空格确保 BM25 分词。
+
+    支持的 key（约定，非强制）：``scope`` / ``type`` / ``canonical`` / ``principal``。
+    """
     parts: list[str] = []
     for key, value in kwargs.items():
         if value is None:
             continue
         if isinstance(value, str):
+            if not value:
+                continue
             parts.append(f"[limem.{key}={value}]")
         else:
-            items = list(value)
+            items = [str(v) for v in value if v]
             if not items:
                 continue
             joined = " | ".join(items)
@@ -49,17 +56,18 @@ def extract_tags(text: str) -> dict[str, list[str]]:
 def build_recall_query(
     user_prompt: str,
     *,
-    scopes: list[str],
-    types: list[str],
+    scopes: list[str] | None = None,
+    types: list[str] | None = None,
     canonical_hints: list[str] | None = None,
 ) -> str:
-    """召回查询：把允许的 scope/type 也 token 化，让 BM25 同时利用 prompt 和 tag。"""
-    tag = encode_tags(
-        scope=scopes,
-        type=types,
-        canonical=canonical_hints or [],
-    )
-    return f"{tag} {user_prompt}".strip()
+    """召回查询构造器。
+
+    v3 行为：默认**只返回 prompt 原文**。历史参数 ``scopes`` / ``types`` /
+    ``canonical_hints`` 保留为接口签名以兼容旧调用方，但不再追加到查询字符串
+    （baseline 噪声大、且权威过滤已迁移到本地 metadata 镜像）。
+    """
+    _ = (scopes, types, canonical_hints)  # 接口保留，参数不再写入查询
+    return (user_prompt or "").strip()
 
 
 def matches_scope(text: str, allowed_scopes: set[str]) -> bool:

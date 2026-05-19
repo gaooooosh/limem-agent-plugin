@@ -4,17 +4,17 @@ description: >-
   Update an existing memory **event's** text in-place via short_id (#xxxx). Use
   when user wants to refine an event's wording without creating a new record
   ("把那条改成 …", "fix the rule about npm dev"). Calls MCP `limem_fix`. Does
-  NOT touch entity markdown profiles — use /limem.pattern for those.
+  NOT touch principal markdown profiles — use /limem.pattern for those.
 arguments: [short_id, new_text]
 ---
 
 # /limem.fix — 修订已有 event 文本（通过 short_id）
 
-## 边界（v2）
+## 边界（v3）
 
 本 skill 只改 **event** 的原文 / summary（后端 `graph/update` + 本地 event_metadata 镜像）。
-它**不会**修改任何 entity 的 markdown 档案——后端 pattern 是另一份独立资源，
-若想修订档案请使用 `/limem.pattern <entity_id_or_canonical>`。两条路径正交，
+它**不会**修改任何 principal 的 markdown 档案——后端 pattern 是另一份独立资源，
+若想修订档案请使用 `/limem.pattern project|user|agent`。两条路径正交，
 保持职责清晰，避免一次 fix 同时改两处导致历史链混乱。
 
 ## 何时调用
@@ -35,12 +35,12 @@ arguments: [short_id, new_text]
        <旧文本>
      → <新文本>
 
-   提示：如果你是想修订某个实体的档案而不是 event 文本，使用：
-       /limem.pattern <entity_id_or_canonical>
+   提示：如果你是想修订某个 principal 的档案而不是 event 文本，使用：
+       /limem.pattern <project|user|agent>
    ```
 
 ## 注意
 
 - 这是 **update**，不是 create；event_id 不变，历史链保留
-- 若 short_id 不在本地映射，工具会返回 NOT_FOUND_SHORT_ID 错误，提示用户检查 id 拼写
-- 不会重新跑 entity 抽取（即新文本里出现新实体不会自动注册）
+- 若 short_id 不在本地映射，工具会返回 NOT_FOUND_SHORT_ID 错误
+- 不会重新跑 mention 抽取（即新文本里出现新 canonical 不会自动写入 metadata）

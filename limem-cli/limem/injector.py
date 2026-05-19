@@ -64,8 +64,15 @@ class InjectItem:
             content = self.pattern_content.strip()
             if len(content) > per_item_chars:
                 content = content[: per_item_chars - 1] + "…"
+            # canonical 形如 "project:foo-bar" / "user:abc" / "agent:codex"
+            # 优先用 ":" 前的 principal_type 作为标签头；没有则退回 canonical/entity_id
             name = self.canonical or self.entity_id
-            return f"[{name} · {head}]\n{content} src=pattern"
+            if ":" in name:
+                ptype, body = name.split(":", 1)
+                label = f"{ptype} · {body or name}"
+            else:
+                label = name
+            return f"[{label} · {head}]\n{content} src=pattern"
         date = (
             time.strftime("%Y-%m-%d", time.localtime(self.ts)) if self.ts else "????-??-??"
         )

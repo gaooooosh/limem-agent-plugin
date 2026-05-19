@@ -1,7 +1,7 @@
 {
   "name": "limem",
-  "version": "0.2.0",
-  "description": "LiMem long-term memory for Codex (v2) — entity-centric markdown profiles, three-tier recall (hard / pattern / soft), server-side section scoring.",
+  "version": "0.3.0",
+  "description": "Principal-centric LiMem memory model: user / agent / project markdown profiles plus three-tier event recall (hard / pattern / soft) with server-side section scoring.",
   "author": "gaooooosh",
   "homepage": "https://limem.gaooooosh.art",
   "license": "MIT",

@@ -1,15 +1,16 @@
 """LiMem MCP stdio server。
 
-v2 工具集（变化集中在 search / write / pattern_* / fix）：
-- ``limem_search``  ：entity FTS5 候选 → 并发后端 markdown 切片 + BM25 软召回，三段聚合
-- ``limem_write``   ：写一条 event + 注册（晋升）entity；**不再支持 trigger 短语数组**
-- ``limem_forget``  ：归档 event
-- ``limem_fix``     ：修改 event 文本（不动 entity markdown）
-- ``limem_list``    ：列出本项目 + global 的强规则
-- ``limem_pause``   / ``limem_resume`` / ``limem_mute``  ：保留
-- ``limem_ping``    / ``limem_stats`` ：保留（stats 输出新 entity 维度）
-- ``limem_pattern_get`` / ``limem_pattern_put`` / ``limem_pattern_delete``  ：v2 新增
-   entity markdown 档案的 CRUD（唯一面向 LLM 的入口；用户侧通过 /limem.pattern skill）
+v3 工具集（principal-centric）：
+- ``limem_search`` ：对 active principals 并发 ``patterns_recall`` + BM25 软召回，三段聚合
+- ``limem_write``  ：写一条 event；``entities`` 入参降级为 mention 元信息，**不再注册后端 entity**
+- ``limem_forget`` ：归档 event
+- ``limem_fix``    ：修改 event 文本（不动 principal markdown）
+- ``limem_list``   ：列出本项目 + global 的强规则
+- ``limem_pause`` / ``limem_resume`` / ``limem_mute`` ：保留
+- ``limem_ping``  / ``limem_stats`` ：保留（stats 输出 principals 维度）
+- ``limem_pattern_{get,put,delete}`` ：principal markdown CRUD，入参支持 alias
+  (``"project" / "user" / "agent"``) 或 stable entity_id
+- ``limem_principal_{list,register,activate,deactivate}`` ：principal 管理（v3 新增）
 """
 
 from __future__ import annotations
@@ -22,20 +23,38 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from . import daemon_client, session_mute
-from .client import LimemClient, LimemError, PatternRecallResult
+from .client import LimemClient, LimemError
 from .config import Credentials, RuntimeConfig
 from .entity_index import EntityIndex
 from .memory_writer import (
     EntitySpec,
+)
+from .memory_writer import (
     delete_pattern as do_pattern_delete,
+)
+from .memory_writer import (
     fix as do_fix,
+)
+from .memory_writer import (
     forget as do_forget,
+)
+from .memory_writer import (
     get_pattern as do_pattern_get,
+)
+from .memory_writer import (
     remember as do_remember,
+)
+from .memory_writer import (
     update_pattern as do_pattern_put,
 )
+from .principals import (
+    PrincipalSpec,
+    ensure_default_principals,
+    entity_id_for,
+    principal_alias_to_id,
+    register_principal,
+)
 from .scope import detect_project_id
-
 
 server: Server = Server("limem")
 
@@ -47,9 +66,8 @@ async def _list_tools() -> list[Tool]:
             name="limem_search",
             description=(
                 "Search LiMem long-term memory for the current user/project. "
-                "Returns matched memories (rules / events) AND any relevant entity "
-                "markdown sections (`pattern` source). Use when you need to recall "
-                "what the user has previously asked you to remember."
+                "Returns matched memories (events) AND principal markdown sections "
+                "(`pattern` source: user / agent / project profiles)."
             ),
             inputSchema={
                 "type": "object",
@@ -66,8 +84,10 @@ async def _list_tools() -> list[Tool]:
             name="limem_write",
             description=(
                 "Persist a long-term memory event. Use when user says 'remember X' / "
-                "'don't do Y' / 'always Z'. To edit an entity's markdown profile use "
-                "limem_pattern_put instead."
+                "'don't do Y' / 'always Z'. v3: `entities` is mention metadata only "
+                "(canonicals + aliases) — it is NOT registered as a backend entity. "
+                "To attach a markdown profile to user / agent / project, call "
+                "`limem_pattern_put` with alias 'user' / 'agent' / 'project'."
             ),
             inputSchema={
                 "type": "object",
@@ -86,6 +106,7 @@ async def _list_tools() -> list[Tool]:
                     "importance": {"type": "number", "default": 0.9, "minimum": 0, "maximum": 1},
                     "entities": {
                         "type": "array",
+                        "description": "Mentions (deprecated name). canonical / aliases only.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -138,7 +159,7 @@ async def _list_tools() -> list[Tool]:
         ),
         Tool(
             name="limem_stats",
-            description="Show local SQLite cache statistics (entities/events/short_ids).",
+            description="Show local SQLite cache statistics (principals/events/short_ids).",
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
@@ -165,8 +186,8 @@ async def _list_tools() -> list[Tool]:
             name="limem_fix",
             description=(
                 "Update an existing memory event's text in-place via short_id (#xxxx) "
-                "or full event_id. Does NOT create a new event. For editing an entity's "
-                "markdown profile, use limem_pattern_put instead."
+                "or full event_id. Does NOT create a new event. For editing principal "
+                "markdown profiles, use limem_pattern_put instead."
             ),
             inputSchema={
                 "type": "object",
@@ -192,12 +213,12 @@ async def _list_tools() -> list[Tool]:
                 "required": ["short_id", "session_id"],
             },
         ),
-        # v2 新增：entity markdown 档案 CRUD
+        # principal markdown CRUD（alias 解析支持 "project" / "user" / "agent"）
         Tool(
             name="limem_pattern_get",
             description=(
-                "Fetch the entire markdown profile attached to a registered entity. "
-                "Use to read what is currently stored before editing."
+                "Fetch the entire markdown profile of a principal. "
+                "`entity_id` accepts aliases 'project' / 'user' / 'agent' or a stable id."
             ),
             inputSchema={
                 "type": "object",
@@ -208,8 +229,8 @@ async def _list_tools() -> list[Tool]:
         Tool(
             name="limem_pattern_put",
             description=(
-                "Replace an entity's markdown profile with new content (whole-document upsert). "
-                "Caller is responsible for merging if partial edits are intended."
+                "Replace a principal's markdown profile (whole-document upsert). "
+                "`entity_id` accepts aliases 'project' / 'user' / 'agent' or a stable id."
             ),
             inputSchema={
                 "type": "object",
@@ -217,7 +238,7 @@ async def _list_tools() -> list[Tool]:
                     "entity_id": {"type": "string"},
                     "content": {
                         "type": "string",
-                        "description": "Full markdown content; non-empty. H2 sections will be used for recall scoring.",
+                        "description": "Full markdown content; non-empty. H2 sections are used for recall scoring.",
                     },
                 },
                 "required": ["entity_id", "content"],
@@ -225,7 +246,62 @@ async def _list_tools() -> list[Tool]:
         ),
         Tool(
             name="limem_pattern_delete",
-            description="Hard-delete an entity's markdown profile. The entity itself is NOT removed.",
+            description="Hard-delete a principal's markdown profile. The principal itself is NOT removed.",
+            inputSchema={
+                "type": "object",
+                "properties": {"entity_id": {"type": "string"}},
+                "required": ["entity_id"],
+            },
+        ),
+        # v3：principal 管理
+        Tool(
+            name="limem_principal_list",
+            description="List active principals (user / agent / project / team / service).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "active_only": {"type": "boolean", "default": True},
+                    "principal_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Filter by type (user/agent/project/team/service).",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="limem_principal_register",
+            description=(
+                "Register a new principal (typically team / service). Default principals "
+                "(user / agent / project) are auto-ensured on SessionStart and do not need this."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "principal_type": {
+                        "type": "string",
+                        "enum": ["user", "agent", "project", "team", "service"],
+                    },
+                    "slug": {"type": "string"},
+                    "description": {"type": "string"},
+                    "aliases": {"type": "array", "items": {"type": "string"}},
+                    "scope": {"type": "string", "default": "global"},
+                },
+                "required": ["principal_type", "slug", "description"],
+            },
+        ),
+        Tool(
+            name="limem_principal_activate",
+            description="Re-activate a deactivated principal so it participates in recall again.",
+            inputSchema={
+                "type": "object",
+                "properties": {"entity_id": {"type": "string"}},
+                "required": ["entity_id"],
+            },
+        ),
+        Tool(
+            name="limem_principal_deactivate",
+            description="Deactivate a principal: stop calling /patterns/recall on it. Markdown is preserved.",
             inputSchema={
                 "type": "object",
                 "properties": {"entity_id": {"type": "string"}},
@@ -264,6 +340,14 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             text = _t_pattern_put(**arguments)
         elif name == "limem_pattern_delete":
             text = _t_pattern_delete(**arguments)
+        elif name == "limem_principal_list":
+            text = _t_principal_list(**arguments)
+        elif name == "limem_principal_register":
+            text = _t_principal_register(**arguments)
+        elif name == "limem_principal_activate":
+            text = _t_principal_activate(**arguments)
+        elif name == "limem_principal_deactivate":
+            text = _t_principal_deactivate(**arguments)
         else:
             text = json.dumps({"error": f"unknown tool: {name}"}, ensure_ascii=False)
     except (LimemError, ValueError) as e:
@@ -286,6 +370,18 @@ def _resolve_event_id(input_id: str) -> str:
     return looked or input_id
 
 
+def _resolve_principal_id(alias_or_id: str, *, idx: EntityIndex | None = None) -> str:
+    """alias → stable entity_id；不存在则返回原值（让下游 404 报错）。"""
+    idx = idx or EntityIndex()
+    creds = Credentials.load()
+    project_id = detect_project_id()
+    # 工具名未知（mcp 是单 server，无 hook 上下文）；用占位 "claude-code" 让 agent alias 也可解析
+    tool = "claude-code"
+    return principal_alias_to_id(
+        alias_or_id, creds=creds, project_id=project_id, tool=tool, idx=idx
+    )
+
+
 def _t_search(
     query: str,
     *,
@@ -302,23 +398,24 @@ def _t_search(
     out_events: list[dict[str, Any]] = []
     out_patterns: list[dict[str, Any]] = []
 
-    # 1) entity FTS → 后端 markdown 切片
+    # 1) 对 active principals 并发 patterns_recall
     if include_patterns and creds.api_key and creds.db_id:
-        entity_hits = idx.search_entities(
-            query,
-            allowed_scopes=scopes,
-            limit=min(top_k, runtime.pattern_top_entities),
-            require_pattern=True,
-        )
+        try:
+            ensure_default_principals(
+                creds, project_id=project_id, tool="claude-code", idx=idx
+            )
+        except Exception:
+            pass
+        principals = idx.list_principals(active_only=True)
         client = LimemClient(
             creds=creds, timeout=runtime.patterns_recall_timeout_ms / 1000.0
         )
-        for eh in entity_hits:
+        for p in principals:
             try:
-                res: PatternRecallResult = client.patterns_recall(
-                    eh.entity_id,
+                res = client.patterns_recall(
+                    p.entity_id,
                     query,
-                    mode="auto",
+                    mode="section",
                     top_k_sections=runtime.patterns_recall_top_k_sections,
                 )
             except LimemError:
@@ -329,9 +426,10 @@ def _t_search(
                 continue
             out_patterns.append(
                 {
-                    "entity_id": eh.entity_id,
-                    "canonical": eh.canonical,
-                    "scope": eh.scope,
+                    "entity_id": p.entity_id,
+                    "principal_type": p.principal_type,
+                    "canonical": p.canonical,
+                    "scope": p.scope,
                     "mode": res.mode,
                     "matched_sections": [
                         {"heading": s.heading, "score": s.score} for s in res.matched_sections
@@ -341,8 +439,9 @@ def _t_search(
                 }
             )
 
-    # 2) BM25 软召回
+    # 2) BM25 soft 召回
     soft_results = []
+    principal_id_set = {p.entity_id for p in idx.list_principals(active_only=True)} or None
     if creds.api_key and creds.db_id:
         client = LimemClient(creds=creds)
         try:
@@ -360,6 +459,7 @@ def _t_search(
         allowed_scopes=set(scopes),
         allowed_types=set(include_types) if include_types else None,
         excluded_types=excluded if not include_types else None,
+        allowed_principals=principal_id_set,
     )
 
     seen: set[str] = set()
@@ -399,6 +499,7 @@ def _serialize_event(meta, *, source: str, score: float | None = None) -> dict[s
         "bm25_score": score,
         "text": raw.get("original_text") or meta.summary,
         "canonicals": raw.get("canonicals", []),
+        "principal_ids": raw.get("principal_ids", []),
     }
 
 
@@ -443,18 +544,20 @@ def _t_write(
         session_id=session_id,
         detail=detail,
     )
+    next_step = (
+        "If this should become a persistent profile, call limem_pattern_put with "
+        "entity_id='project' / 'user' / 'agent'."
+        if res.principal_ids
+        else ""
+    )
     return json.dumps(
         {
             "event_id": res.event_id,
             "scope": res.scope,
             "summary": res.summary,
-            "entities_registered": res.entity_ids,
-            "entities_indexed": res.pattern_count,
-            "next_step": (
-                "Run limem_pattern_put to attach a markdown profile to one of the entities."
-                if res.entity_ids
-                else ""
-            ),
+            "principal_ids": res.principal_ids,
+            "canonicals": res.canonicals,
+            "next_step": next_step,
         },
         ensure_ascii=False,
     )
@@ -483,10 +586,20 @@ def _t_list(types: list[str] | None = None, *, include_global: bool = True) -> s
         allowed_scopes=scopes,
         allowed_types=types or ["rule", "feedback", "preference"],
     )
+    principals = idx.list_principals(active_only=True)
     return json.dumps(
         {
             "project_id": project_id,
             "items": [_serialize_event(m, source="list") for m in metas],
+            "principals": [
+                {
+                    "entity_id": p.entity_id,
+                    "principal_type": p.principal_type,
+                    "canonical": p.canonical,
+                    "has_pattern": p.has_pattern,
+                }
+                for p in principals
+            ],
         },
         ensure_ascii=False,
     )
@@ -522,8 +635,9 @@ def _t_pause(
         duration_seconds=duration_seconds, scope=scope, session_id=session_id
     )
     if res is None:
-        from .daemon.state import PauseState
         import time as _t
+
+        from .daemon.state import PauseState
         until = int(_t.time()) + duration_seconds if duration_seconds > 0 else None
         p = PauseState(on=True, until_ts=until, scope=scope, session_id=session_id)
         p.save_to_disk()
@@ -554,24 +668,103 @@ def _t_mute(short_id: str, session_id: str) -> str:
     )
 
 
-# ---------- entity markdown 档案 ----------
+# ---------- principal markdown ----------
 
 
 def _t_pattern_get(entity_id: str) -> str:
-    res = do_pattern_get(entity_id=entity_id)
-    return json.dumps(res, ensure_ascii=False)
+    eid = _resolve_principal_id(entity_id)
+    res = do_pattern_get(entity_id=eid)
+    return json.dumps({"alias_resolved_to": eid, **res}, ensure_ascii=False)
 
 
 def _t_pattern_put(entity_id: str, content: str) -> str:
     if not (content or "").strip():
         return json.dumps({"error": "content must not be blank"}, ensure_ascii=False)
-    res = do_pattern_put(entity_id=entity_id, content=content)
-    return json.dumps(res, ensure_ascii=False)
+    eid = _resolve_principal_id(entity_id)
+    res = do_pattern_put(entity_id=eid, content=content)
+    return json.dumps({"alias_resolved_to": eid, **res}, ensure_ascii=False)
 
 
 def _t_pattern_delete(entity_id: str) -> str:
-    res = do_pattern_delete(entity_id=entity_id)
-    return json.dumps(res, ensure_ascii=False)
+    eid = _resolve_principal_id(entity_id)
+    res = do_pattern_delete(entity_id=eid)
+    return json.dumps({"alias_resolved_to": eid, **res}, ensure_ascii=False)
+
+
+# ---------- principal 管理 ----------
+
+
+def _t_principal_list(
+    *,
+    active_only: bool = True,
+    principal_types: list[str] | None = None,
+) -> str:
+    idx = EntityIndex()
+    rows = idx.list_principals(
+        active_only=active_only, principal_types=principal_types or None
+    )
+    return json.dumps(
+        {
+            "principals": [
+                {
+                    "entity_id": r.entity_id,
+                    "principal_type": r.principal_type,
+                    "slug": r.slug,
+                    "canonical": r.canonical,
+                    "aliases": r.aliases,
+                    "description": r.description,
+                    "scope": r.scope,
+                    "tool": r.tool,
+                    "project_id": r.project_id,
+                    "has_pattern": r.has_pattern,
+                    "active": r.active,
+                    "last_seen_ts": r.last_seen_ts,
+                }
+                for r in rows
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
+def _t_principal_register(
+    principal_type: str,
+    slug: str,
+    description: str,
+    *,
+    aliases: list[str] | None = None,
+    scope: str = "global",
+) -> str:
+    creds = Credentials.load()
+    idx = EntityIndex()
+    spec = PrincipalSpec(
+        principal_type=principal_type,  # type: ignore[arg-type]
+        slug=slug,
+        description=description,
+        aliases=list(aliases or []),
+        scope=scope,
+        canonical=f"{principal_type}:{slug}",
+    )
+    eid = register_principal(spec, creds=creds, idx=idx, swallow=False)
+    return json.dumps({"entity_id": eid, "registered": True}, ensure_ascii=False)
+
+
+def _t_principal_activate(entity_id: str) -> str:
+    idx = EntityIndex()
+    eid = _resolve_principal_id(entity_id, idx=idx)
+    idx.activate_principal(eid)
+    return json.dumps({"entity_id": eid, "active": True}, ensure_ascii=False)
+
+
+def _t_principal_deactivate(entity_id: str) -> str:
+    idx = EntityIndex()
+    eid = _resolve_principal_id(entity_id, idx=idx)
+    idx.deactivate_principal(eid)
+    return json.dumps({"entity_id": eid, "active": False}, ensure_ascii=False)
+
+
+# 保留导入以便扩展模块复用（避免 lint 警告）
+_ = entity_id_for
 
 
 def main() -> None:

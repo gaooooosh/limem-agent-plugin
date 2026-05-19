@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import json
 import shutil
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import tomli_w
-
+import tomllib
 
 # ---------- 路径常量 ----------
 
@@ -341,6 +340,27 @@ def install_all(
             if enable_skills:
                 plan.codex_skills_copied = copy_skills("codex")
                 plan.notes.append(f"codex: skills {plan.codex_skills_copied} 个")
+
+    # v3：首次 install 时尝试注册 user / project 默认 principals（失败静默）
+    try:
+        from .config import Credentials
+        from .entity_index import EntityIndex
+        from .principals import ensure_default_principals
+        from .scope import detect_project_id
+
+        creds = Credentials.load()
+        if creds.api_key and creds.db_id:
+            ids = ensure_default_principals(
+                creds,
+                project_id=detect_project_id(),
+                tool="",  # tool 由 SessionStart hook 时再补 agent principal
+                idx=EntityIndex(),
+            )
+            if ids:
+                plan.notes.append(f"principals ensured: {', '.join(ids)}")
+    except Exception as e:  # noqa: BLE001
+        plan.notes.append(f"principals ensure skipped: {e}")
+
     return plan
 
 

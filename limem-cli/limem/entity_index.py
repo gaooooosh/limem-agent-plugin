@@ -1,27 +1,24 @@
-"""Entity Index + Event Metadata + short_id 本地 SQLite 缓存。
+"""Principal + Event Metadata + short_id 本地 SQLite 镜像（v3）。
 
-v2 重写：
-- 旧 ``patterns`` / ``patterns_fts`` 表（trigger 短语 trigram 索引）首次启动自动 DROP。
-- 新 ``entities`` / ``entities_fts`` 表：以**注册实体**为索引主体，FTS 字段为
-  canonical + aliases + description。命中后客户端再去后端拉对应 markdown 切片。
-- ``event_metadata`` / ``short_id_map`` 保留（与 pattern 无关，仍是后端 query summary
-  反查 scope/type 的权威镜像）。
+v3 重写要点：
+- ``principals`` 表是 pattern markdown 的唯一承载体（user / agent / project / team / service）
+- 不再维护 mention 级 ``entities`` 与 FTS5 索引；mention 只通过 event_metadata.raw_metadata
+  的 ``canonicals`` 字段保留
+- 软删除依赖 ``active=0`` 与 ``tombstone=1``；schema 版本不匹配时**直接 unlink 重建**
+  （本地缓存视为可重建数据，无迁移）
+- event_metadata / short_id_map 字段与 v2 一致，但 raw_metadata 新增 ``principal_ids``
 
-为什么仍然需要本地索引：
-- 后端 ``GET /api/entities/{id}/patterns/recall`` 只能针对**单个 entity**召回 markdown。
-  hook 在 UserPromptSubmit 时间窗内必须先快速决定 "哪些 entity 与当前 prompt 相关"，
-  这一步靠本地 FTS5 trigram（中英文混合，<15 ms）。
-- 后端 ``POST /query`` 不返回 metadata，summary 是 LLM 生成的纯文本（不含原始 tag token）；
-  仍需本地 event_metadata 镜像反查 scope/type。
-
-软删除用 ``tombstone`` 标记，便于 ``/limem.forget`` 撤销。
+仍然需要本地镜像的原因：
+- 后端 ``/patterns/recall`` 只能对单一 entity 召回，hook 内必须先在本地决定 "对哪些
+  principal 并发 recall"
+- 后端 ``/query`` 不返回 metadata，soft 召回结果必须靠本地 event_metadata 做权威 scope /
+  type / principal 过滤
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import re
 import sqlite3
 import time
 from collections.abc import Iterable, Iterator, Sequence
@@ -32,10 +29,10 @@ from typing import Any
 
 from .config import PATTERNS_DB_PATH
 
-# schema_version 用于驱动 v1 → v2 的本地表迁移。
-# v1：仅有 patterns/patterns_fts/event_metadata（trigger 短语索引）
-# v2：删除 patterns/patterns_fts，新增 entities/entities_fts；event_metadata + short_id_map 保留
-SCHEMA_VERSION = 2
+# v1：trigger 短语 FTS（已下线）
+# v2：mention 粒度 entities + entities_fts（已下线）
+# v3：principals 承载 pattern markdown；mention 仅作为 event tag
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS _schema_meta (
@@ -43,56 +40,24 @@ CREATE TABLE IF NOT EXISTS _schema_meta (
   applied_ts INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS entities (
-  entity_id     TEXT PRIMARY KEY,
-  canonical     TEXT NOT NULL,
-  aliases       TEXT,                -- JSON list[str]
-  description   TEXT,
-  entity_type   TEXT,
-  scope         TEXT NOT NULL,
-  role          TEXT,
-  importance    REAL DEFAULT 0.5,
-  last_seen_ts  INTEGER NOT NULL,
-  tombstone     INTEGER DEFAULT 0,
-  has_pattern   INTEGER DEFAULT 0,   -- 后端是否已挂 markdown
-  raw_metadata  TEXT
+CREATE TABLE IF NOT EXISTS principals (
+  entity_id      TEXT PRIMARY KEY,
+  principal_type TEXT NOT NULL,
+  slug           TEXT NOT NULL,
+  canonical      TEXT NOT NULL,
+  aliases        TEXT,
+  description    TEXT,
+  scope          TEXT NOT NULL,
+  tool           TEXT,
+  project_id     TEXT,
+  has_pattern    INTEGER DEFAULT 0,
+  active         INTEGER DEFAULT 1,
+  last_seen_ts   INTEGER NOT NULL,
+  raw_metadata   TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_entities_scope ON entities(scope);
-CREATE INDEX IF NOT EXISTS idx_entities_canonical ON entities(canonical);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
-  fts_text,
-  content='entities',
-  content_rowid='rowid',
-  tokenize='trigram'
-);
-
-CREATE TRIGGER IF NOT EXISTS entities_ai AFTER INSERT ON entities BEGIN
-  INSERT INTO entities_fts(rowid, fts_text)
-  VALUES (new.rowid,
-    coalesce(new.canonical, '') || ' ' ||
-    coalesce(new.aliases, '') || ' ' ||
-    coalesce(new.description, ''));
-END;
-CREATE TRIGGER IF NOT EXISTS entities_ad AFTER DELETE ON entities BEGIN
-  INSERT INTO entities_fts(entities_fts, rowid, fts_text)
-  VALUES('delete', old.rowid,
-    coalesce(old.canonical, '') || ' ' ||
-    coalesce(old.aliases, '') || ' ' ||
-    coalesce(old.description, ''));
-END;
-CREATE TRIGGER IF NOT EXISTS entities_au AFTER UPDATE ON entities BEGIN
-  INSERT INTO entities_fts(entities_fts, rowid, fts_text)
-  VALUES('delete', old.rowid,
-    coalesce(old.canonical, '') || ' ' ||
-    coalesce(old.aliases, '') || ' ' ||
-    coalesce(old.description, ''));
-  INSERT INTO entities_fts(rowid, fts_text)
-  VALUES (new.rowid,
-    coalesce(new.canonical, '') || ' ' ||
-    coalesce(new.aliases, '') || ' ' ||
-    coalesce(new.description, ''));
-END;
+CREATE INDEX IF NOT EXISTS idx_principals_type ON principals(principal_type);
+CREATE INDEX IF NOT EXISTS idx_principals_active ON principals(active);
+CREATE INDEX IF NOT EXISTS idx_principals_project ON principals(project_id);
 
 CREATE TABLE IF NOT EXISTS event_metadata (
   event_id     TEXT PRIMARY KEY,
@@ -120,21 +85,24 @@ CREATE INDEX IF NOT EXISTS idx_short_id_event ON short_id_map(event_id);
 """
 
 
+# ---------- 数据类 ----------
+
+
 @dataclass
-class EntityHit:
+class PrincipalRow:
     entity_id: str
+    principal_type: str
+    slug: str
     canonical: str
     aliases: list[str]
     description: str
     scope: str
-    role: str
-    importance: float
+    tool: str
+    project_id: str
     has_pattern: bool
-    bm25_score: float
-
-    def composite_score(self) -> float:
-        """FTS bm25 是负值，越接近 0 越好；importance ∈ [0,1] 越大越好。"""
-        return float(self.importance or 0.0) - float(self.bm25_score or 0.0) * 0.1
+    active: bool
+    last_seen_ts: int
+    raw_metadata: dict[str, Any]
 
 
 @dataclass
@@ -149,6 +117,13 @@ class EventMetadata:
     ts: int
     summary: str
     raw_metadata: dict[str, Any]
+
+
+# v2 兼容别名（仅供旧代码 import 路径平滑过渡；新代码用 PrincipalRow）
+EntityHit = PrincipalRow
+
+
+# ---------- 主类 ----------
 
 
 class EntityIndex:
@@ -170,183 +145,158 @@ class EntityIndex:
             conn.close()
 
     def _ensure_schema(self) -> None:
+        """schema 版本不匹配 → unlink 重建。**不迁移任何旧数据**。"""
+        if self.db_path.exists():
+            current = 0
+            try:
+                conn = sqlite3.connect(str(self.db_path))
+                try:
+                    cur = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='_schema_meta'"
+                    ).fetchone()
+                    if cur is not None:
+                        row = conn.execute("SELECT max(version) AS v FROM _schema_meta").fetchone()
+                        current = (row[0] if row else None) or 0
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                current = 0
+            if current != SCHEMA_VERSION:
+                # 直接删库重建，丢弃旧本地数据（旧 entities / patterns / FTS / metadata）
+                try:
+                    self.db_path.unlink()
+                except FileNotFoundError:
+                    pass
+
         with self._conn() as conn:
-            # 1) 创建 schema_meta（若不存在）
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS _schema_meta "
-                "(version INTEGER PRIMARY KEY, applied_ts INTEGER NOT NULL)"
-            )
-            row = conn.execute(
-                "SELECT max(version) AS v FROM _schema_meta"
-            ).fetchone()
-            current = (row["v"] if row else None) or 0
-
-            # 2) v1 → v2 迁移：DROP 旧 trigger 短语表
-            if current < SCHEMA_VERSION:
-                conn.execute("DROP TABLE IF EXISTS patterns_fts")
-                conn.execute("DROP TRIGGER IF EXISTS patterns_ai")
-                conn.execute("DROP TRIGGER IF EXISTS patterns_ad")
-                conn.execute("DROP TRIGGER IF EXISTS patterns_au")
-                conn.execute("DROP TABLE IF EXISTS patterns")
-
-            # 3) 重建/创建新 schema（幂等）
             conn.executescript(_SCHEMA)
+            conn.execute(
+                "INSERT OR REPLACE INTO _schema_meta(version, applied_ts) VALUES (?, ?)",
+                (SCHEMA_VERSION, int(time.time())),
+            )
 
-            if current < SCHEMA_VERSION:
-                conn.execute(
-                    "INSERT OR REPLACE INTO _schema_meta(version, applied_ts) VALUES (?, ?)",
-                    (SCHEMA_VERSION, int(time.time())),
-                )
+    # ---------- principals ----------
 
-    # ---------- Entity 写入 ----------
-
-    def upsert_entity(
+    def upsert_principal(
         self,
         *,
         entity_id: str,
+        principal_type: str,
+        slug: str,
         canonical: str,
         aliases: Sequence[str] | None = None,
         description: str = "",
-        entity_type: str = "",
-        scope: str = "",
-        role: str = "",
-        importance: float = 0.5,
-        has_pattern: bool = False,
+        scope: str = "global",
+        tool: str = "",
+        project_id: str = "",
+        has_pattern: bool | None = None,
+        active: bool = True,
+        last_seen_ts: int | None = None,
         raw_metadata: dict[str, Any] | None = None,
-        ts: int | None = None,
     ) -> None:
-        now = int(ts or time.time())
+        now = int(last_seen_ts or time.time())
         aliases_json = json.dumps(list(aliases or []), ensure_ascii=False)
         meta_json = json.dumps(raw_metadata or {}, ensure_ascii=False)
+        has_pat_value = None if has_pattern is None else (1 if has_pattern else 0)
         with self._conn() as conn:
             conn.execute(
                 """
-                INSERT INTO entities
-                  (entity_id, canonical, aliases, description, entity_type,
-                   scope, role, importance, last_seen_ts, has_pattern, raw_metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO principals
+                  (entity_id, principal_type, slug, canonical, aliases, description,
+                   scope, tool, project_id, has_pattern, active, last_seen_ts, raw_metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 0), ?, ?, ?)
                 ON CONFLICT(entity_id) DO UPDATE SET
-                  canonical    = excluded.canonical,
-                  aliases      = excluded.aliases,
-                  description  = excluded.description,
-                  entity_type  = excluded.entity_type,
-                  scope        = excluded.scope,
-                  role         = excluded.role,
-                  importance   = max(entities.importance, excluded.importance),
-                  last_seen_ts = excluded.last_seen_ts,
-                  has_pattern  = excluded.has_pattern,
-                  raw_metadata = excluded.raw_metadata,
-                  tombstone    = 0
+                  principal_type = excluded.principal_type,
+                  slug           = excluded.slug,
+                  canonical      = excluded.canonical,
+                  aliases        = excluded.aliases,
+                  description    = excluded.description,
+                  scope          = excluded.scope,
+                  tool           = excluded.tool,
+                  project_id     = excluded.project_id,
+                  has_pattern    = COALESCE(?, principals.has_pattern),
+                  active         = excluded.active,
+                  last_seen_ts   = excluded.last_seen_ts,
+                  raw_metadata   = excluded.raw_metadata
                 """,
                 (
                     entity_id,
+                    principal_type,
+                    slug,
                     canonical,
                     aliases_json,
                     description,
-                    entity_type,
                     scope,
-                    role,
-                    float(importance),
+                    tool,
+                    project_id,
+                    has_pat_value,
+                    1 if active else 0,
                     now,
-                    1 if has_pattern else 0,
                     meta_json,
+                    has_pat_value,
                 ),
             )
 
-    def mark_has_pattern(self, entity_id: str, has_pattern: bool) -> None:
+    def list_principals(
+        self,
+        *,
+        active_only: bool = True,
+        principal_types: Sequence[str] | None = None,
+        project_id: str | None = None,
+    ) -> list[PrincipalRow]:
+        sql = "SELECT * FROM principals WHERE 1=1"
+        params: list[Any] = []
+        if active_only:
+            sql += " AND active = 1"
+        if principal_types:
+            placeholders = ",".join("?" * len(principal_types))
+            sql += f" AND principal_type IN ({placeholders})"
+            params.extend(principal_types)
+        if project_id is not None:
+            # 项目 principal 精确匹配；其他类型不受 project_id 过滤
+            sql += " AND (project_id = ? OR principal_type != 'project')"
+            params.append(project_id)
+        sql += " ORDER BY last_seen_ts DESC"
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [_row_to_principal(r) for r in rows]
+
+    def lookup_principal(self, entity_id: str) -> PrincipalRow | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM principals WHERE entity_id = ?", (entity_id,)
+            ).fetchone()
+        return _row_to_principal(row) if row else None
+
+    def mark_principal_has_pattern(self, entity_id: str, has_pattern: bool) -> None:
         with self._conn() as conn:
             conn.execute(
-                "UPDATE entities SET has_pattern=? WHERE entity_id=?",
+                "UPDATE principals SET has_pattern = ? WHERE entity_id = ?",
                 (1 if has_pattern else 0, entity_id),
             )
 
-    def tombstone_entity(self, entity_id: str) -> int:
+    def activate_principal(self, entity_id: str) -> None:
         with self._conn() as conn:
-            return conn.execute(
-                "UPDATE entities SET tombstone=1 WHERE entity_id=?", (entity_id,)
-            ).rowcount
-
-    # ---------- Entity 查询 ----------
-
-    def search_entities(
-        self,
-        prompt: str,
-        *,
-        allowed_scopes: Sequence[str],
-        limit: int = 5,
-        require_pattern: bool = False,
-    ) -> list[EntityHit]:
-        """根据 prompt 在 entity FTS5 索引上反查候选实体。"""
-        if not prompt.strip() or not allowed_scopes:
-            return []
-        match = _fts5_sanitize(prompt)
-        if not match:
-            return []
-        scope_placeholders = ",".join("?" * len(allowed_scopes))
-        pattern_filter = " AND e.has_pattern = 1" if require_pattern else ""
-        sql = f"""
-            SELECT e.entity_id, e.canonical, e.aliases, e.description, e.scope,
-                   e.role, e.importance, e.has_pattern, fts.rank AS bm25_score
-            FROM entities_fts fts
-            JOIN entities e ON e.rowid = fts.rowid
-            WHERE entities_fts MATCH ?
-              AND e.tombstone = 0
-              AND e.scope IN ({scope_placeholders})
-              {pattern_filter}
-            ORDER BY fts.rank
-            LIMIT ?
-        """
-        with self._conn() as conn:
-            rows = conn.execute(sql, (match, *allowed_scopes, limit * 2)).fetchall()
-        hits: list[EntityHit] = []
-        for r in rows:
-            try:
-                aliases = json.loads(r["aliases"] or "[]")
-            except json.JSONDecodeError:
-                aliases = []
-            hits.append(
-                EntityHit(
-                    entity_id=r["entity_id"],
-                    canonical=r["canonical"] or "",
-                    aliases=aliases if isinstance(aliases, list) else [],
-                    description=r["description"] or "",
-                    scope=r["scope"] or "",
-                    role=r["role"] or "",
-                    importance=float(r["importance"] or 0.0),
-                    has_pattern=bool(r["has_pattern"]),
-                    bm25_score=float(r["bm25_score"] or 0.0),
-                )
+            conn.execute(
+                "UPDATE principals SET active = 1, last_seen_ts = ? WHERE entity_id = ?",
+                (int(time.time()), entity_id),
             )
-        hits.sort(key=lambda h: h.composite_score(), reverse=True)
-        return hits[:limit]
 
-    def lookup_entity(self, entity_id: str) -> EntityHit | None:
+    def deactivate_principal(self, entity_id: str) -> None:
         with self._conn() as conn:
-            row = conn.execute(
-                "SELECT entity_id, canonical, aliases, description, scope, role, "
-                "       importance, has_pattern, 0 AS bm25_score "
-                "FROM entities WHERE entity_id=? AND tombstone=0",
+            conn.execute(
+                "UPDATE principals SET active = 0 WHERE entity_id = ?",
                 (entity_id,),
-            ).fetchone()
-        if not row:
-            return None
-        try:
-            aliases = json.loads(row["aliases"] or "[]")
-        except json.JSONDecodeError:
-            aliases = []
-        return EntityHit(
-            entity_id=row["entity_id"],
-            canonical=row["canonical"] or "",
-            aliases=aliases if isinstance(aliases, list) else [],
-            description=row["description"] or "",
-            scope=row["scope"] or "",
-            role=row["role"] or "",
-            importance=float(row["importance"] or 0.0),
-            has_pattern=bool(row["has_pattern"]),
-            bm25_score=0.0,
-        )
+            )
 
-    # ---------- Event metadata（不变接口） ----------
+    # v2 兼容别名（mcp_server / hooks 旧调用路径）
+    def mark_has_pattern(self, entity_id: str, has_pattern: bool) -> None:
+        self.mark_principal_has_pattern(entity_id, has_pattern)
+
+    def lookup_entity(self, entity_id: str) -> PrincipalRow | None:
+        return self.lookup_principal(entity_id)
+
+    # ---------- Event metadata ----------
 
     def upsert_event_metadata(self, ev: dict[str, Any]) -> None:
         with self._conn() as conn:
@@ -405,7 +355,13 @@ class EntityIndex:
         allowed_scopes: set[str],
         excluded_types: set[str] | None = None,
         allowed_types: set[str] | None = None,
+        allowed_principals: set[str] | None = None,
     ) -> list[tuple[Any, EventMetadata]]:
+        """对后端 query() 结果做权威 scope/type 过滤。
+
+        ``allowed_principals`` 不为空时执行 v3 降权语义：raw_metadata.principal_ids 与
+        allowed 无交集的项 ``score *= 0.5``，但**不丢弃**（用户决策）。
+        """
         kept: list[tuple[Any, EventMetadata]] = []
         for r in results:
             event_id = getattr(r, "event_id", None) or (
@@ -422,6 +378,13 @@ class EntityIndex:
                 continue
             if allowed_types and meta.mem_type not in allowed_types:
                 continue
+            if allowed_principals:
+                pids = set((meta.raw_metadata or {}).get("principal_ids") or [])
+                if pids and not (pids & allowed_principals):
+                    try:
+                        r.score = float(getattr(r, "score", 0.0) or 0.0) * 0.5
+                    except Exception:
+                        pass
             kept.append((r, meta))
         return kept
 
@@ -450,7 +413,7 @@ class EntityIndex:
             ).fetchall()
         return [_row_to_meta(r) for r in rows]
 
-    # ---------- short_id（不变） ----------
+    # ---------- short_id ----------
 
     def ensure_short_id(self, event_id: str, *, default_length: int = 12) -> str:
         with self._conn() as conn:
@@ -498,11 +461,11 @@ class EntityIndex:
 
     def stats(self) -> dict[str, int]:
         with self._conn() as conn:
-            e_total = conn.execute(
-                "SELECT count(*) AS c FROM entities WHERE tombstone=0"
+            p_active = conn.execute(
+                "SELECT count(*) AS c FROM principals WHERE active=1"
             ).fetchone()["c"]
-            e_with_pattern = conn.execute(
-                "SELECT count(*) AS c FROM entities WHERE tombstone=0 AND has_pattern=1"
+            p_with_pat = conn.execute(
+                "SELECT count(*) AS c FROM principals WHERE active=1 AND has_pattern=1"
             ).fetchone()["c"]
             ev_total = conn.execute(
                 "SELECT count(*) AS c FROM event_metadata WHERE tombstone=0"
@@ -515,15 +478,53 @@ class EntityIndex:
             except sqlite3.OperationalError:
                 short = 0
         return {
-            "entities_active": e_total,
-            "entities_with_pattern": e_with_pattern,
+            "principals_active": p_active,
+            "principals_with_pattern": p_with_pat,
+            # v2 兼容字段名（外部脚本 / dashboard 可能仍依赖）
+            "entities_active": p_active,
+            "entities_with_pattern": p_with_pat,
             "events_active": ev_total,
             "events_tombstoned": ev_tomb,
             "short_ids": short,
         }
 
 
+# ---------- row → dataclass ----------
+
+
+def _row_to_principal(row: sqlite3.Row | None) -> PrincipalRow | None:
+    if row is None:
+        return None
+    try:
+        aliases = json.loads(row["aliases"] or "[]")
+    except json.JSONDecodeError:
+        aliases = []
+    try:
+        raw = json.loads(row["raw_metadata"] or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return PrincipalRow(
+        entity_id=row["entity_id"],
+        principal_type=row["principal_type"] or "",
+        slug=row["slug"] or "",
+        canonical=row["canonical"] or "",
+        aliases=aliases if isinstance(aliases, list) else [],
+        description=row["description"] or "",
+        scope=row["scope"] or "",
+        tool=row["tool"] or "",
+        project_id=row["project_id"] or "",
+        has_pattern=bool(row["has_pattern"]),
+        active=bool(row["active"]),
+        last_seen_ts=int(row["last_seen_ts"] or 0),
+        raw_metadata=raw if isinstance(raw, dict) else {},
+    )
+
+
 def _row_to_meta(row: sqlite3.Row) -> EventMetadata:
+    try:
+        raw = json.loads(row["raw_metadata"] or "{}")
+    except json.JSONDecodeError:
+        raw = {}
     return EventMetadata(
         event_id=row["event_id"],
         scope=row["scope"] or "",
@@ -534,46 +535,5 @@ def _row_to_meta(row: sqlite3.Row) -> EventMetadata:
         source=row["source"] or "",
         ts=row["ts"] or 0,
         summary=row["summary"] or "",
-        raw_metadata=json.loads(row["raw_metadata"] or "{}"),
+        raw_metadata=raw if isinstance(raw, dict) else {},
     )
-
-
-# ---------- FTS5 表达式构造（沿用旧版的中文长 token 滑窗） ----------
-
-_FTS_RESERVED = '"():*-'
-_CHINESE_WINDOW_SIZE = 4
-
-
-def _fts5_sanitize(s: str) -> str:
-    """构造 FTS5 MATCH 表达式。长中文 token (>4 字) 拆 4 字滑动窗口。"""
-    cleaned = "".join(" " if c in _FTS_RESERVED else c for c in s)
-    tokens = re.findall(r"[一-鿿\w]+", cleaned, re.UNICODE)
-    if not tokens:
-        return ""
-    seen: set[str] = set()
-    quoted: list[str] = []
-    for t in tokens:
-        t = t.lower()
-        if len(t) < 2:
-            continue
-        if _has_chinese(t) and len(t) > _CHINESE_WINDOW_SIZE:
-            for i in range(len(t) - _CHINESE_WINDOW_SIZE + 1):
-                sub = t[i : i + _CHINESE_WINDOW_SIZE]
-                if sub in seen:
-                    continue
-                seen.add(sub)
-                quoted.append(f'"{sub}"')
-                if len(quoted) >= 32:
-                    break
-        else:
-            if t in seen:
-                continue
-            seen.add(t)
-            quoted.append(f'"{t}"')
-        if len(quoted) >= 32:
-            break
-    return " OR ".join(quoted)
-
-
-def _has_chinese(s: str) -> bool:
-    return any("一" <= c <= "鿿" for c in s)
