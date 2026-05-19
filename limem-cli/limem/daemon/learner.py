@@ -298,11 +298,24 @@ def merge_suggestions(
     existing: list[dict[str, Any]],
     new: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """按 candidate_text 去重（仅 status=pending）。"""
-    seen = {s.get("candidate_text") for s in existing if s.get("status") == "pending"}
+    """按 kind/scope/candidate_text 去重，避免 passive learner 重复写同一结论。"""
+    seen = {
+        _suggestion_key(s)
+        for s in existing
+        if s.get("status") in {"pending", "learned", "accepted", "discarded"}
+    }
     for s in new:
-        if s.get("candidate_text") in seen:
+        key = _suggestion_key(s)
+        if key in seen:
             continue
         existing.append(s)
-        seen.add(s.get("candidate_text"))
+        seen.add(key)
     return existing
+
+
+def _suggestion_key(suggestion: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(suggestion.get("kind") or "rule").strip(),
+        str(suggestion.get("scope") or "global").strip(),
+        " ".join(str(suggestion.get("candidate_text") or "").split()),
+    )

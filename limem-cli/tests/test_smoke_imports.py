@@ -251,3 +251,75 @@ def test_accept_suggestion_uses_candidate_text_only(monkeypatch, tmp_path) -> No
     assert captured["text"] == "在本项目中，避免运行 npm run dev。"
     assert "用户多次纠正" not in captured["text"]
     assert "#abc" not in captured["text"]
+
+
+def test_merge_suggestions_dedupes_learned_items() -> None:
+    from limem.daemon.learner import merge_suggestions
+
+    existing = [
+        {
+            "id": "sug_old",
+            "kind": "rule",
+            "scope": "project:demo",
+            "candidate_text": "在本项目中，避免运行 npm run dev。",
+            "status": "learned",
+        }
+    ]
+    new = [
+        {
+            "id": "sug_new",
+            "kind": "rule",
+            "scope": "project:demo",
+            "candidate_text": "在本项目中，避免运行 npm run dev。",
+            "status": "pending",
+        }
+    ]
+
+    merged = merge_suggestions(existing, new)
+    assert len(merged) == 1
+    assert merged[0]["id"] == "sug_old"
+
+
+def test_passive_learning_submits_pending_suggestion(monkeypatch) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    import limem.daemon.server as server
+
+    captured = {}
+
+    def fake_remember_impl(**kwargs):
+        captured.update(kwargs)
+        return {"event_id": "evt_passive_1"}
+
+    monkeypatch.setattr(server, "remember_impl", fake_remember_impl)
+
+    daemon = SimpleNamespace(
+        creds=SimpleNamespace(api_key="key", db_id="db"),
+        runtime=SimpleNamespace(),
+        pidx=object(),
+    )
+    daemon._passive_learning_text = server.Daemon._passive_learning_text.__get__(daemon)
+    daemon._passive_learning_detail = server.Daemon._passive_learning_detail.__get__(daemon)
+    daemon._project_id_from_scope = server.Daemon._project_id_from_scope.__get__(daemon)
+    items = [
+        {
+            "id": "sug_1",
+            "kind": "rule",
+            "scope": "project:demo",
+            "candidate_text": "在本项目中，避免运行 npm run dev。",
+            "rationale": "用户多次纠正。",
+            "evidence": ["2026-01-01 [codex] #abc: 不要 npm run dev"],
+            "confidence": 0.91,
+            "status": "pending",
+        }
+    ]
+
+    learned = asyncio.run(server.Daemon._submit_passive_suggestions(daemon, items))
+    assert learned == 1
+    assert items[0]["status"] == "learned"
+    assert items[0]["learned_event_id"] == "evt_passive_1"
+    assert captured["source"] == "daemon:passive_learning"
+    assert captured["text"] == "在本项目中，避免运行 npm run dev。"
+    assert captured["detail"].startswith("passive learning observation")
+    assert captured["project_id"] == "demo"

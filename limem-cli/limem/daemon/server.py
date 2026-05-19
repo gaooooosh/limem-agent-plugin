@@ -430,13 +430,95 @@ class Daemon:
             min_occurrences=self.runtime.ngram_min_occurrences,
             min_accept_rate=self.runtime.ngram_min_accept_rate,
         )
-        if not new:
-            return
         existing = load_suggestions()
-        merged = merge_suggestions(existing, new)
+        merged = merge_suggestions(existing, new) if new else existing
+        if not merged:
+            return
+        learned = await self._submit_passive_suggestions(merged)
+        if not new and not learned:
+            return
         merged = archive_old(merged, max_active=self.runtime.suggestions_max_active)
         save_suggestions(merged)
         self.state.suggestion_count = len([s for s in merged if s.get("status") == "pending"])
+        if learned:
+            self.state.active_memories += learned
+
+    async def _submit_passive_suggestions(self, items: list[dict[str, Any]]) -> int:
+        """Submit pending passive-learning candidates to LiMem service as event memories.
+
+        The daemon keeps suggestions.json as an audit/retry ledger. The source of truth for
+        learned memory is the service-side event created by remember_impl -> /ingest.
+        """
+        if not self.creds.api_key or not self.creds.db_id:
+            return 0
+
+        learned = 0
+        loop = asyncio.get_event_loop()
+        for suggestion in items:
+            if suggestion.get("status") != "pending":
+                continue
+            try:
+                result = await loop.run_in_executor(
+                    None,
+                    lambda s=suggestion: remember_impl(
+                        text=self._passive_learning_text(s),
+                        scope=s.get("scope", "global"),
+                        mem_type=s.get("kind", "rule"),
+                        importance=float(s.get("confidence", 0.85) or 0.85),
+                        project_id=self._project_id_from_scope(s.get("scope", "")),
+                        entities=s.get("extracted_entities") or None,
+                        source="daemon:passive_learning",
+                        detail=self._passive_learning_detail(s),
+                        creds=self.creds,
+                        runtime=self.runtime,
+                        idx=self.pidx,
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001
+                suggestion["last_error"] = str(e)[:200]
+                suggestion["last_error_ts"] = int(time.time())
+                _log(
+                    "passive_learning_submit_error",
+                    suggestion_id=suggestion.get("id", ""),
+                    err=str(e)[:200],
+                )
+                continue
+
+            event_id = result.get("event_id", "")
+            suggestion["status"] = "learned"
+            suggestion["learned_event_id"] = event_id
+            suggestion["learned_ts"] = int(time.time())
+            suggestion.pop("last_error", None)
+            suggestion.pop("last_error_ts", None)
+            learned += 1
+            _log(
+                "passive_learning_submitted",
+                suggestion_id=suggestion.get("id", ""),
+                event_id=event_id,
+                kind=suggestion.get("kind", ""),
+                scope=suggestion.get("scope", ""),
+            )
+        return learned
+
+    def _passive_learning_text(self, suggestion: dict[str, Any]) -> str:
+        return str(suggestion.get("candidate_text") or "").strip()
+
+    def _passive_learning_detail(self, suggestion: dict[str, Any]) -> str:
+        evidence = suggestion.get("evidence") or []
+        rationale = str(suggestion.get("rationale") or "").strip()
+        parts = [
+            "passive learning observation",
+            f"rationale: {rationale}" if rationale else "",
+        ]
+        if evidence:
+            parts.append("evidence:")
+            parts.extend(f"- {line}" for line in evidence[:8])
+        return "\n".join(part for part in parts if part)
+
+    def _project_id_from_scope(self, scope: str) -> str:
+        if scope.startswith("project:"):
+            return scope.split(":", 1)[1]
+        return ""
 
     async def statusline_loop(self) -> None:
         period = self.runtime.statusline_cache_refresh_seconds
