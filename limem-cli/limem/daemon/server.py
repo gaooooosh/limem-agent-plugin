@@ -11,6 +11,7 @@ import resource
 import signal
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -69,10 +70,17 @@ class Daemon:
         self.state.active_memories = self.pidx.stats().get("events_active", 0)
         self.state.suggestion_count = len([s for s in load_suggestions() if s.get("status") == "pending"])
         self.event_tail = EventTail()
-        self._correction_buf: list[dict[str, Any]] = []
-        self._post_tool_buf: list[dict[str, Any]] = []
+        # 环形 buffer：满了自动丢最旧而非丢最新（修复 server.py 旧版本 `len < _buf_max` 丢新事件的 bug）；
+        # 实际时间窗剪裁由 learner.run_correction_analyzer / run_ngram_analyzer 在每次 tick 用 window_seconds 完成。
+        self._buf_max = 5000
+        self._correction_buf: deque[dict[str, Any]] = deque(maxlen=self._buf_max)
+        self._post_tool_buf: deque[dict[str, Any]] = deque(maxlen=self._buf_max)
+        # PreToolUse → PostToolUse 配对的临时 holding 池；键 = (session_id, file_path)，A1.2 真消费用。
+        # 仅 daemon 内存，不写 events.ndjson（守 feedback #b94b0fa：不扩 event schema）。
+        self._pending_intents: dict[tuple[str, str], dict[str, Any]] = {}
+        # A3：session_end 出现时唤醒 learner_loop 提前 tick；不做 session-only flush 以保 24h/7d 跨会话窗口。
+        self._learner_wakeup = asyncio.Event()
         self._shutdown = asyncio.Event()
-        self._buf_max = 2000  # 环形 buffer 上限
 
     def _apply_sqlite_pragmas(self) -> None:
         # 限制 SQLite cache（控内存）+ 启用 WAL 让 hook fallback 写也能并发
@@ -328,34 +336,71 @@ class Daemon:
         evidence_id = hashlib.sha1(evidence_seed.encode("utf-8")).hexdigest()[:12]
         if kind == "user_prompt_submit":
             prompt = payload.get("prompt", "")
-            # F2 correction 采集
-            from .learner import is_correction
-            if is_correction(prompt) and len(self._correction_buf) < self._buf_max:
+            # F2 correction 采集；prev_assistant_head 由 hooks.py UserPromptSubmit 可选填充（A4）。
+            from .learner import score_correction
+            prev = payload.get("prev_assistant_head") or None
+            ok, conf = score_correction(prompt, prev_assistant=prev)
+            if ok and conf >= self.runtime.is_correction_confidence_threshold:
+                # deque(maxlen=...) 自动丢最旧；无需 len 守门，避免丢最新事件
                 self._correction_buf.append(
                     {
                         "ts": row.get("ts", 0),
                         "project_id": row.get("project_id", ""),
                         "scope": row.get("scope", ""),
                         "prompt": prompt,
+                        "prev_assistant_head": prev or "",
+                        "is_correction_confidence": conf,
                         "session_id": row.get("session_id", ""),
                         "tool": row.get("tool", ""),
                         "evidence_id": evidence_id,
                     }
                 )
+        elif kind == "pre_tool_use":
+            # A1.2：仅 Edit/Write/NotebookEdit 进配对池（Bash 等不参与，亦不携带 intent_summary）
+            tool_name = (payload.get("tool") or "").strip()
+            if tool_name in {"Edit", "Write", "NotebookEdit"}:
+                key = (row.get("session_id", ""), payload.get("file_path", "") or "")
+                self._pending_intents[key] = {
+                    "ts": row.get("ts", 0),
+                    "intent_summary": payload.get("intent_summary", ""),
+                    "tool": tool_name,
+                }
+                self._evict_old_intents(now=row.get("ts", 0))
         elif kind == "post_tool_use":
-            if len(self._post_tool_buf) < self._buf_max:
-                self._post_tool_buf.append(
-                    {
-                        "ts": row.get("ts", 0),
-                        "project_id": row.get("project_id", ""),
-                        "diff_summary": payload.get("diff_summary", ""),
-                        "accepted": payload.get("accepted", False),
-                        "tool": payload.get("tool", ""),
-                        "file_path": payload.get("file_path", ""),
-                        "session_id": row.get("session_id", ""),
-                        "evidence_id": evidence_id,
-                    }
-                )
+            buf_item: dict[str, Any] = {
+                "ts": row.get("ts", 0),
+                "project_id": row.get("project_id", ""),
+                "diff_summary": payload.get("diff_summary", ""),
+                "accepted": payload.get("accepted", False),
+                "tool": payload.get("tool", ""),
+                "file_path": payload.get("file_path", ""),
+                "session_id": row.get("session_id", ""),
+                "evidence_id": evidence_id,
+            }
+            # A1.2：找最近 N 秒同 session_id+file_path 的 pre_tool_use，合并 intent_summary 到 buffer item
+            key = (row.get("session_id", ""), payload.get("file_path", "") or "")
+            intent = self._pending_intents.pop(key, None)
+            if intent:
+                pair_age = row.get("ts", 0) - intent["ts"]
+                if 0 <= pair_age <= self.runtime.pre_post_pair_window_seconds:
+                    buf_item["intent_summary"] = intent["intent_summary"]
+                    buf_item["pair_age_seconds"] = pair_age
+            self._post_tool_buf.append(buf_item)
+        elif kind == "session_end":
+            # A3：仅唤醒 learner，让 learner_loop 提前 tick；不做 session-only flush（保 24h/7d 跨会话窗口）。
+            self._learner_wakeup.set()
+
+    def _evict_old_intents(self, *, now: int) -> None:
+        """清理过期的 pre_tool_use 配对项；上限 200 条防止无界增长。"""
+        window = self.runtime.pre_post_pair_window_seconds
+        stale = [k for k, v in self._pending_intents.items() if now - v["ts"] > window]
+        for k in stale:
+            self._pending_intents.pop(k, None)
+        # 防御性硬上限：按 ts 升序丢最旧
+        if len(self._pending_intents) > 200:
+            ordered = sorted(self._pending_intents.items(), key=lambda kv: kv[1]["ts"])
+            for k, _v in ordered[: len(self._pending_intents) - 200]:
+                self._pending_intents.pop(k, None)
 
     async def learner_loop(self) -> None:
         period = self.runtime.learner_period_seconds
@@ -364,7 +409,12 @@ class Daemon:
                 await self._run_learner_once()
             except Exception as e:  # noqa: BLE001
                 _log("learner_error", err=str(e))
-            await asyncio.sleep(period)
+            # 等周期或 session_end / 显式 wakeup 触发（A3）；任何一个先到即进入下一轮 tick。
+            try:
+                await asyncio.wait_for(self._learner_wakeup.wait(), timeout=period)
+                self._learner_wakeup.clear()
+            except asyncio.TimeoutError:
+                pass
 
     async def _run_learner_once(self) -> None:
         # F2
@@ -442,9 +492,14 @@ class Daemon:
                     rss_mb = rss_kb / (1024 * 1024)
                 if rss_mb > self.runtime.daemon_rss_soft_limit_mb:
                     _log("rss_high", rss_mb=rss_mb)
-                    # 简单 GC：截尾 buffer
-                    self._correction_buf = self._correction_buf[-500:]
-                    self._post_tool_buf = self._post_tool_buf[-500:]
+                    # 紧急 GC：将 deque 缩到尾部 500 条；deque 不支持负数切片，借助构造新 deque 实现
+                    self._correction_buf = deque(
+                        list(self._correction_buf)[-500:], maxlen=self._buf_max
+                    )
+                    self._post_tool_buf = deque(
+                        list(self._post_tool_buf)[-500:], maxlen=self._buf_max
+                    )
+                    self._pending_intents.clear()
                 # 日志滚动
                 if rotate_if_needed(
                     max_bytes=self.runtime.events_log_max_bytes,

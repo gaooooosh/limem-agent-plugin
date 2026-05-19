@@ -100,6 +100,12 @@ _CLAUDE_HOOKS: dict[str, list[dict[str, Any]]] = {
     "PreCompact": [
         {"hooks": [{"type": "command", "command": "limem hook claude-code PreCompact"}]}
     ],
+    "PreToolUse": [
+        {
+            "matcher": "Edit|Write|NotebookEdit|Bash",
+            "hooks": [{"type": "command", "command": "limem hook claude-code PreToolUse"}],
+        }
+    ],
     "PostToolUse": [
         {
             "matcher": "Edit|Write|NotebookEdit",

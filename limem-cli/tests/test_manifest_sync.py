@@ -27,6 +27,7 @@ CLAUDE_EXPECTED = {
     "SessionStart",
     "SessionEnd",
     "PreCompact",
+    "PreToolUse",
     "PostToolUse",
 }
 # Codex 期望事件集合（hooks.json + installer 都该一致）

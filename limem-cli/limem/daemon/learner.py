@@ -17,7 +17,7 @@ from ..config import (
     SUGGESTIONS_ARCHIVE_PATH,
     SUGGESTIONS_PATH,
 )
-from .jaccard import cluster_by_similarity
+from .jaccard import cluster_by_similarity, jaccard, trigrams
 from .ngram import aggregate as ngram_aggregate
 
 _CN_CORRECT = re.compile(r"不对|应该|别|不要|改成|纠正|换成|不是")
@@ -28,7 +28,36 @@ _PREFER_HINT = re.compile(r"应该|改成|换成|prefer|instead|actually", re.IG
 
 
 def is_correction(text: str) -> bool:
+    """旧 API：仅判断是否含纠正关键词（保持向后兼容；新代码改用 score_correction）。"""
     return bool(_CN_CORRECT.search(text or "") or _EN_CORRECT.search(text or ""))
+
+
+def score_correction(
+    text: str, prev_assistant: str | None = None
+) -> tuple[bool, float]:
+    """A4.2：返回 (是否纠正, 置信度 0~1)。
+
+    置信度组成：
+      基础 0.5（命中中/英纠正词即起步）
+      + 0.25：紧跟 assistant 回复后的纠正（prev_assistant 非空）
+      + 0.15：强否定词命中（不对/别/wrong/...）
+      + 0.10：prev_assistant 与 prompt 主题重叠（trigram Jaccard ≥ 0.2）
+    """
+    if not (_CN_CORRECT.search(text or "") or _EN_CORRECT.search(text or "")):
+        return False, 0.0
+    score = 0.5
+    if prev_assistant:
+        score += 0.25
+    if _NEGATIVE_HINT.search(text or ""):
+        score += 0.15
+    if prev_assistant:
+        try:
+            sim = jaccard(trigrams(prev_assistant), trigrams(text or ""))
+            if sim >= 0.2:
+                score += 0.1
+        except Exception:
+            pass
+    return True, min(score, 1.0)
 
 
 def extract_subject(text: str) -> str:
@@ -161,6 +190,17 @@ def run_correction_analyzer(
             text = build_candidate_text(cluster)
             subj = extract_subject(sample.get("prompt", ""))
             scope = sample.get("scope", f"project:{proj}") if proj else "global"
+            cluster_conf = min(0.95, 0.4 + 0.1 * len(cluster))
+            # A4.2：合入逐事件 is_correction 置信度的均值，避免单条 cluster + 弱信号过度自信
+            confs = [
+                float(e.get("is_correction_confidence", 0.0) or 0.0)
+                for e in cluster
+                if "is_correction_confidence" in e
+            ]
+            if confs:
+                conf_final = min(cluster_conf, sum(confs) / len(confs))
+            else:
+                conf_final = cluster_conf
             suggestions.append(
                 {
                     "id": f"sug_{uuid.uuid4().hex[:10]}",
@@ -170,7 +210,7 @@ def run_correction_analyzer(
                     "rationale": build_rationale(cluster),
                     "evidence": [format_evidence(e) for e in cluster[:8]],
                     "evidence_event_ids": [_evidence_ref(e) for e in cluster],
-                    "confidence": min(0.95, 0.4 + 0.1 * len(cluster)),
+                    "confidence": conf_final,
                     "extracted_entities": (
                         [{"canonical": subj, "role": "subject", "patterns": [subj]}] if subj else []
                     ),
@@ -198,8 +238,21 @@ def run_ngram_analyzer(
 
     suggestions: list[dict[str, Any]] = []
     for proj, events in by_proj.items():
+        # A1.3：若 daemon 在 PreToolUse↔PostToolUse 配对时挂载了 intent_summary，
+        # 把它拼到 diff_summary 之前作为 n-gram 输入（语义："用户原本要的 + 实际改的"一起聚合）。
+        # 仍是 pure 函数：仅按 dict 读字段，不引入外部依赖。
+        enriched: list[dict[str, Any]] = []
+        for e in events:
+            intent = e.get("intent_summary") or ""
+            diff = e.get("diff_summary") or ""
+            if intent:
+                merged = e.copy()
+                merged["diff_summary"] = f"{intent} {diff}".strip()
+                enriched.append(merged)
+            else:
+                enriched.append(e)
         ngs = ngram_aggregate(
-            events,
+            enriched,
             min_occurrences=min_occurrences,
             min_accept_rate=min_accept_rate,
         )
@@ -220,12 +273,13 @@ def run_ngram_analyzer(
                             {
                                 "ts": e.get("ts", 0),
                                 "tool": e.get("tool", "PostToolUse"),
+                                # 用 enriched 的合并文本作 evidence prompt，便于人工 review 看到 intent 上下文
                                 "prompt": e.get("diff_summary", ""),
                                 "session_id": e.get("session_id", ""),
                                 "evidence_id": e.get("evidence_id", ""),
                             }
                         )
-                        for e in events
+                        for e in enriched
                         if ng["ngram"] in " ".join((e.get("diff_summary", "") or "").lower().split())
                     ][:8],
                     "evidence_event_ids": [],

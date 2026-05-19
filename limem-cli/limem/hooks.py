@@ -222,6 +222,16 @@ def _hook_user_prompt_submit(
     project_id = detect_project_id()
     scope = f"project:{project_id}" if project_id else "global"
 
+    # A4.1：可选探测 transcript_path，提取上一条 assistant 回复 head，供 daemon 改进 is_correction 判定。
+    # payload 是自由 dict，本字段挂在 payload["prev_assistant_head"] 内，**不**新增 events.ndjson envelope 字段。
+    transcript_path = payload.get("transcript_path") or payload.get("transcriptPath") or ""
+    prev_assistant_head = _read_prev_assistant_head(
+        transcript_path, runtime.prev_assistant_chars, runtime
+    )
+    extra_payload: dict[str, Any] = {}
+    if prev_assistant_head:
+        extra_payload["prev_assistant_head"] = prev_assistant_head
+
     try:
         daemon_client.safe_call("auto_init_project", {"cwd": str(Path.cwd())})
     except Exception:
@@ -250,7 +260,14 @@ def _hook_user_prompt_submit(
                 _mark_degraded_emitted(session_id)
             _emit_inject("UserPromptSubmit", banner)
         _emit_event_safe(
-            "user_prompt_submit", tool, prompt, session_id, project_id, scope, runtime
+            "user_prompt_submit",
+            tool,
+            prompt,
+            session_id,
+            project_id,
+            scope,
+            runtime,
+            extra_payload=extra_payload or None,
         )
         return
 
@@ -357,7 +374,14 @@ def _hook_user_prompt_submit(
         injected_chars=len(text),
     )
     _emit_event_safe(
-        "user_prompt_submit", tool, prompt, session_id, project_id, scope, runtime
+        "user_prompt_submit",
+        tool,
+        prompt,
+        session_id,
+        project_id,
+        scope,
+        runtime,
+        extra_payload=extra_payload or None,
     )
     _emit_inject("UserPromptSubmit", text)
 
@@ -383,17 +407,76 @@ def _emit_event_safe(
     project_id: str,
     scope: str,
     runtime: RuntimeConfig,
+    extra_payload: dict[str, Any] | None = None,
 ) -> None:
     safe_prompt, redacted = _safe_redact(prompt, runtime.redact_patterns)
+    out_payload: dict[str, Any] = {"prompt": safe_prompt}
+    if extra_payload:
+        # 仅合并 daemon 真消费的可选字段（如 prev_assistant_head）；
+        # 不引入新的 envelope 字段（守 feedback #b94b0fa：限定 event schema 层不可扩）
+        out_payload.update(extra_payload)
     emit_event(
         kind,
         tool=tool,
         session_id=session_id,
         project_id=project_id,
         scope=scope,
-        payload={"prompt": safe_prompt},
+        payload=out_payload,
         redacted=redacted,
     )
+
+
+def _read_prev_assistant_head(
+    transcript_path: str, chars: int, runtime: RuntimeConfig
+) -> str:
+    """A4.1：从 Claude Code transcript JSONL tail ≤4KB 中提取最近一条 assistant 回复 head。
+
+    JSONL 每行为独立 JSON 对象，反向逐行解析寻找 `type=="assistant"`。
+    任何失败（文件不存在 / 编码 / 解析）静默返回空串；本函数限 50ms 自包含。
+    """
+    if not transcript_path:
+        return ""
+    try:
+        p = Path(transcript_path).expanduser()
+        if not p.is_file():
+            return ""
+        # 仅读尾部 4KB，避免大文件全量加载
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            if size > 4096:
+                f.seek(size - 4096)
+            tail = f.read().decode("utf-8", errors="replace")
+        # 反向遍历行，找最末 assistant 条目
+        for line in reversed(tail.splitlines()):
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") != "assistant":
+                continue
+            content = obj.get("content") or obj.get("message", {}).get("content")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                # Claude API content blocks: 取所有 text 类型拼接
+                parts: list[str] = []
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "text":
+                        t = blk.get("text") or ""
+                        if t:
+                            parts.append(t)
+                text = " ".join(parts)
+            if not text:
+                continue
+            safe, _redacted = _safe_redact(text[:chars], runtime.redact_patterns)
+            return safe
+    except Exception as e:  # noqa: BLE001
+        _log("transcript_tail_failed", "claude-code", err=str(e)[:120])
+    return ""
 
 
 # ---------- SessionStart ----------
@@ -564,6 +647,39 @@ def _hook_pre_compact(
     _log("pre_compact", tool, payload_keys=list(payload.keys()))
 
 
+def _hook_pre_tool_use(
+    tool: str, payload: dict[str, Any], creds: Credentials, runtime: RuntimeConfig
+) -> None:
+    """A1.1：仅 Edit/Write/NotebookEdit 三种工具采集 intent_summary（new_string 头部，经脱敏）。
+
+    Bash 等工具不读 command head（隐私面），payload 只携带 tool + file_path 用于 daemon 配对。
+    """
+    project_id = detect_project_id()
+    session_id = payload.get("session_id") or payload.get("sessionId") or ""
+    tool_name = payload.get("tool_name") or payload.get("tool") or ""
+    file_path = payload.get("file_path") or ""
+    out_payload: dict[str, Any] = {"tool": tool_name, "file_path": file_path}
+    if tool_name in {"Edit", "Write", "NotebookEdit"}:
+        intent_raw = (
+            payload.get("new_string")
+            or payload.get("content")
+            or payload.get("new_source")
+            or ""
+        )
+        if intent_raw:
+            head = intent_raw[: runtime.pre_tool_intent_chars]
+            safe_head, _redacted = _safe_redact(head, runtime.redact_patterns)
+            out_payload["intent_summary"] = safe_head
+    emit_event(
+        "pre_tool_use",
+        tool=tool,
+        session_id=session_id,
+        project_id=project_id,
+        scope=f"project:{project_id}" if project_id else "global",
+        payload=out_payload,
+    )
+
+
 def _hook_post_tool_use(
     tool: str, payload: dict[str, Any], creds: Credentials, runtime: RuntimeConfig
 ) -> None:
@@ -612,6 +728,7 @@ def main(argv: list[str] | None = None) -> int:
             "SessionEnd",
             "Stop",
             "PreCompact",
+            "PreToolUse",
             "PostToolUse",
         ],
     )
@@ -643,6 +760,8 @@ def main(argv: list[str] | None = None) -> int:
             _log("stop_noop", args.tool)
         elif args.event == "PreCompact":
             _hook_pre_compact(args.tool, payload, creds, runtime)
+        elif args.event == "PreToolUse":
+            _hook_pre_tool_use(args.tool, payload, creds, runtime)
         elif args.event == "PostToolUse":
             _hook_post_tool_use(args.tool, payload, creds, runtime)
     except Exception:

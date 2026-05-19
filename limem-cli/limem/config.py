@@ -139,6 +139,13 @@ class RuntimeConfig:
     ngram_min_occurrences: int = 5
     ngram_min_accept_rate: float = 0.8
     suggestions_max_active: int = 500
+    # PreToolUse / PostToolUse 配对窗口与采集截断（仅在 daemon 内存中使用）
+    pre_post_pair_window_seconds: int = 60
+    pre_tool_intent_chars: int = 200
+    # UserPromptSubmit 中 transcript_path tail 采集的 assistant 上一轮回复截断长度
+    prev_assistant_chars: int = 200
+    # is_correction 改进版的最低置信度阈值（< 此值不入 correction buffer）
+    is_correction_confidence_threshold: float = 0.5
     redact_patterns: list[str] = field(
         default_factory=lambda: [
             r"\bsk-[A-Za-z0-9]{20,}\b",

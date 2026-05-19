@@ -314,7 +314,15 @@ def db_new(name: str, use_flag: bool) -> None:
 @click.argument(
     "event",
     type=click.Choice(
-        ["UserPromptSubmit", "SessionStart", "SessionEnd", "Stop", "PreCompact", "PostToolUse"]
+        [
+            "UserPromptSubmit",
+            "SessionStart",
+            "SessionEnd",
+            "Stop",
+            "PreCompact",
+            "PreToolUse",
+            "PostToolUse",
+        ]
     ),
 )
 def hook(tool: str, event: str) -> None:
