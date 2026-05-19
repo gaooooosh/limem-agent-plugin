@@ -1,7 +1,7 @@
 {
   "name": "limem",
-  "version": "0.1.0",
-  "description": "LiMem long-term memory for Claude Code — auto-recall rules, facts, and preferences across sessions and projects.",
+  "version": "0.2.0",
+  "description": "LiMem long-term memory for Claude Code (v2) — entity-centric markdown profiles, three-tier recall (hard / pattern / soft), server-side section scoring.",
   "author": "gaooooosh",
   "homepage": "https://limem.gaooooosh.art",
   "license": "MIT",

@@ -1,18 +1,30 @@
 """LimemClient — 唯一与 LiMem 后端契约耦合的模块。
 
-后端契约（已通过生产 /openapi.json 验证，2026-05-15）：
-- 多租户：所有数据操作走 /db/{db_id}/...
-- 强制鉴权：X-API-Key 头（缺失 401）
-- Ingest schema：{data: any, timestamp: int|null}（顶层无 metadata，元信息塞 data 内）
-- Query schema：{query, top_k}（无 filters，客户端必须二次过滤）
-- Pattern API 后端原生：/db/{db_id}/api/entities 注册 entity 时可一并提交 patterns
+后端契约（已通过生产 /openapi.json + API_DOC §0/§11 验证，2026-05-19）：
+
+通用
+- 多租户：所有数据操作走 /db/{db_id}/...，鉴权头 X-API-Key（缺失 401）
+- Ingest body：{data: any, timestamp: int|null}（顶层无 metadata，元信息塞 data 内）
+- Query body：{query, top_k}（**无 filters**，客户端必须二次过滤）
+- summary 由 LLM 生成，不含原始 tag token；客户端需本地镜像 event_metadata
+
+Entity / Pattern（v2 Breaking Change，2026-04 上线）
+- 每个 entity 至多 1 篇 markdown 文档；卡片粒度 CRUD 已下线
+- POST /api/entities 可内联 `pattern: {content: "..."}`（**单对象**，不是数组）
+  旧 `patterns: [...]` 字段 → 422
+- PUT /api/entities/{id}/patterns 整篇 upsert（不存在局部段落编辑）
+- GET /api/entities/{id}/patterns  与
+  GET /api/entities/{id}/patterns/recall?query=&mode=auto|full|section&top_k_sections=3
+  返回同构 RecallEntityPatternResponse
+- DELETE /api/entities/{id}/patterns 硬删（无 archive；404 表示该实体当前无 pattern）
+- 无主检索 pipeline 消费 pattern；仅通过 /patterns/recall 独立召回（H2 切片打分）
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -41,31 +53,75 @@ class QueryResult:
 
 @dataclass
 class EntityPattern:
-    pattern_id: str  # 后端响应里字段名是 ``id``；本地统一叫 pattern_id 更清晰
+    """注册实体绑定的 markdown 档案（v2：每实体 ≤ 1 篇）。"""
+
+    pattern_id: str
+    entity_id: str
     content: str
-    pattern_type: str
-    metadata: dict[str, Any] = field(default_factory=dict)
-    entity_id: str = ""
-    status: str = ""
+    status: str = "active"
+    created_at: int = 0
+    updated_at: int = 0
 
     @classmethod
-    def from_response(cls, p: dict[str, Any]) -> EntityPattern:
+    def from_response(cls, p: dict[str, Any] | None) -> EntityPattern | None:
+        if not p:
+            return None
         return cls(
             pattern_id=p.get("id") or p.get("pattern_id") or "",
-            content=p.get("content", ""),
-            pattern_type=p.get("pattern_type", ""),
-            metadata=p.get("metadata", {}) or {},
             entity_id=p.get("entity_id", ""),
-            status=p.get("status", ""),
+            content=p.get("content", ""),
+            status=p.get("status", "active"),
+            created_at=int(p.get("created_at") or 0),
+            updated_at=int(p.get("updated_at") or 0),
         )
 
 
 @dataclass
+class MatchedSection:
+    heading: str
+    score: float
+    char_offset: int
+
+    @classmethod
+    def from_response(cls, s: dict[str, Any]) -> MatchedSection:
+        return cls(
+            heading=s.get("heading", ""),
+            score=float(s.get("score") or 0.0),
+            char_offset=int(s.get("char_offset") or 0),
+        )
+
+
+@dataclass
+class PatternRecallResult:
+    """`GET /patterns` 与 `GET /patterns/recall` 共享同构响应。"""
+
+    mode: Literal["full", "section"]
+    content: str
+    total_chars: int
+    matched_sections: list[MatchedSection] = field(default_factory=list)
+    pattern: EntityPattern | None = None
+
+    @classmethod
+    def from_response(cls, r: dict[str, Any]) -> PatternRecallResult:
+        mode = r.get("mode") or "full"
+        return cls(
+            mode=mode if mode in ("full", "section") else "full",
+            content=r.get("content", "") or "",
+            total_chars=int(r.get("total_chars") or 0),
+            matched_sections=[MatchedSection.from_response(s) for s in (r.get("matched_sections") or [])],
+            pattern=EntityPattern.from_response(r.get("pattern")),
+        )
+
+    def has_content(self) -> bool:
+        return bool(self.content.strip())
+
+
+@dataclass
 class RegisterEntityResult:
-    action: str  # "created" | "updated"
+    action: str  # "created" | "promoted" | "updated"
     existed_as_extracted: bool
     entity: dict[str, Any]
-    patterns: list[EntityPattern]
+    pattern: EntityPattern | None  # v2：单对象（旧 patterns 数组已下线）
 
 
 class LimemError(RuntimeError):
@@ -79,7 +135,7 @@ class LimemError(RuntimeError):
 class LimemClient:
     """同步 httpx 客户端；hook 脚本短期进程使用。
 
-    长生命周期场景（MCP server）可调 ``aclient`` 取异步实例。
+    长生命周期场景（MCP server）可调 ``aclient`` 取异步实例（未来实现）。
     """
 
     def __init__(
@@ -125,7 +181,6 @@ class LimemClient:
                     headers=self._headers(),
                 )
         except Exception as e:
-            # 网络异常：best-effort 通知 daemon
             self._notify_connectivity(0, str(e)[:60])
             raise LimemError(0, f"network error: {e}", None) from e
 
@@ -139,7 +194,6 @@ class LimemClient:
             self._notify_connectivity(r.status_code, msg or "")
             raise LimemError(r.status_code, msg or "request failed", body)
 
-        # 成功
         self._notify_connectivity(200, None, ok=True)
         if r.status_code == 204 or not r.content:
             return None
@@ -154,17 +208,22 @@ class LimemClient:
         except Exception:
             pass
 
-    # ----- 健康 & 身份 -----
-
-    def me(self) -> dict[str, Any]:
-        """返回当前 API Key 关联的 user 信息。"""
-        return self._request("GET", "/me")
-
-    def db_health(self, db_id: str | None = None) -> dict[str, Any]:
+    def _require_db(self, db_id: str | None) -> str:
         db = db_id or self.creds.db_id
         if not db:
             raise LimemError(0, "db_id not configured")
-        return self._request("GET", f"/db/{db}/health")
+        return db
+
+    # ----- 健康 & 身份 -----
+
+    def me(self) -> dict[str, Any]:
+        return self._request("GET", "/me")
+
+    def db_health(self, db_id: str | None = None) -> dict[str, Any]:
+        return self._request("GET", f"/db/{self._require_db(db_id)}/health")
+
+    def db_stats(self, db_id: str | None = None) -> dict[str, Any]:
+        return self._request("GET", f"/db/{self._require_db(db_id)}/stats")
 
     # ----- 用户级库管理 -----
 
@@ -184,9 +243,7 @@ class LimemClient:
         db_id: str | None = None,
     ) -> IngestResult:
         """data 内自由放置 metadata，后端 LLM 会读 data['detail'] 或 data['text']。"""
-        db = db_id or self.creds.db_id
-        if not db:
-            raise LimemError(0, "db_id not configured")
+        db = self._require_db(db_id)
         body = {"data": data, "timestamp": timestamp if timestamp is not None else int(time.time())}
         r = self._request("POST", f"/db/{db}/ingest", json_body=body, timeout=self.ingest_timeout)
         return IngestResult(
@@ -204,9 +261,7 @@ class LimemClient:
         top_k: int = 20,
         db_id: str | None = None,
     ) -> list[QueryResult]:
-        db = db_id or self.creds.db_id
-        if not db:
-            raise LimemError(0, "db_id not configured")
+        db = self._require_db(db_id)
         body = {"query": query, "top_k": top_k}
         r = self._request("POST", f"/db/{db}/query", json_body=body)
         out: list[QueryResult] = []
@@ -224,9 +279,12 @@ class LimemClient:
             )
         return out
 
-    # ----- Entity / Pattern -----
+    def evolve(self, db_id: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/db/{self._require_db(db_id)}/evolve")
 
-    def register_entity(
+    # ----- Entity 注册 / 修改（v2） -----
+
+    def entity_create_or_promote(
         self,
         entity_id: str,
         description: str,
@@ -234,10 +292,15 @@ class LimemClient:
         entity_type: str = "UNKNOWN",
         aliases: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
-        patterns: list[dict[str, Any]] | None = None,
+        pattern_markdown: str | None = None,
         db_id: str | None = None,
     ) -> RegisterEntityResult:
-        db = db_id or self.creds.db_id
+        """注册（或晋升 / 更新）注册实体。
+
+        - `pattern_markdown` 不为空时，作为单对象 `pattern: {content}` 内联写入；失败由后端整体回滚。
+        - 旧 `patterns: [...]` 数组参数已被后端拒绝（422）；本方法不再支持。
+        """
+        db = self._require_db(db_id)
         body: dict[str, Any] = {
             "entity_id": entity_id,
             "description": description,
@@ -247,11 +310,10 @@ class LimemClient:
             body["aliases"] = aliases
         if metadata:
             body["metadata"] = metadata
-        if patterns:
-            body["patterns"] = patterns
+        if pattern_markdown is not None and pattern_markdown.strip():
+            body["pattern"] = {"content": pattern_markdown}
         r = self._request("POST", f"/db/{db}/api/entities", json_body=body)
         entity_dict = r.get("entity") or {}
-        # 后端用 ``id``+``type``，本地统一 ``entity_id``+``entity_type``
         if isinstance(entity_dict, dict):
             if "id" in entity_dict and "entity_id" not in entity_dict:
                 entity_dict = {**entity_dict, "entity_id": entity_dict["id"]}
@@ -261,74 +323,117 @@ class LimemClient:
             action=r.get("action", ""),
             existed_as_extracted=r.get("existed_as_extracted", False),
             entity=entity_dict,
-            patterns=[EntityPattern.from_response(p) for p in r.get("patterns", [])],
+            pattern=EntityPattern.from_response(r.get("pattern")),
         )
 
-    def list_entity_patterns(
-        self, entity_id: str, *, db_id: str | None = None
-    ) -> list[EntityPattern]:
-        db = db_id or self.creds.db_id
-        r = self._request("GET", f"/db/{db}/api/entities/{entity_id}/patterns")
-        # 后端真实形态：{"items": [...]}；老接口/降级形态：直接是 list 或 {"patterns": [...]}
-        if isinstance(r, list):
-            items = r
-        elif isinstance(r, dict):
-            items = r.get("items") or r.get("patterns") or []
-        else:
-            items = []
-        return [EntityPattern.from_response(p) for p in items]
+    def entity_patch(
+        self,
+        entity_id: str,
+        *,
+        description: str | None = None,
+        entity_type: str | None = None,
+        add_aliases: list[str] | None = None,
+        remove_aliases: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        db_id: str | None = None,
+    ) -> RegisterEntityResult:
+        db = self._require_db(db_id)
+        body: dict[str, Any] = {}
+        if description is not None:
+            body["description"] = description
+        if entity_type is not None:
+            body["entity_type"] = entity_type
+        if add_aliases:
+            body["add_aliases"] = add_aliases
+        if remove_aliases:
+            body["remove_aliases"] = remove_aliases
+        if metadata is not None:
+            body["metadata"] = metadata
+        if not body:
+            raise LimemError(0, "entity_patch: empty payload")
+        r = self._request("PATCH", f"/db/{db}/api/entities/{entity_id}", json_body=body)
+        entity_dict = r.get("entity") or {}
+        return RegisterEntityResult(
+            action=r.get("action", "updated"),
+            existed_as_extracted=r.get("existed_as_extracted", False),
+            entity=entity_dict,
+            pattern=EntityPattern.from_response(r.get("pattern")),
+        )
 
-    def create_entity_pattern(
+    def entity_get(self, entity_id: str, *, db_id: str | None = None) -> dict[str, Any]:
+        db = self._require_db(db_id)
+        return self._request("GET", f"/db/{db}/api/entities/{entity_id}")
+
+    def entity_list(self, *, db_id: str | None = None) -> dict[str, Any]:
+        db = self._require_db(db_id)
+        return self._request("GET", f"/db/{db}/api/entities")
+
+    # ----- Entity Pattern markdown（v2） -----
+
+    def patterns_upsert(
         self,
         entity_id: str,
         content: str,
         *,
-        pattern_type: str = "preference",
-        metadata: dict[str, Any] | None = None,
-        pattern_id: str | None = None,
         db_id: str | None = None,
-    ) -> EntityPattern:
-        db = db_id or self.creds.db_id
-        body: dict[str, Any] = {"content": content, "pattern_type": pattern_type}
-        if metadata:
-            body["metadata"] = metadata
-        if pattern_id:
-            body["pattern_id"] = pattern_id
-        r = self._request("POST", f"/db/{db}/api/entities/{entity_id}/patterns", json_body=body)
-        p = r.get("pattern", r) if isinstance(r, dict) else {}
-        return EntityPattern.from_response(p)
+    ) -> tuple[str, EntityPattern | None]:
+        """整篇 upsert markdown；首次返回 action=created，之后 updated。"""
+        db = self._require_db(db_id)
+        if not content or not content.strip():
+            raise LimemError(0, "patterns_upsert: content must not be blank")
+        r = self._request(
+            "PUT",
+            f"/db/{db}/api/entities/{entity_id}/patterns",
+            json_body={"content": content},
+        )
+        return (r.get("action", ""), EntityPattern.from_response(r.get("pattern")))
 
-    def batch_create_entity_patterns(
+    def patterns_get(self, entity_id: str, *, db_id: str | None = None) -> PatternRecallResult:
+        """读取 entity 的整篇 markdown（与 recall 同构响应）。空 pattern 返 200 + 空响应。"""
+        db = self._require_db(db_id)
+        r = self._request("GET", f"/db/{db}/api/entities/{entity_id}/patterns")
+        return PatternRecallResult.from_response(r or {})
+
+    def patterns_recall(
         self,
         entity_id: str,
-        patterns: list[dict[str, Any]],
+        query: str,
         *,
+        mode: Literal["auto", "full", "section"] = "auto",
+        top_k_sections: int = 0,
         db_id: str | None = None,
-    ) -> list[EntityPattern]:
-        db = db_id or self.creds.db_id
+        timeout: float | None = None,
+    ) -> PatternRecallResult:
+        """按 H2 切片打分召回；空 pattern 返 200 + 空响应。
+
+        :param mode: ``auto`` (默认，content<2000 用 full 否则 section) / ``full`` / ``section``。
+        :param top_k_sections: 0=后端默认 3；范围 [0, 20]。
+        :param timeout: hook 内召回常 < hook_timeout_ms/2；可覆盖 self.timeout。
+        """
+        db = self._require_db(db_id)
+        params: dict[str, Any] = {"query": query or "", "mode": mode}
+        if top_k_sections:
+            params["top_k_sections"] = top_k_sections
         r = self._request(
-            "POST",
-            f"/db/{db}/api/entities/{entity_id}/patterns/:batch",
-            json_body={"patterns": patterns},
+            "GET",
+            f"/db/{db}/api/entities/{entity_id}/patterns/recall",
+            params=params,
+            timeout=timeout,
         )
-        if isinstance(r, list):
-            items = r
-        elif isinstance(r, dict):
-            items = r.get("items") or r.get("patterns") or []
-        else:
-            items = []
-        return [EntityPattern.from_response(p) for p in items]
+        return PatternRecallResult.from_response(r or {})
 
-    def delete_entity_pattern(
-        self, entity_id: str, pattern_id: str, *, db_id: str | None = None
-    ) -> None:
-        db = db_id or self.creds.db_id
-        self._request("DELETE", f"/db/{db}/api/entities/{entity_id}/patterns/{pattern_id}")
+    def patterns_delete(self, entity_id: str, *, db_id: str | None = None) -> EntityPattern | None:
+        """硬删 entity 的 markdown；该实体当前无 pattern → 404 抛出。"""
+        db = self._require_db(db_id)
+        r = self._request("DELETE", f"/db/{db}/api/entities/{entity_id}/patterns")
+        if isinstance(r, dict):
+            return EntityPattern.from_response(r.get("pattern"))
+        return None
 
-    # ----- Graph 编辑（forget 用） -----
+    # ----- Graph 编辑（forget / fix 用） -----
 
     def graph_archive_event(self, event_id: str, *, db_id: str | None = None) -> dict[str, Any]:
-        db = db_id or self.creds.db_id
+        db = self._require_db(db_id)
         return self._request(
             "POST",
             f"/db/{db}/api/graph/delete",
@@ -338,7 +443,7 @@ class LimemClient:
     def graph_update_event(
         self, event_id: str, fields: dict[str, Any], *, db_id: str | None = None
     ) -> dict[str, Any]:
-        db = db_id or self.creds.db_id
+        db = self._require_db(db_id)
         return self._request(
             "POST",
             f"/db/{db}/api/graph/update",

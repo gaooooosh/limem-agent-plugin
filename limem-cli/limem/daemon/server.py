@@ -193,7 +193,7 @@ class Daemon:
                 importance=0.85,
                 entities=entities or None,
                 source="daemon:learner_accept",
-                creds=self.creds, runtime=self.runtime, pidx=self.pidx,
+                creds=self.creds, runtime=self.runtime, idx=self.pidx,
             )
             s["status"] = "accepted"
             s["accepted_event_id"] = result["event_id"]
@@ -265,7 +265,7 @@ class Daemon:
                 source=p.get("source", "rpc"),
                 session_id=p.get("session_id", ""),
                 detail=p.get("detail", ""),
-                creds=self.creds, runtime=self.runtime, pidx=self.pidx,
+                creds=self.creds, runtime=self.runtime, idx=self.pidx,
                 skip_redact=p.get("skip_redact", False),
             ),
         )
@@ -275,7 +275,7 @@ class Daemon:
     async def _h_forget_memory(self, p: dict[str, Any]) -> dict[str, Any]:
         result = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: forget_impl(event_id=p["event_id"], creds=self.creds, pidx=self.pidx),
+            lambda: forget_impl(event_id=p["event_id"], creds=self.creds, idx=self.pidx),
         )
         if result.get("local_rows_tombstoned", 0) > 0:
             self.state.active_memories = max(0, self.state.active_memories - 1)
@@ -287,7 +287,7 @@ class Daemon:
             lambda: fix_impl(
                 event_id=p["event_id"],
                 new_text=p["new_text"],
-                creds=self.creds, pidx=self.pidx,
+                creds=self.creds, idx=self.pidx,
             ),
         )
 

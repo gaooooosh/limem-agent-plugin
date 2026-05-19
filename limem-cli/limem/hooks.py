@@ -1,20 +1,17 @@
 """Hook 调度入口：``limem hook <tool> <event>``。
 
-阶段 1-8 累积改造：
-- 每次入口都先读 ``pause.json``（直接读磁盘，不依赖 daemon）
-- degraded banner 每 session 一次（去重经由 ``DEGRADED_SEEN_PATH``）
-- 注入区块带 ``via=`` 与 ``#<short_id>``；session_mute 过滤
-- 写 events.ndjson 新 schema（供 daemon 异步消费）
-- 调 ``auto_init_project`` RPC（25ms 超时，非阻塞）
-- ``bump_hit`` 命中召回后调 daemon 计数
-- 失败永远 swallow
+v2 重写要点：
+- UserPromptSubmit 拆为 **3 路完全并发**：hard（本地）/ pattern（entity FTS + 后端 markdown 切片）
+  / soft（BM25），独立超时、独立预算。
+- SessionStart 仍只跑 hard（避免重复噪声）。
+- SessionEnd / Codex Stop 缓冲池 / PostToolUse / PreCompact 行为保留。
+- 失败永远 swallow（hook 不能阻塞用户 prompt）。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 import traceback
@@ -36,23 +33,24 @@ from .daemon.state import (
     is_degraded_banner_emitted_on_disk,
     read_pause_from_disk,
 )
+from .entity_index import EntityHit, EntityIndex
 from .injector import (
+    Budgets,
+    PatternRecallSlice,
     hard_recall_to_items,
     pattern_recall_to_items,
     render_inject,
     soft_recall_to_items,
 )
-from .pattern_index import PatternIndex
 from .redact import contains_secret
 from .scope import detect_project_id, project_scope
 from .tag_text import build_recall_query
 
 
-# ---------- 日志（兼容旧 _log 接口） ----------
+# ---------- 日志 ----------
 
 
 def _log(event: str, tool: str, **fields: Any) -> None:
-    # 旧 _log 已升级为事件总线写入；保留接口便于诊断输出
     try:
         EVENTS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with EVENTS_LOG_PATH.open("a") as f:
@@ -84,7 +82,7 @@ def _emit_inject(event_name: str, text: str) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
 
 
-# ---------- 召回 ----------
+# ---------- 召回辅助 ----------
 
 
 def _allowed_scopes(project_id: str) -> list[str]:
@@ -95,7 +93,6 @@ def _allowed_scopes(project_id: str) -> list[str]:
 
 
 def _safe_redact(text: str, patterns: list[str]) -> tuple[str, bool]:
-    """对 prompt 做 secret 过滤（用于 events.ndjson 隐私保护）。"""
     if not text:
         return "", False
     hit = contains_secret(text, patterns)
@@ -127,6 +124,59 @@ def _degraded_banner(reason: str) -> str:
     )
 
 
+def _patterns_recall_for_entities(
+    entity_hits: list[EntityHit],
+    prompt: str,
+    creds: Credentials,
+    runtime: RuntimeConfig,
+) -> list[PatternRecallSlice]:
+    """对候选实体并发拉取 markdown 切片。单 entity 超时即跳过，永不抛错。"""
+    if not entity_hits or not creds.api_key or not creds.db_id:
+        return []
+
+    per_timeout_s = max(0.02, runtime.patterns_recall_timeout_ms / 1000.0)
+    client = LimemClient(creds=creds, timeout=per_timeout_s)
+
+    def _fetch(eh: EntityHit) -> tuple[EntityHit, Any]:
+        try:
+            res = client.patterns_recall(
+                eh.entity_id,
+                prompt,
+                mode="auto",
+                top_k_sections=runtime.patterns_recall_top_k_sections,
+                timeout=per_timeout_s,
+            )
+            return eh, res
+        except Exception:
+            return eh, None
+
+    slices: list[PatternRecallSlice] = []
+    workers = min(8, max(1, len(entity_hits)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for eh, res in pool.map(_fetch, entity_hits):
+            if res is None or not res.has_content():
+                continue
+            if res.matched_sections:
+                head = res.matched_sections[0].heading or ""
+                score = sum(s.score for s in res.matched_sections)
+            else:
+                head = ""
+                score = max(float(eh.importance or 0.0), 0.5)
+            slices.append(
+                PatternRecallSlice(
+                    entity_id=eh.entity_id,
+                    canonical=eh.canonical,
+                    heading=head,
+                    content=res.content,
+                    score=float(score),
+                )
+            )
+    return slices
+
+
+# ---------- UserPromptSubmit ----------
+
+
 def _hook_user_prompt_submit(
     tool: str, payload: dict[str, Any], creds: Credentials, runtime: RuntimeConfig
 ) -> None:
@@ -140,20 +190,23 @@ def _hook_user_prompt_submit(
     project_id = detect_project_id()
     scope = f"project:{project_id}" if project_id else "global"
 
-    # F1 自动 init：非阻塞 RPC（25ms 超时）
     try:
         daemon_client.safe_call("auto_init_project", {"cwd": str(Path.cwd())})
     except Exception:
         pass
 
-    # F7 pause 优先
     pause = read_pause_from_disk()
     if pause.is_active():
-        _log("user_prompt_submit_paused", tool, session_id=session_id, project_id=project_id, scope=scope)
+        _log(
+            "user_prompt_submit_paused",
+            tool,
+            session_id=session_id,
+            project_id=project_id,
+            scope=scope,
+        )
         sys.stdout.write("")
         return
 
-    # F9 degraded：本 session 首次注入 banner，其后仅 statusline
     conn = daemon_client.get_connectivity()
     if conn and conn.get("state") == "degraded":
         reason = conn.get("reason") or "unknown"
@@ -162,28 +215,39 @@ def _hook_user_prompt_submit(
         else:
             banner = _degraded_banner(reason)
             if session_id:
-                # 通过 daemon 记录已注入；fallback 本地落盘
-                try:
-                    from .daemon.state import DEGRADED_SEEN_PATH  # noqa
-                except Exception:
-                    pass
                 _mark_degraded_emitted(session_id)
             _emit_inject("UserPromptSubmit", banner)
-        # degraded 期间也写 events 便于 daemon 学习器观察
         _emit_event_safe(
             "user_prompt_submit", tool, prompt, session_id, project_id, scope, runtime
         )
         return
 
-    pidx = PatternIndex()
+    idx = EntityIndex()
     scopes = _allowed_scopes(project_id)
 
-    pattern_hits: list = []
+    hard_metas = []
+    entity_hits: list[EntityHit] = []
+    pattern_slices: list[PatternRecallSlice] = []
     soft_results: list = []
 
+    def _do_hard() -> None:
+        nonlocal hard_metas
+        hard_metas = idx.list_hard_recall(
+            allowed_scopes=scopes,
+            allowed_types=["rule", "feedback", "preference"],
+            min_importance=runtime.hard_min_importance,
+        )
+
     def _do_pattern() -> None:
-        nonlocal pattern_hits
-        pattern_hits = pidx.search_patterns(prompt, allowed_scopes=scopes, limit=8)
+        nonlocal entity_hits, pattern_slices
+        entity_hits = idx.search_entities(
+            prompt,
+            allowed_scopes=scopes,
+            limit=runtime.pattern_top_entities,
+            require_pattern=True,  # 没挂 markdown 的 entity 跳过，省一次 HTTP
+        )
+        if entity_hits:
+            pattern_slices = _patterns_recall_for_entities(entity_hits, prompt, creds, runtime)
 
     def _do_soft() -> None:
         nonlocal soft_results
@@ -191,10 +255,7 @@ def _hook_user_prompt_submit(
             return
         client = LimemClient(creds=creds, timeout=runtime.hook_timeout_ms / 1000.0)
         try:
-            q = build_recall_query(
-                prompt, scopes=[], types=[],
-                canonical_hints=[h.content for h in pattern_hits] if pattern_hits else None,
-            )
+            q = build_recall_query(prompt, scopes=[], types=[], canonical_hints=None)
             soft_results = client.query(q, top_k=runtime.bm25_query_top_k)
             daemon_client.set_connectivity(status=200, ok=True)
         except LimemError as e:
@@ -204,41 +265,45 @@ def _hook_user_prompt_submit(
             daemon_client.set_connectivity(status=0, reason="network")
             _log("soft_recall_exc", tool, msg=str(e))
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f1 = pool.submit(_do_pattern)
-        try:
-            f1.result(timeout=runtime.hook_timeout_ms / 1000.0)
-        except FutTimeout:
-            _log("pattern_timeout", tool)
-        f2 = pool.submit(_do_soft)
-        try:
-            f2.result(timeout=runtime.hook_timeout_ms / 1000.0)
-        except FutTimeout:
-            _log("soft_timeout", tool)
+    hook_t = runtime.hook_timeout_ms / 1000.0
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_hard = pool.submit(_do_hard)
+        f_pattern = pool.submit(_do_pattern)
+        f_soft = pool.submit(_do_soft)
+        for fut, label in ((f_hard, "hard"), (f_pattern, "pattern"), (f_soft, "soft")):
+            try:
+                fut.result(timeout=hook_t)
+            except FutTimeout:
+                _log(f"{label}_timeout", tool)
 
-    soft_filtered = pidx.filter_query_results(
+    soft_filtered = idx.filter_query_results(
         soft_results,
         allowed_scopes=set(scopes),
         excluded_types={"rule", "feedback", "preference"},
     )
 
     items = (
-        pattern_recall_to_items(pattern_hits, pidx.lookup_event, pidx=pidx)
-        + soft_recall_to_items(soft_filtered, pidx=pidx)
+        hard_recall_to_items(hard_metas, idx=idx)
+        + pattern_recall_to_items(pattern_slices)
+        + soft_recall_to_items(soft_filtered, idx=idx)
     )
 
-    # session_mute 过滤
     muted = session_mute.get_muted(session_id) if session_id else set()
     if muted:
         items = [it for it in items if (it.short_id or it.event_id[:12]) not in muted]
 
-    via_patterns = [h.content for h in pattern_hits[:3]]
+    via_patterns = [eh.canonical for eh in entity_hits[:3]]
     via_keywords = _via_keywords(prompt, limit=2)
 
+    budgets = Budgets(
+        hard=runtime.inject_budget_hard,
+        pattern=runtime.inject_budget_pattern,
+        soft=runtime.inject_budget_soft,
+    )
     text = render_inject(
         items,
         project_id=project_id,
-        total_budget=runtime.inject_budget_soft + runtime.inject_budget_hard,
+        budgets=budgets,
         via_patterns=via_patterns,
         via_keywords=via_keywords,
     )
@@ -251,7 +316,9 @@ def _hook_user_prompt_submit(
         project_id=project_id,
         scope=scope,
         prompt_head=prompt[:60],
-        pattern_hits=len(pattern_hits),
+        hard_hits=len(hard_metas),
+        entity_hits=len(entity_hits),
+        pattern_slices=len(pattern_slices),
         soft_hits=len(soft_results),
         soft_filtered=len(soft_filtered),
         injected_chars=len(text),
@@ -296,6 +363,9 @@ def _emit_event_safe(
     )
 
 
+# ---------- SessionStart ----------
+
+
 def _hook_session_start(
     tool: str, payload: dict[str, Any], creds: Credentials, runtime: RuntimeConfig
 ) -> None:
@@ -303,7 +373,6 @@ def _hook_session_start(
     scope = f"project:{project_id}" if project_id else "global"
     session_id = payload.get("session_id") or payload.get("sessionId") or ""
 
-    # F1 自动 init（非阻塞）
     try:
         daemon_client.safe_call("auto_init_project", {"cwd": str(Path.cwd())})
     except Exception:
@@ -314,18 +383,17 @@ def _hook_session_start(
         sys.stdout.write("")
         return
 
-    pidx = PatternIndex()
+    idx = EntityIndex()
     scopes = _allowed_scopes(project_id)
-    metas = pidx.list_hard_recall(
+    metas = idx.list_hard_recall(
         allowed_scopes=scopes,
         allowed_types=["rule", "feedback", "preference"],
+        min_importance=runtime.hard_min_importance,
     )
-    items = hard_recall_to_items(metas, pidx=pidx)
-    text = render_inject(
-        items,
-        project_id=project_id,
-        total_budget=runtime.inject_budget_hard,
-    )
+    items = hard_recall_to_items(metas, idx=idx)
+    # SessionStart 仅 hard 段；pattern/soft 都为 0
+    budgets = Budgets(hard=runtime.inject_budget_hard, pattern=0, soft=0)
+    text = render_inject(items, project_id=project_id, budgets=budgets)
     if items:
         daemon_client.bump_hit(session_id)
     _log(
@@ -340,12 +408,14 @@ def _hook_session_start(
     _emit_inject("SessionStart", text)
 
 
+# ---------- SessionEnd / Stop / Misc ----------
+
+
 def _hook_session_end(
     tool: str, payload: dict[str, Any], creds: Credentials, runtime: RuntimeConfig
 ) -> None:
     project_id = detect_project_id()
     session_id = payload.get("session_id") or payload.get("sessionId") or ""
-    # session_mute 清理
     if session_id:
         session_mute.clear(session_id)
     emit_event(
@@ -426,7 +496,6 @@ def _flush_codex_session(buf: Path, creds: Credentials, tool: str) -> None:
         LimemClient(creds=creds).ingest(summary_payload)
         daemon_client.set_connectivity(status=200, ok=True)
         _log("stop_flush", tool, buffer=str(buf), turns=len(events))
-        # session_mute 清理
         session_mute.clear(sid)
         buf.unlink(missing_ok=True)
     except LimemError as e:
@@ -446,18 +515,12 @@ def _hook_pre_compact(
 def _hook_post_tool_use(
     tool: str, payload: dict[str, Any], creds: Credentials, runtime: RuntimeConfig
 ) -> None:
-    """F3 采集：编辑工具的 file_path/diff_summary/accepted 信号。
-
-    Claude Code 在 Edit/Write/NotebookEdit 后会触发此 hook（若已订阅）；
-    Codex 无此事件，由 UserPromptSubmit 中的 apply_patch 关键字降级推断。
-    """
     project_id = detect_project_id()
     session_id = payload.get("session_id") or payload.get("sessionId") or ""
     tool_name = payload.get("tool_name") or payload.get("tool") or ""
     file_path = payload.get("file_path") or ""
-    accepted = bool(payload.get("accepted", True))  # Claude Code 默认应用即视为 accepted
+    accepted = bool(payload.get("accepted", True))
     diff_summary = ""
-    # 尽力提取 diff 摘要：Edit 提供 old_string/new_string；Write 提供 content
     if "new_string" in payload or "old_string" in payload:
         diff_summary = (
             f"old: {(payload.get('old_string') or '')[:200]} | "

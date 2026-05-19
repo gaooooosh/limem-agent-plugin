@@ -1,10 +1,15 @@
 """LiMem MCP stdio server。
 
-阶段 1-4 工具集：
-- ``limem_search`` / ``limem_write`` / ``limem_forget`` / ``limem_list``
-- ``limem_ping`` / ``limem_stats``
-- ``limem_pause`` / ``limem_resume``     — 阶段 3
-- ``limem_fix`` / ``limem_mute``         — 阶段 4
+v2 工具集（变化集中在 search / write / pattern_* / fix）：
+- ``limem_search``  ：entity FTS5 候选 → 并发后端 markdown 切片 + BM25 软召回，三段聚合
+- ``limem_write``   ：写一条 event + 注册（晋升）entity；**不再支持 trigger 短语数组**
+- ``limem_forget``  ：归档 event
+- ``limem_fix``     ：修改 event 文本（不动 entity markdown）
+- ``limem_list``    ：列出本项目 + global 的强规则
+- ``limem_pause``   / ``limem_resume`` / ``limem_mute``  ：保留
+- ``limem_ping``    / ``limem_stats`` ：保留（stats 输出新 entity 维度）
+- ``limem_pattern_get`` / ``limem_pattern_put`` / ``limem_pattern_delete``  ：v2 新增
+   entity markdown 档案的 CRUD（唯一面向 LLM 的入口；用户侧通过 /limem.pattern skill）
 """
 
 from __future__ import annotations
@@ -17,10 +22,18 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from . import daemon_client, session_mute
-from .client import LimemClient, LimemError
-from .config import Credentials
-from .memory_writer import EntitySpec, fix as do_fix, forget as do_forget, remember as do_remember
-from .pattern_index import PatternIndex
+from .client import LimemClient, LimemError, PatternRecallResult
+from .config import Credentials, RuntimeConfig
+from .entity_index import EntityIndex
+from .memory_writer import (
+    EntitySpec,
+    delete_pattern as do_pattern_delete,
+    fix as do_fix,
+    forget as do_forget,
+    get_pattern as do_pattern_get,
+    remember as do_remember,
+    update_pattern as do_pattern_put,
+)
 from .scope import detect_project_id
 
 
@@ -34,7 +47,9 @@ async def _list_tools() -> list[Tool]:
             name="limem_search",
             description=(
                 "Search LiMem long-term memory for the current user/project. "
-                "Returns matched memories with their IDs, scope, type, and origin text."
+                "Returns matched memories (rules / events) AND any relevant entity "
+                "markdown sections (`pattern` source). Use when you need to recall "
+                "what the user has previously asked you to remember."
             ),
             inputSchema={
                 "type": "object",
@@ -42,6 +57,7 @@ async def _list_tools() -> list[Tool]:
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20},
                     "include_types": {"type": "array", "items": {"type": "string"}},
+                    "include_patterns": {"type": "boolean", "default": True},
                 },
                 "required": ["query"],
             },
@@ -49,13 +65,19 @@ async def _list_tools() -> list[Tool]:
         Tool(
             name="limem_write",
             description=(
-                "Persist a long-term memory. Use when user says 'remember X' / 'don't do Y' / 'always Z'."
+                "Persist a long-term memory event. Use when user says 'remember X' / "
+                "'don't do Y' / 'always Z'. To edit an entity's markdown profile use "
+                "limem_pattern_put instead."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "text": {"type": "string"},
-                    "scope": {"type": "string", "enum": ["project", "global", "session"], "default": "project"},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["project", "global", "session"],
+                        "default": "project",
+                    },
                     "mem_type": {
                         "type": "string",
                         "enum": ["rule", "feedback", "preference", "note", "fact", "decision"],
@@ -68,10 +90,15 @@ async def _list_tools() -> list[Tool]:
                             "type": "object",
                             "properties": {
                                 "canonical": {"type": "string"},
-                                "role": {"type": "string", "enum": ["forbidden", "preferred", "neutral", "subject"]},
-                                "patterns": {"type": "array", "items": {"type": "string"}},
+                                "role": {
+                                    "type": "string",
+                                    "enum": ["forbidden", "preferred", "neutral", "subject"],
+                                },
+                                "aliases": {"type": "array", "items": {"type": "string"}},
+                                "description": {"type": "string"},
+                                "entity_type": {"type": "string"},
                             },
-                            "required": ["canonical", "role", "patterns"],
+                            "required": ["canonical"],
                         },
                     },
                     "session_id": {"type": "string"},
@@ -95,7 +122,11 @@ async def _list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "types": {"type": "array", "items": {"type": "string"}, "default": ["rule", "feedback", "preference"]},
+                    "types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": ["rule", "feedback", "preference"],
+                    },
                     "include_global": {"type": "boolean", "default": True},
                 },
             },
@@ -107,7 +138,7 @@ async def _list_tools() -> list[Tool]:
         ),
         Tool(
             name="limem_stats",
-            description="Show local SQLite cache statistics.",
+            description="Show local SQLite cache statistics (entities/events/short_ids).",
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
@@ -134,7 +165,8 @@ async def _list_tools() -> list[Tool]:
             name="limem_fix",
             description=(
                 "Update an existing memory event's text in-place via short_id (#xxxx) "
-                "or full event_id. Does NOT create a new event."
+                "or full event_id. Does NOT create a new event. For editing an entity's "
+                "markdown profile, use limem_pattern_put instead."
             ),
             inputSchema={
                 "type": "object",
@@ -158,6 +190,46 @@ async def _list_tools() -> list[Tool]:
                     "session_id": {"type": "string"},
                 },
                 "required": ["short_id", "session_id"],
+            },
+        ),
+        # v2 新增：entity markdown 档案 CRUD
+        Tool(
+            name="limem_pattern_get",
+            description=(
+                "Fetch the entire markdown profile attached to a registered entity. "
+                "Use to read what is currently stored before editing."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {"entity_id": {"type": "string"}},
+                "required": ["entity_id"],
+            },
+        ),
+        Tool(
+            name="limem_pattern_put",
+            description=(
+                "Replace an entity's markdown profile with new content (whole-document upsert). "
+                "Caller is responsible for merging if partial edits are intended."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "entity_id": {"type": "string"},
+                    "content": {
+                        "type": "string",
+                        "description": "Full markdown content; non-empty. H2 sections will be used for recall scoring.",
+                    },
+                },
+                "required": ["entity_id", "content"],
+            },
+        ),
+        Tool(
+            name="limem_pattern_delete",
+            description="Hard-delete an entity's markdown profile. The entity itself is NOT removed.",
+            inputSchema={
+                "type": "object",
+                "properties": {"entity_id": {"type": "string"}},
+                "required": ["entity_id"],
             },
         ),
     ]
@@ -186,6 +258,12 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             text = _t_fix(**arguments)
         elif name == "limem_mute":
             text = _t_mute(**arguments)
+        elif name == "limem_pattern_get":
+            text = _t_pattern_get(**arguments)
+        elif name == "limem_pattern_put":
+            text = _t_pattern_put(**arguments)
+        elif name == "limem_pattern_delete":
+            text = _t_pattern_delete(**arguments)
         else:
             text = json.dumps({"error": f"unknown tool: {name}"}, ensure_ascii=False)
     except (LimemError, ValueError) as e:
@@ -200,22 +278,70 @@ def _allowed_scopes(project_id: str) -> list[str]:
 
 
 def _resolve_event_id(input_id: str) -> str:
-    """支持 #short_id 与完整 event_id。"""
     s = (input_id or "").strip()
     if s.startswith("#"):
         s = s[1:]
-    pidx = PatternIndex()
-    looked = pidx.lookup_event_by_short_id(s)
+    idx = EntityIndex()
+    looked = idx.lookup_event_by_short_id(s)
     return looked or input_id
 
 
-def _t_search(query: str, *, top_k: int = 5, include_types: list[str] | None = None) -> str:
+def _t_search(
+    query: str,
+    *,
+    top_k: int = 5,
+    include_types: list[str] | None = None,
+    include_patterns: bool = True,
+) -> str:
     creds = Credentials.load()
+    runtime = RuntimeConfig.load()
     project_id = detect_project_id()
     scopes = _allowed_scopes(project_id)
-    pidx = PatternIndex()
+    idx = EntityIndex()
 
-    pattern_hits = pidx.search_patterns(query, allowed_scopes=scopes, limit=top_k * 2)
+    out_events: list[dict[str, Any]] = []
+    out_patterns: list[dict[str, Any]] = []
+
+    # 1) entity FTS → 后端 markdown 切片
+    if include_patterns and creds.api_key and creds.db_id:
+        entity_hits = idx.search_entities(
+            query,
+            allowed_scopes=scopes,
+            limit=min(top_k, runtime.pattern_top_entities),
+            require_pattern=True,
+        )
+        client = LimemClient(
+            creds=creds, timeout=runtime.patterns_recall_timeout_ms / 1000.0
+        )
+        for eh in entity_hits:
+            try:
+                res: PatternRecallResult = client.patterns_recall(
+                    eh.entity_id,
+                    query,
+                    mode="auto",
+                    top_k_sections=runtime.patterns_recall_top_k_sections,
+                )
+            except LimemError:
+                continue
+            except Exception:
+                continue
+            if not res.has_content():
+                continue
+            out_patterns.append(
+                {
+                    "entity_id": eh.entity_id,
+                    "canonical": eh.canonical,
+                    "scope": eh.scope,
+                    "mode": res.mode,
+                    "matched_sections": [
+                        {"heading": s.heading, "score": s.score} for s in res.matched_sections
+                    ],
+                    "content": res.content,
+                    "source": "pattern",
+                }
+            )
+
+    # 2) BM25 软召回
     soft_results = []
     if creds.api_key and creds.db_id:
         client = LimemClient(creds=creds)
@@ -229,36 +355,37 @@ def _t_search(query: str, *, top_k: int = 5, include_types: list[str] | None = N
         if include_types
         else set()
     )
-    soft_filtered = pidx.filter_query_results(
+    soft_filtered = idx.filter_query_results(
         soft_results,
         allowed_scopes=set(scopes),
         allowed_types=set(include_types) if include_types else None,
         excluded_types=excluded if not include_types else None,
     )
 
-    out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for h in pattern_hits:
-        if h.event_id in seen:
-            continue
-        meta = pidx.lookup_event(h.event_id)
-        if meta is None:
-            continue
-        seen.add(h.event_id)
-        out.append(_serialize_event(meta, source="pattern", trigger=h.content))
     for qr, meta in soft_filtered:
         if meta.event_id in seen:
             continue
         seen.add(meta.event_id)
-        out.append(_serialize_event(meta, source="bm25", trigger=None, score=qr.score))
-    return json.dumps({"matches": out[:top_k], "project_id": project_id}, ensure_ascii=False)
+        out_events.append(_serialize_event(meta, source="bm25", score=qr.score))
+        if len(out_events) >= top_k:
+            break
+
+    return json.dumps(
+        {
+            "events": out_events,
+            "patterns": out_patterns[:top_k],
+            "project_id": project_id,
+        },
+        ensure_ascii=False,
+    )
 
 
-def _serialize_event(meta, *, source: str, trigger: str | None, score: float | None = None) -> dict[str, Any]:
+def _serialize_event(meta, *, source: str, score: float | None = None) -> dict[str, Any]:
     raw = meta.raw_metadata or {}
-    pidx = PatternIndex()
+    idx = EntityIndex()
     try:
-        short = pidx.ensure_short_id(meta.event_id)
+        short = idx.ensure_short_id(meta.event_id)
     except Exception:
         short = meta.event_id[:12]
     return {
@@ -269,7 +396,6 @@ def _serialize_event(meta, *, source: str, trigger: str | None, score: float | N
         "role": meta.role,
         "importance": meta.importance,
         "source": source,
-        "trigger_pattern": trigger,
         "bm25_score": score,
         "text": raw.get("original_text") or meta.summary,
         "canonicals": raw.get("canonicals", []),
@@ -300,7 +426,9 @@ def _t_write(
             EntitySpec(
                 canonical=raw["canonical"],
                 role=raw.get("role", "neutral"),
-                patterns=list(raw.get("patterns") or []),
+                aliases=list(raw.get("aliases") or []),
+                description=raw.get("description") or "",
+                entity_type=raw.get("entity_type") or "",
             )
         )
 
@@ -321,7 +449,12 @@ def _t_write(
             "scope": res.scope,
             "summary": res.summary,
             "entities_registered": res.entity_ids,
-            "patterns_indexed": res.pattern_count,
+            "entities_indexed": res.pattern_count,
+            "next_step": (
+                "Run limem_pattern_put to attach a markdown profile to one of the entities."
+                if res.entity_ids
+                else ""
+            ),
         },
         ensure_ascii=False,
     )
@@ -345,15 +478,15 @@ def _t_list(types: list[str] | None = None, *, include_global: bool = True) -> s
     scopes = [f"project:{project_id}"] if project_id else []
     if include_global:
         scopes.append("global")
-    pidx = PatternIndex()
-    metas = pidx.list_hard_recall(
+    idx = EntityIndex()
+    metas = idx.list_hard_recall(
         allowed_scopes=scopes,
         allowed_types=types or ["rule", "feedback", "preference"],
     )
     return json.dumps(
         {
             "project_id": project_id,
-            "items": [_serialize_event(m, source="list", trigger=None) for m in metas],
+            "items": [_serialize_event(m, source="list") for m in metas],
         },
         ensure_ascii=False,
     )
@@ -375,7 +508,7 @@ def _t_ping() -> str:
 
 
 def _t_stats() -> str:
-    return json.dumps(PatternIndex().stats(), ensure_ascii=False)
+    return json.dumps(EntityIndex().stats(), ensure_ascii=False)
 
 
 def _t_pause(
@@ -384,13 +517,11 @@ def _t_pause(
     scope: str = "project",
     session_id: str | None = None,
 ) -> str:
-    # 同时确保 daemon 启动（pause 不能掉链子）
     daemon_client.ensure_or_spawn()
     res = daemon_client.set_pause(
         duration_seconds=duration_seconds, scope=scope, session_id=session_id
     )
     if res is None:
-        # daemon 不可达 fallback：直接写 pause.json
         from .daemon.state import PauseState
         import time as _t
         until = int(_t.time()) + duration_seconds if duration_seconds > 0 else None
@@ -417,7 +548,30 @@ def _t_fix(short_id: str, new_text: str) -> str:
 
 def _t_mute(short_id: str, session_id: str) -> str:
     session_mute.mute(session_id, short_id)
-    return json.dumps({"muted": True, "short_id": short_id.lstrip("#"), "session_id": session_id}, ensure_ascii=False)
+    return json.dumps(
+        {"muted": True, "short_id": short_id.lstrip("#"), "session_id": session_id},
+        ensure_ascii=False,
+    )
+
+
+# ---------- entity markdown 档案 ----------
+
+
+def _t_pattern_get(entity_id: str) -> str:
+    res = do_pattern_get(entity_id=entity_id)
+    return json.dumps(res, ensure_ascii=False)
+
+
+def _t_pattern_put(entity_id: str, content: str) -> str:
+    if not (content or "").strip():
+        return json.dumps({"error": "content must not be blank"}, ensure_ascii=False)
+    res = do_pattern_put(entity_id=entity_id, content=content)
+    return json.dumps(res, ensure_ascii=False)
+
+
+def _t_pattern_delete(entity_id: str) -> str:
+    res = do_pattern_delete(entity_id=entity_id)
+    return json.dumps(res, ensure_ascii=False)
 
 
 def main() -> None:

@@ -105,12 +105,21 @@ class RuntimeConfig:
     """非敏感配置，可进 settings.json 但默认放 ~/.config/limem/config.json。"""
 
     inject_budget_hard: int = 800
+    inject_budget_pattern: int = 700  # v2：entity markdown 切片独立预算（决策 4）
     inject_budget_soft: int = 1200
     soft_min_score: float = 0.6
     pattern_min_tokens: int = 2
+    # v2：本地 entity FTS 召回 top-N 个候选实体送去后端 /patterns/recall
+    pattern_top_entities: int = 5
+    # v2：单个 entity /patterns/recall 的 HTTP 超时（毫秒），并发期间任何一个超时即跳过
+    patterns_recall_timeout_ms: int = 80
+    # v2：每个 entity 的 markdown 召回最多取前 N 个 H2 段（后端默认 3，此处缩小避免噪声）
+    patterns_recall_top_k_sections: int = 2
     hook_timeout_ms: int = 500
     bm25_query_top_k: int = 20
     hard_recall_top_k: int = 100
+    # v2：UserPromptSubmit 内 hard 召回的最低 importance 阈值（避免低分项挤掉 pattern/soft）
+    hard_min_importance: float = 0.7
     cache_query_ttl_seconds: int = 300
     cache_query_max_entries: int = 200
     codex_stop_idle_seconds: int = 30

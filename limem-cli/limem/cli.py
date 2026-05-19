@@ -410,14 +410,118 @@ def init(project: bool, targets: str, no_hooks: bool, no_mcp: bool, no_skills: b
 
 @main.command()
 def stats() -> None:
-    """本地 SQLite 缓存统计。"""
-    from .pattern_index import PatternIndex
-    pidx = PatternIndex()
-    s = pidx.stats()
+    """本地 SQLite 缓存统计 + 后端 stats（若可达）。"""
+    from .entity_index import EntityIndex
+    idx = EntityIndex()
+    s = idx.stats()
     t = Table(show_header=False, box=None)
+    t.add_row("[bold]local[/bold]", "")
     for k, v in s.items():
-        t.add_row(k, str(v))
+        t.add_row(f"  {k}", str(v))
+
+    creds = Credentials.load()
+    if creds.api_key and creds.db_id:
+        try:
+            backend = LimemClient(creds=creds).db_stats()
+            t.add_row("[bold]backend[/bold]", "")
+            for k in (
+                "episode_count",
+                "event_count",
+                "entity_count",
+                "context_count",
+                "involves_count",
+            ):
+                if k in backend:
+                    t.add_row(f"  {k}", str(backend[k]))
+        except LimemError as e:
+            t.add_row("backend", f"[yellow]unreachable: {e.status}[/yellow]")
+        except Exception as e:  # noqa: BLE001
+            t.add_row("backend", f"[yellow]error: {e}[/yellow]")
     console.print(t)
+
+
+# ---------- evolve / pattern ----------
+
+
+@main.command()
+def evolve() -> None:
+    """触发后端 /evolve（衰减 + 归档）。"""
+    creds = Credentials.load()
+    if not creds.api_key or not creds.db_id:
+        console.print("[red]缺凭证/db_id；先运行 `limem bootstrap`。[/red]")
+        sys.exit(2)
+    try:
+        out = LimemClient(creds=creds).evolve()
+        console.print(f"[green]evolve ok[/green]: {out}")
+    except LimemError as e:
+        console.print(f"[red]evolve failed[/red]: {e}")
+        sys.exit(1)
+
+
+@main.group()
+def pattern() -> None:
+    """entity markdown 档案 CRUD（调试/调用 /limem.pattern skill 的等价 CLI）。"""
+
+
+@pattern.command("get")
+@click.argument("entity_id")
+def pattern_get_cmd(entity_id: str) -> None:
+    creds = Credentials.load()
+    if not creds.api_key or not creds.db_id:
+        console.print("[red]缺凭证/db_id[/red]")
+        sys.exit(2)
+    try:
+        res = LimemClient(creds=creds).patterns_get(entity_id)
+    except LimemError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    if not res.has_content():
+        console.print(f"[yellow]entity {entity_id} 暂无档案[/yellow]")
+        return
+    console.print(f"[bold]entity:[/bold] {entity_id}  ({res.total_chars} chars)")
+    console.print(res.content)
+
+
+@pattern.command("put")
+@click.argument("entity_id")
+@click.option(
+    "--file", "-f", "file_path",
+    type=click.Path(exists=True),
+    help="从文件读取 markdown（覆盖 stdin）",
+)
+def pattern_put_cmd(entity_id: str, file_path: str | None) -> None:
+    """整篇 upsert entity markdown。从 --file 或 stdin 读取内容。"""
+    from pathlib import Path
+    if file_path:
+        content = Path(file_path).read_text(encoding="utf-8")
+    else:
+        content = sys.stdin.read()
+    if not content.strip():
+        console.print("[red]content is blank; 提供 --file 或在 stdin 输入[/red]")
+        sys.exit(2)
+    creds = Credentials.load()
+    try:
+        action, p = LimemClient(creds=creds).patterns_upsert(entity_id, content)
+    except LimemError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    console.print(
+        f"[green]{action}[/green] entity={entity_id} pattern_id={p.pattern_id if p else '-'} "
+        f"chars={len(content)}"
+    )
+
+
+@pattern.command("delete")
+@click.argument("entity_id")
+@click.confirmation_option(prompt="确认硬删除 entity 档案？此操作不可撤销")
+def pattern_delete_cmd(entity_id: str) -> None:
+    creds = Credentials.load()
+    try:
+        snap = LimemClient(creds=creds).patterns_delete(entity_id)
+    except LimemError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    console.print(f"[green]deleted[/green] entity={entity_id} previous_id={snap.pattern_id if snap else '-'}")
 
 
 # ---------- daemon ----------
@@ -527,20 +631,20 @@ def sync_static(target: str, scope: str) -> None:
     """显式将后端规则镜像到本地静态文件（占位块形式）。"""
     from pathlib import Path
 
+    from .entity_index import EntityIndex
     from .migrate import sync_static as do_sync
-    from .pattern_index import PatternIndex
     from .scope import detect_project_id
 
     project_id = detect_project_id()
     scopes = ["global", f"project:{project_id}"] if scope == "project" else ["global"]
-    pidx = PatternIndex()
-    metas = pidx.list_hard_recall(allowed_scopes=scopes, allowed_types=["rule", "feedback", "preference"])
+    idx = EntityIndex()
+    metas = idx.list_hard_recall(allowed_scopes=scopes, allowed_types=["rule", "feedback", "preference"])
     body_lines = ["<!-- This block is managed by LiMem (`limem sync-static`). -->"]
     for m in metas:
         raw = m.raw_metadata or {}
         text = (raw.get("original_text") or m.summary or "").strip().replace("\n", " ")
         try:
-            short = pidx.ensure_short_id(m.event_id)
+            short = idx.ensure_short_id(m.event_id)
         except Exception:
             short = m.event_id[:12]
         body_lines.append(f"- [{m.mem_type}] {text} (#{short})")
@@ -609,9 +713,14 @@ def migrate_add_post_tool_use() -> None:
 @click.option("--format", "fmt", type=click.Choice(["json", "markdown"]), default="json")
 @click.option("--output", type=click.Path(), default=None)
 @click.option("--include-tombstoned", is_flag=True)
-@click.option("--no-fill-triggers", is_flag=True, help="不调后端 list_entity_patterns 补 triggers")
-def export(fmt: str, output: str | None, include_tombstoned: bool, no_fill_triggers: bool) -> None:
-    """导出本地全部记忆到 JSON 或 Markdown。"""
+@click.option(
+    "--no-fill-patterns",
+    "no_fill_patterns",
+    is_flag=True,
+    help="不调后端 patterns_get 拉每个 entity 的 markdown 档案（更快但导出不全）",
+)
+def export(fmt: str, output: str | None, include_tombstoned: bool, no_fill_patterns: bool) -> None:
+    """导出本地全部记忆到 JSON 或 Markdown（v2：含 events + entities + 档案）。"""
     from pathlib import Path
 
     from .exporter import export as do_export
@@ -619,7 +728,7 @@ def export(fmt: str, output: str | None, include_tombstoned: bool, no_fill_trigg
         fmt=fmt,
         output=Path(output) if output else None,
         include_tombstoned=include_tombstoned,
-        fill_triggers=not no_fill_triggers,
+        fill_patterns=not no_fill_patterns,
     )
     console.print(f"[green]exported → {out}[/green]")
 
