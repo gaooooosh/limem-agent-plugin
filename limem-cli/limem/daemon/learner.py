@@ -10,6 +10,7 @@ import json
 import re
 import time
 import uuid
+from datetime import datetime
 from typing import Any
 
 from ..config import (
@@ -22,6 +23,8 @@ from .ngram import aggregate as ngram_aggregate
 _CN_CORRECT = re.compile(r"不对|应该|别|不要|改成|纠正|换成|不是")
 _EN_CORRECT = re.compile(r"don'?t|actually|stop|wrong|instead|prefer", re.IGNORECASE)
 _NP_EXTRACT = re.compile(r"([一-鿿\w]{2,8})(?=\s*(?:不对|要|改成|换成|换))")
+_NEGATIVE_HINT = re.compile(r"不对|别|不要|不是|don'?t|stop|wrong", re.IGNORECASE)
+_PREFER_HINT = re.compile(r"应该|改成|换成|prefer|instead|actually", re.IGNORECASE)
 
 
 def is_correction(text: str) -> bool:
@@ -31,6 +34,71 @@ def is_correction(text: str) -> bool:
 def extract_subject(text: str) -> str:
     m = _NP_EXTRACT.search(text or "")
     return m.group(1) if m else (text or "")[:20]
+
+
+def _clean_inline(text: str, *, limit: int = 180) -> str:
+    one = " ".join((text or "").split())
+    if len(one) <= limit:
+        return one
+    return one[: limit - 1].rstrip() + "…"
+
+
+def _format_ts(ts: int) -> str:
+    if not ts:
+        return "unknown time"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def _evidence_ref(event: dict[str, Any]) -> str:
+    ref = str(event.get("evidence_id") or "")
+    if ref:
+        return ref[:12]
+    ts = event.get("ts", 0)
+    sid = str(event.get("session_id") or "")
+    return f"{ts}:{sid[:8]}" if sid else str(ts)
+
+
+def format_evidence(event: dict[str, Any]) -> str:
+    """Render review-only evidence from existing event fields.
+
+    This intentionally does not require or mutate the events.ndjson schema.
+    """
+    tool = event.get("tool") or "agent"
+    prompt = _clean_inline(event.get("prompt", ""), limit=160)
+    return f"{_format_ts(int(event.get('ts', 0) or 0))} [{tool}] #{_evidence_ref(event)}: {prompt}"
+
+
+def build_candidate_text(cluster: list[dict[str, Any]], *, kind: str = "correction") -> str:
+    """Build a natural-language memory candidate, not structured pattern data."""
+    sample = cluster[-1] if cluster else {}
+    text = _clean_inline(sample.get("prompt", ""), limit=180)
+    if not text:
+        return "在本项目中，遵循用户最近反复纠正的工作方式。"
+
+    if _NEGATIVE_HINT.search(text) and _PREFER_HINT.search(text):
+        return f"在本项目中，按用户纠正执行：{text}"
+    if _NEGATIVE_HINT.search(text):
+        return f"在本项目中，避免重复这个被用户纠正的做法：{text}"
+    if _PREFER_HINT.search(text):
+        return f"在本项目中，优先遵循这个用户偏好：{text}"
+    if kind == "preference":
+        return f"在本项目中，优先采用这个反复出现的代码偏好：{text}"
+    return f"在本项目中，遵循这个用户反复纠正的规则：{text}"
+
+
+def build_rationale(cluster: list[dict[str, Any]], *, kind: str = "correction") -> str:
+    count = len(cluster)
+    if kind == "preference":
+        return f"该候选来自 {count} 次相似的已接受代码改动；请编辑成自然语言偏好后再保存。"
+    has_negative = any(_NEGATIVE_HINT.search(e.get("prompt", "")) for e in cluster)
+    has_prefer = any(_PREFER_HINT.search(e.get("prompt", "")) for e in cluster)
+    if has_negative and has_prefer:
+        return f"用户在 {count} 次相似提示中同时表达了否定做法和替代偏好。"
+    if has_negative:
+        return f"用户在 {count} 次相似提示中纠正了同类不应采用的做法。"
+    if has_prefer:
+        return f"用户在 {count} 次相似提示中表达了同类偏好或替代方式。"
+    return f"该候选来自 {count} 次相似提示，请审阅后再保存。"
 
 
 def load_suggestions() -> list[dict[str, Any]]:
@@ -90,16 +158,18 @@ def run_correction_analyzer(
         clusters = cluster_by_similarity(items, threshold=jaccard_threshold)
         for cluster in clusters:
             sample = cluster[0]
-            text = sample.get("prompt", "")
-            subj = extract_subject(text)
+            text = build_candidate_text(cluster)
+            subj = extract_subject(sample.get("prompt", ""))
             scope = sample.get("scope", f"project:{proj}") if proj else "global"
             suggestions.append(
                 {
                     "id": f"sug_{uuid.uuid4().hex[:10]}",
                     "kind": "rule",
                     "scope": scope,
-                    "candidate_text": text[:200],
-                    "evidence_event_ids": [e.get("ts") for e in cluster],
+                    "candidate_text": text[:240],
+                    "rationale": build_rationale(cluster),
+                    "evidence": [format_evidence(e) for e in cluster[:8]],
+                    "evidence_event_ids": [_evidence_ref(e) for e in cluster],
                     "confidence": min(0.95, 0.4 + 0.1 * len(cluster)),
                     "extracted_entities": (
                         [{"canonical": subj, "role": "subject", "patterns": [subj]}] if subj else []
@@ -134,13 +204,30 @@ def run_ngram_analyzer(
             min_accept_rate=min_accept_rate,
         )
         for ng in ngs:
-            text = f"prefer pattern: {ng['ngram']}"
+            text = f"在本项目中，优先采用这个反复出现的代码偏好：{ng['ngram']}"
             suggestions.append(
                 {
                     "id": f"sug_{uuid.uuid4().hex[:10]}",
                     "kind": "preference",
                     "scope": f"project:{proj}" if proj else "global",
                     "candidate_text": text,
+                    "rationale": (
+                        f"该候选来自 {ng['count']} 次相似的已接受代码改动，"
+                        f"接受率 {ng['accept_rate']:.0%}；请编辑成自然语言偏好后再保存。"
+                    ),
+                    "evidence": [
+                        format_evidence(
+                            {
+                                "ts": e.get("ts", 0),
+                                "tool": e.get("tool", "PostToolUse"),
+                                "prompt": e.get("diff_summary", ""),
+                                "session_id": e.get("session_id", ""),
+                                "evidence_id": e.get("evidence_id", ""),
+                            }
+                        )
+                        for e in events
+                        if ng["ngram"] in " ".join((e.get("diff_summary", "") or "").lower().split())
+                    ][:8],
                     "evidence_event_ids": [],
                     "confidence": min(0.95, ng["accept_rate"]),
                     "extracted_entities": [

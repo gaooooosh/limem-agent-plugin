@@ -9,6 +9,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -22,7 +26,6 @@ from rich.table import Table
 from .. import daemon_client
 from ..config import EVENTS_LOG_PATH, SUGGESTIONS_PATH
 from .keys import raw_mode, read_key
-
 
 console = Console()
 
@@ -65,6 +68,44 @@ def _render_suggestions_table(suggestions: list[dict[str, Any]]) -> Table:
     return t
 
 
+def _render_suggestion_detail(suggestions: list[dict[str, Any]], selected: int) -> Panel:
+    if not suggestions:
+        return Panel("no pending suggestions", title="detail", style="dim")
+    selected = max(0, min(selected, len(suggestions) - 1))
+    s = suggestions[selected]
+    evidence = s.get("evidence") or []
+    evidence_lines = "\n".join(f"- {line}" for line in evidence[:6]) or "(no evidence)"
+    if len(evidence) > 6:
+        evidence_lines += f"\n- ... and {len(evidence) - 6} more"
+    body = (
+        f"id: {s.get('id', '')}\n"
+        f"kind: {s.get('kind', '')}    scope: {s.get('scope', '')}    "
+        f"confidence: {s.get('confidence', 0):.2f}\n\n"
+        f"candidate:\n{s.get('candidate_text', '')}\n\n"
+        f"rationale:\n{s.get('rationale', '(none)')}\n\n"
+        f"evidence:\n{evidence_lines}"
+    )
+    return Panel(body, title=f"detail #{selected}", style="green")
+
+
+def _edit_text(initial: str) -> str | None:
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    with tempfile.NamedTemporaryFile("w+", suffix=".md", prefix="limem-suggestion-", delete=False) as f:
+        path = Path(f.name)
+        f.write(initial)
+        if initial and not initial.endswith("\n"):
+            f.write("\n")
+    try:
+        subprocess.run([*shlex.split(editor), str(path)], check=False)
+        edited = path.read_text(encoding="utf-8").strip()
+        return edited or None
+    finally:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def run_dashboard() -> int:
     if not daemon_client.ensure_or_spawn():
         console.print("[red]daemon unreachable; run `limem daemon start`[/red]")
@@ -72,40 +113,67 @@ def run_dashboard() -> int:
     layout = Layout()
     layout.split_column(
         Layout(name="status", size=8),
-        Layout(name="suggestions"),
+        Layout(name="suggestions", ratio=2),
+        Layout(name="detail", ratio=3),
         Layout(name="help", size=3),
     )
     layout["help"].update(
-        Panel("[a]ccept N · [d]iscard N · [q]uit · 输入数字选定行", style="dim")
+        Panel("[j/k] select · [a]ccept · [e]dit+accept · [d]iscard · [q]uit", style="dim")
     )
 
     selected = 0
     suggestions: list[dict[str, Any]] = daemon_client.list_suggestions() or []
 
-    with Live(layout, console=console, refresh_per_second=2, screen=True):
-        with raw_mode():
-            while True:
-                # 刷新数据
-                suggestions = daemon_client.list_suggestions() or []
-                layout["status"].update(_render_status_panel())
-                layout["suggestions"].update(_render_suggestions_table(suggestions))
+    with Live(layout, console=console, refresh_per_second=2, screen=True) as live:
+        while True:
+            # 刷新数据
+            suggestions = daemon_client.list_suggestions() or []
+            if suggestions:
+                selected = max(0, min(selected, len(suggestions) - 1))
+            else:
+                selected = 0
+            layout["status"].update(_render_status_panel())
+            layout["suggestions"].update(_render_suggestions_table(suggestions))
+            layout["detail"].update(_render_suggestion_detail(suggestions, selected))
 
+            with raw_mode():
                 key = read_key(timeout=0.5)
-                if key is None:
+            if key is None:
+                continue
+            if key in ("q", "Q", "\x03"):
+                return 0
+            if key.isdigit():
+                selected = int(key)
+                continue
+            if key in ("j", "J") and suggestions:
+                selected = min(len(suggestions) - 1, selected + 1)
+                continue
+            if key in ("k", "K") and suggestions:
+                selected = max(0, selected - 1)
+                continue
+            if key in ("a", "A") and 0 <= selected < len(suggestions):
+                sid = suggestions[selected].get("id")
+                if sid:
+                    daemon_client.accept_suggestion(sid)
                     continue
-                if key in ("q", "Q", "\x03"):
-                    return 0
-                if key.isdigit():
-                    selected = int(key)
+            if key in ("e", "E") and 0 <= selected < len(suggestions):
+                sid = suggestions[selected].get("id")
+                text = suggestions[selected].get("candidate_text", "")
+                live.stop()
+                try:
+                    edited = _edit_text(text)
+                finally:
+                    live.start(refresh=True)
+                if sid and edited and edited != text:
+                    daemon_client.accept_suggestion(sid, edited_text=edited)
+                elif sid and edited:
+                    daemon_client.accept_suggestion(sid)
+                continue
+            if key in ("d", "D") and 0 <= selected < len(suggestions):
+                sid = suggestions[selected].get("id")
+                if sid:
+                    daemon_client.discard_suggestion(sid)
                     continue
-                if key in ("a", "A") and 0 <= selected < len(suggestions):
-                    sid = suggestions[selected].get("id")
-                    if sid:
-                        daemon_client.accept_suggestion(sid)
-                if key in ("d", "D") and 0 <= selected < len(suggestions):
-                    sid = suggestions[selected].get("id")
-                    if sid:
-                        daemon_client.discard_suggestion(sid)
     return 0
 
 

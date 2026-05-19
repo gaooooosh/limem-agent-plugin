@@ -164,3 +164,90 @@ def test_learner_correction_detection() -> None:
     assert is_correction("Don't use npm dev")
     assert not is_correction("hello world")
     assert "npm" in extract_subject("npm 不对").lower() or extract_subject("npm 不对")
+
+
+def test_learner_correction_suggestion_has_review_context() -> None:
+    import time
+
+    from limem.daemon.learner import run_correction_analyzer
+
+    now = int(time.time())
+    events = [
+        {
+            "ts": now - 60,
+            "project_id": "github.com/example/repo",
+            "scope": "project:github.com/example/repo",
+            "prompt": "不要用 npm run dev，应该 docker rebuild",
+            "session_id": "session-alpha",
+            "tool": "codex",
+            "evidence_id": "abcdef123456",
+        },
+        {
+            "ts": now - 30,
+            "project_id": "github.com/example/repo",
+            "scope": "project:github.com/example/repo",
+            "prompt": "别用 npm run dev，应该 docker rebuild",
+            "session_id": "session-alpha",
+            "tool": "codex",
+            "evidence_id": "abcdef123457",
+        },
+    ]
+    out = run_correction_analyzer(
+        events,
+        window_seconds=24 * 3600,
+        jaccard_threshold=0.2,
+    )
+    assert len(out) == 1
+    suggestion = out[0]
+    assert suggestion["candidate_text"].startswith("在本项目中")
+    assert "rationale" in suggestion
+    assert suggestion["evidence"]
+    assert "abcdef123456" in suggestion["evidence"][0]
+    # Evidence remains review context, not part of the text that will be remembered.
+    assert "abcdef123456" not in suggestion["candidate_text"]
+
+
+def test_accept_suggestion_uses_candidate_text_only(monkeypatch, tmp_path) -> None:
+    import limem.daemon.learner as learner
+    import limem.daemon.server as server
+
+    suggestions_path = tmp_path / "suggestions.json"
+    monkeypatch.setattr(learner, "SUGGESTIONS_PATH", suggestions_path)
+    monkeypatch.setattr(server, "load_suggestions", learner.load_suggestions)
+    monkeypatch.setattr(server, "save_suggestions", learner.save_suggestions)
+    learner.save_suggestions(
+        [
+            {
+                "id": "sug_1",
+                "kind": "rule",
+                "scope": "project:demo",
+                "candidate_text": "在本项目中，避免运行 npm run dev。",
+                "rationale": "用户多次纠正。",
+                "evidence": ["2026-01-01 [codex] #abc: 不要 npm run dev"],
+                "status": "pending",
+            }
+        ]
+    )
+
+    captured = {}
+
+    def fake_remember_impl(**kwargs):
+        captured.update(kwargs)
+        return {"event_id": "evt_1"}
+
+    monkeypatch.setattr(server, "remember_impl", fake_remember_impl)
+
+    import asyncio
+    from types import SimpleNamespace
+
+    daemon = SimpleNamespace(
+        creds=None,
+        runtime=None,
+        pidx=None,
+        state=SimpleNamespace(suggestion_count=1, active_memories=0),
+    )
+    result = asyncio.run(server.Daemon._h_accept_suggestion(daemon, {"id": "sug_1"}))
+    assert result == {"event_id": "evt_1"}
+    assert captured["text"] == "在本项目中，避免运行 npm run dev。"
+    assert "用户多次纠正" not in captured["text"]
+    assert "#abc" not in captured["text"]

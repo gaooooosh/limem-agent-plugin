@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import resource
@@ -13,9 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..client import LimemClient, LimemError
+from ..client import LimemError
 from ..config import (
-    EVENTS_LOG_PATH,
     LIMEMD_FINGERPRINT_PATH,
     LIMEMD_LOG_PATH,
     LIMEMD_PID_PATH,
@@ -44,7 +44,6 @@ from .learner import (
 from .lock import FileLock, write_pid
 from .state import DaemonState
 from .writer import fix_impl, forget_impl, remember_impl
-
 
 VERSION = "0.1.0"
 
@@ -88,7 +87,6 @@ class Daemon:
     # ---------- RPC ----------
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        peer = writer.get_extra_info("peername") or "anon"
         try:
             while not reader.at_eof():
                 line = await reader.readline()
@@ -326,6 +324,8 @@ class Daemon:
     def _handle_event_row(self, row: dict[str, Any]) -> None:
         kind = row.get("kind")
         payload = row.get("payload") or {}
+        evidence_seed = json.dumps(row, ensure_ascii=False, sort_keys=True)
+        evidence_id = hashlib.sha1(evidence_seed.encode("utf-8")).hexdigest()[:12]
         if kind == "user_prompt_submit":
             prompt = payload.get("prompt", "")
             # F2 correction 采集
@@ -338,6 +338,8 @@ class Daemon:
                         "scope": row.get("scope", ""),
                         "prompt": prompt,
                         "session_id": row.get("session_id", ""),
+                        "tool": row.get("tool", ""),
+                        "evidence_id": evidence_id,
                     }
                 )
         elif kind == "post_tool_use":
@@ -350,6 +352,8 @@ class Daemon:
                         "accepted": payload.get("accepted", False),
                         "tool": payload.get("tool", ""),
                         "file_path": payload.get("file_path", ""),
+                        "session_id": row.get("session_id", ""),
+                        "evidence_id": evidence_id,
                     }
                 )
 
