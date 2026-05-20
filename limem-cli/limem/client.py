@@ -6,6 +6,8 @@
 - 多租户：所有数据操作走 /db/{db_id}/...，鉴权头 X-API-Key（缺失 401）
 - Ingest body：{data: any, timestamp: int|null}（顶层无 metadata，元信息塞 data 内）
 - Query body：{query, top_k}（**无 filters**，客户端必须二次过滤）
+- Task recall body：{task, limit, include_debug}；输入是 agent 当前真实任务，
+  返回可直接注入 prompt 的 prompt_text（Rule / Context / Event 等轻量 Markdown）
 - summary 由 LLM 生成，不含原始 tag token；客户端需本地镜像 event_metadata
 
 Entity / Pattern（v3 Principal-Centric Model，2026-05-19）
@@ -53,6 +55,25 @@ class QueryResult:
     timestamp: int
     score: float
     raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TaskRecallResult:
+    prompt_text: str
+    items: list[dict[str, Any]] = field(default_factory=list)
+    stats: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_response(cls, r: dict[str, Any] | None) -> TaskRecallResult:
+        data = r or {}
+        return cls(
+            prompt_text=str(data.get("prompt_text") or ""),
+            items=list(data.get("items") or []),
+            stats=dict(data.get("stats") or {}),
+        )
+
+    def has_content(self) -> bool:
+        return bool(self.prompt_text.strip())
 
 
 @dataclass
@@ -282,6 +303,35 @@ class LimemClient:
                 )
             )
         return out
+
+    def recall_for_task(
+        self,
+        task: str,
+        *,
+        limit: int = 5,
+        include_debug: bool = False,
+        db_id: str | None = None,
+        timeout: float | None = None,
+    ) -> TaskRecallResult:
+        """Agent task recall.
+
+        Unlike ``query()``, ``task`` is the user's real current task, not a
+        memory-search question. The service returns lightweight Markdown that
+        can be injected directly into the LLM prompt.
+        """
+        db = self._require_db(db_id)
+        body = {
+            "task": task or "",
+            "limit": max(1, min(int(limit), 20)),
+            "include_debug": bool(include_debug),
+        }
+        r = self._request(
+            "POST",
+            f"/db/{db}/recall",
+            json_body=body,
+            timeout=timeout,
+        )
+        return TaskRecallResult.from_response(r)
 
     def evolve(self, db_id: str | None = None) -> dict[str, Any]:
         return self._request("POST", f"/db/{self._require_db(db_id)}/evolve")

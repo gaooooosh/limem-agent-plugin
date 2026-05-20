@@ -16,6 +16,9 @@ v2 重写（决策 4）：三类记忆独立预算、独立分节渲染。
       提示...
     </limem_memory>
 
+后端 ``/recall`` 返回已经可直接注入 prompt 的轻量 Markdown。客户端只负责套
+``<limem_memory>`` 信封，避免把 agent task recall 再误当 BM25 搜索结果重排。
+
 每段独立预算，互不挤压：
 - hard：``runtime.inject_budget_hard``
 - pattern：``runtime.inject_budget_pattern``（决策 4 新增）
@@ -229,6 +232,19 @@ def render_inject(
         via_keywords=via_keywords,
     )
     return text
+
+
+def render_backend_recall(prompt_text: str, *, source: str = "task") -> str:
+    body = str(prompt_text or "").strip()
+    if not body:
+        return ""
+    return "\n".join(
+        [
+            f'<limem_memory source="{source}">',
+            body,
+            "</limem_memory>",
+        ]
+    )
 
 
 # ---------- helpers ----------

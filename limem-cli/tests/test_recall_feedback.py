@@ -17,6 +17,7 @@ from typing import Any
 from limem.injector import (
     Budgets,
     InjectItem,
+    render_backend_recall,
     render_inject,
     render_inject_with_diagnostics,
 )
@@ -100,6 +101,20 @@ def test_render_inject_empty_items_returns_empty_string_and_list() -> None:
     text, rendered = render_inject_with_diagnostics([])
     assert text == ""
     assert rendered == []
+
+
+def test_render_backend_recall_wraps_prompt_text() -> None:
+    text = render_backend_recall("## Relevant Memory\n- [Rule] 保持简短")
+    assert text == (
+        '<limem_memory source="task">\n'
+        "## Relevant Memory\n"
+        "- [Rule] 保持简短\n"
+        "</limem_memory>"
+    )
+
+
+def test_render_backend_recall_empty_returns_empty_string() -> None:
+    assert render_backend_recall("  ") == ""
 
 
 # ---------- statusline ----------

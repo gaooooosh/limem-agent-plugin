@@ -2,7 +2,7 @@
 
 v3 重写要点（principal-centric）：
 - UserPromptSubmit 拆为 **3 路完全并发**：hard / pattern（active principals 并发
-  ``patterns_recall``）/ soft（BM25），独立超时、独立预算。
+  ``patterns_recall``）/ task（后端 ``/recall``），独立超时、独立预算。
 - SessionStart 跑 hard + pattern（对 active principals 用 "session start <project>
   <tool>" 查询拉档案切片），不跑 soft。
 - 每次 hook 触发都会 lazy ``ensure_default_principals``（首次注册 user / agent /
@@ -45,14 +45,13 @@ from .injector import (
     PatternRecallSlice,
     hard_recall_to_items,
     pattern_recall_to_items,
+    render_backend_recall,
     render_inject,
     render_inject_with_diagnostics,
-    soft_recall_to_items,
 )
 from .principals import ensure_default_principals
 from .redact import contains_secret
 from .scope import detect_project_id, project_scope
-from .tag_text import build_recall_query
 
 # ---------- 日志 ----------
 
@@ -344,11 +343,9 @@ def _hook_user_prompt_submit(
     active_principals = _active_principals(
         idx, creds, project_id, tool, lazy_ensure=True
     )
-    principal_id_set = {p.entity_id for p in active_principals}
-
     hard_metas = []
     pattern_slices: list[PatternRecallSlice] = []
-    soft_results: list = []
+    task_recall_text = ""
 
     def _do_hard() -> None:
         nonlocal hard_metas
@@ -366,44 +363,41 @@ def _hook_user_prompt_submit(
             active_principals, prompt, creds, runtime
         )
 
-    def _do_soft() -> None:
-        nonlocal soft_results
+    def _do_task_recall() -> None:
+        nonlocal task_recall_text
         if not creds.api_key or not creds.db_id:
             return
         client = LimemClient(creds=creds, timeout=runtime.hook_timeout_ms / 1000.0)
         try:
-            q = build_recall_query(prompt)
-            soft_results = client.query(q, top_k=runtime.bm25_query_top_k)
+            task_recall = client.recall_for_task(
+                prompt,
+                limit=runtime.bm25_query_top_k,
+                include_debug=False,
+                timeout=runtime.hook_timeout_ms / 1000.0,
+            )
+            task_recall_text = task_recall.prompt_text
             daemon_client.set_connectivity(status=200, ok=True)
         except LimemError as e:
             daemon_client.set_connectivity(status=e.status, reason=str(e.message)[:60])
-            _log("soft_recall_error", tool, status=e.status, msg=e.message)
+            _log("task_recall_error", tool, status=e.status, msg=e.message)
         except Exception as e:  # noqa: BLE001
             daemon_client.set_connectivity(status=0, reason="network")
-            _log("soft_recall_exc", tool, msg=str(e))
+            _log("task_recall_exc", tool, msg=str(e))
 
     hook_t = runtime.hook_timeout_ms / 1000.0
     with ThreadPoolExecutor(max_workers=3) as pool:
         f_hard = pool.submit(_do_hard)
         f_pattern = pool.submit(_do_pattern)
-        f_soft = pool.submit(_do_soft)
-        for fut, label in ((f_hard, "hard"), (f_pattern, "pattern"), (f_soft, "soft")):
+        f_task = pool.submit(_do_task_recall)
+        for fut, label in ((f_hard, "hard"), (f_pattern, "pattern"), (f_task, "task_recall")):
             try:
                 fut.result(timeout=hook_t)
             except FutTimeout:
                 _log(f"{label}_timeout", tool)
 
-    soft_filtered = idx.filter_query_results(
-        soft_results,
-        allowed_scopes=set(scopes),
-        excluded_types={"rule", "feedback", "preference"},
-        allowed_principals=principal_id_set or None,
-    )
-
     items = (
         hard_recall_to_items(hard_metas, idx=idx)
         + pattern_recall_to_items(pattern_slices)
-        + soft_recall_to_items(soft_filtered, idx=idx)
     )
 
     muted = session_mute.get_muted(session_id) if session_id else set()
@@ -425,7 +419,10 @@ def _hook_user_prompt_submit(
         via_patterns=via_patterns,
         via_keywords=via_keywords,
     )
-    if items:
+    backend_text = render_backend_recall(task_recall_text)
+    if backend_text:
+        text = "\n\n".join(part for part in (text, backend_text) if part)
+    if items or backend_text:
         daemon_client.bump_hit(session_id)
     # 注入完成后 fire-and-forget 上报本轮实际渲染的 items（含 short_id），
     # 供 statusline / dash 显示「上轮 / 最近召回」反馈。失败永不阻塞。
@@ -449,8 +446,7 @@ def _hook_user_prompt_submit(
         hard_hits=len(hard_metas),
         principals=len(active_principals),
         pattern_slices=len(pattern_slices),
-        soft_hits=len(soft_results),
-        soft_filtered=len(soft_filtered),
+        task_recall_chars=len(task_recall_text),
         injected_chars=len(text),
         rendered=len(rendered_items),
     )

@@ -25,3 +25,31 @@ Use `head -n -1 install.sh` or a dedicated test harness when sourcing shell scri
 - Related Files: install.sh
 
 ---
+## [ERR-20260520-001] pytest_entrypoint_missing
+
+**Logged**: 2026-05-20T13:42:11+08:00
+**Priority**: low
+**Status**: pending
+**Area**: tests
+
+### Summary
+The repo root shell may not have a global `pytest`; use the project virtualenv test runner.
+
+### Error
+```text
+zsh:1: command not found: pytest
+/usr/bin/python3: No module named pytest
+```
+
+### Context
+- Attempted `pytest limem-cli/tests/...` from `/home/gaooooosh/limem-agent-plugin`.
+- System Python lacks pytest, while `.venv/bin/pytest` exists and runs the suite.
+
+### Suggested Fix
+Use `.venv/bin/pytest ...` for this repository unless the environment is refreshed.
+
+### Metadata
+- Reproducible: yes
+- Related Files: limem-cli/pyproject.toml
+
+---

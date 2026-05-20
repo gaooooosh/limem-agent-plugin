@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from limem.entity_index import EntityIndex
@@ -238,3 +240,53 @@ def test_filter_query_results_downweights_principal_mismatch(tmp_path) -> None:
     # 不匹配项 score 减半
     assert by_eid["evt_match"].score == pytest.approx(1.0)
     assert by_eid["evt_other"].score == pytest.approx(0.5)
+
+
+def test_user_prompt_submit_uses_task_recall_not_query(monkeypatch, tmp_path, capsys) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials, RuntimeConfig
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "proj/demo")
+    monkeypatch.setattr(hmod.daemon_client, "safe_call", lambda *_, **__: None)
+    monkeypatch.setattr(hmod.daemon_client, "get_connectivity", lambda: None)
+    monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda *_, **__: None)
+    monkeypatch.setattr(hmod.daemon_client, "bump_hit", lambda *_, **__: None)
+    monkeypatch.setattr(hmod, "_report_recall_safe", lambda **__: None)
+    monkeypatch.setattr(hmod, "_emit_event_safe", lambda *_, **__: None)
+    monkeypatch.setattr(hmod, "ensure_default_principals", lambda *_, **__: [])
+    monkeypatch.setattr(hmod, "_read_prev_assistant_head", lambda *_, **__: "")
+
+    calls: list[tuple[str, str]] = []
+
+    class _FakeTaskRecall:
+        prompt_text = "## Relevant Memory\n- [Context] 用新接口按真实任务召回"
+
+    class _FakeClient:
+        def __init__(self, *_, **__):
+            pass
+
+        def recall_for_task(self, task, **kwargs):
+            calls.append(("recall_for_task", task))
+            return _FakeTaskRecall()
+
+        def query(self, query, **kwargs):  # pragma: no cover - should not be called
+            calls.append(("query", query))
+            raise AssertionError("/query should not be used for automatic task recall")
+
+    monkeypatch.setattr(hmod, "LimemClient", _FakeClient)
+
+    runtime = RuntimeConfig(hook_timeout_ms=200, patterns_recall_timeout_ms=20)
+    creds = Credentials(api_key="k", db_id="db_1", user_id="u_42")
+    hmod._hook_user_prompt_submit(
+        "codex",
+        {"prompt": "请修复当前接口使用", "session_id": "sess-1"},
+        creds,
+        runtime,
+    )
+
+    assert calls == [("recall_for_task", "请修复当前接口使用")]
+    out = json.loads(capsys.readouterr().out)
+    context = out["hookSpecificOutput"]["additionalContext"]
+    assert '<limem_memory source="task">' in context
+    assert "[Context] 用新接口按真实任务召回" in context
