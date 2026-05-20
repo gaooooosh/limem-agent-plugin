@@ -624,7 +624,7 @@ def _hook_session_start(
 
 
 def _format_stop_recall_systemmessage(record: dict[str, Any]) -> str:
-    """渲染 `📚 LiMem · 本次使用 N 条记忆：#a3f #9b2 (+1)` 单行文案。
+    """渲染本轮用户可见的 LiMem 引用提示。
 
     输入是 daemon ``consume_pending_recall`` 返回的 dict（即一条 RecallEmittedRecord
     的序列化形态）。空 items 返回空串，由调用方决定是否发 systemMessage。
@@ -632,20 +632,36 @@ def _format_stop_recall_systemmessage(record: dict[str, Any]) -> str:
     items = record.get("items") or []
     if not items:
         return ""
+
+    def _src_label(src: str) -> str:
+        return {
+            "hard": "强规则",
+            "bm25": "语义记忆",
+            "soft": "语义记忆",
+            "pattern": "档案",
+        }.get(src or "", src or "记忆")
+
+    def _item_label(it: dict[str, Any]) -> str:
+        src = _src_label(str(it.get("src") or ""))
+        short_id = str(it.get("short_id") or "").strip()
+        summary = str(it.get("summary_head") or "").strip()
+        if not summary and it.get("src") == "pattern":
+            canonical = str(it.get("canonical") or "").strip()
+            heading = str(it.get("heading") or "").strip()
+            summary = " · ".join(part for part in (canonical, heading) if part)
+        if not summary:
+            summary = "已匹配记忆"
+        if len(summary) > 32:
+            summary = summary[:31] + "..."
+        ident = f"#{short_id} " if short_id else ""
+        return f"{src}:{ident}{summary}"
+
     n = len(items)
-    short_ids = [it.get("short_id") for it in items if it.get("short_id")]
-    head = short_ids[:2]
-    if head:
-        extra = len(short_ids) - len(head)
-        sid_part = " ".join(f"#{s}" for s in head)
-        if extra > 0:
-            return f"📚 LiMem · 本次使用 {n} 条记忆：{sid_part} (+{extra})"
-        if n > len(head):
-            # 有 short_id 但 n > head；剩余可能是 pattern 无 short_id 条目
-            return f"📚 LiMem · 本次使用 {n} 条记忆：{sid_part} (+{n - len(head)})"
-        return f"📚 LiMem · 本次使用 {n} 条记忆：{sid_part}"
-    # 全部 pattern（无 short_id）
-    return f"📚 LiMem · 本次使用 {n} 条记忆（pattern 切片）"
+    head_items = items[:2]
+    detail = "；".join(_item_label(it) for it in head_items)
+    extra = n - len(head_items)
+    suffix = f"；另 {extra} 条" if extra > 0 else ""
+    return f"📚 LiMem · 本次引用 {n} 条记忆：{detail}{suffix}"
 
 
 def _emit_stop_systemmessage(text: str) -> None:
@@ -787,7 +803,7 @@ def _hook_stop_codex(
 
     # 每轮 Codex Stop 也尝试给出「本次使用了哪些记忆」提示，与 Claude Code 端体验一致：
     # - stdout 输出 systemMessage JSON（与 Claude Code 协议同形态；Codex 若不识别则被忽略，无副作用）
-    # - stderr 输出一行 ASCII fallback（多数 CLI 会把 stderr 显示给用户，作为 stdout 不被识别时的兜底）
+    # - stderr 输出一行 UTF-8 fallback（多数 CLI 会把 stderr 显示给用户，作为 stdout 不被识别时的兜底）
     try:
         text = _stop_recall_message(sid if sid != "unknown" else "")
     except Exception:
@@ -795,9 +811,7 @@ def _hook_stop_codex(
     _emit_stop_systemmessage(text)
     if text:
         try:
-            ascii_fallback = text.encode("ascii", errors="ignore").decode("ascii").strip()
-            if ascii_fallback:
-                sys.stderr.write(ascii_fallback + "\n")
+            sys.stderr.write(text.strip() + "\n")
         except Exception:
             pass
 

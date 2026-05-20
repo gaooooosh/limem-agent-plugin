@@ -744,16 +744,18 @@ def test_format_stop_recall_systemmessage_with_short_ids() -> None:
 
     record = {
         "items": [
-            {"short_id": "aaa111aaa111", "src": "hard"},
-            {"short_id": "bbb222bbb222", "src": "bm25"},
-            {"short_id": "ccc333ccc333", "src": "hard"},
+            {"short_id": "aaa111aaa111", "src": "hard", "summary_head": "不要运行 npm dev"},
+            {"short_id": "bbb222bbb222", "src": "bm25", "summary_head": "Docker rebuild 流程"},
+            {"short_id": "ccc333ccc333", "src": "hard", "summary_head": "第三条"},
         ]
     }
     out = hmod._format_stop_recall_systemmessage(record)
-    assert "📚 LiMem · 本次使用 3 条记忆" in out
+    assert "📚 LiMem · 本次引用 3 条记忆" in out
+    assert "强规则:#aaa111aaa111 不要运行 npm dev" in out
+    assert "语义记忆:#bbb222bbb222 Docker rebuild 流程" in out
     assert "#aaa111aaa111" in out
     assert "#bbb222bbb222" in out
-    assert "(+1)" in out  # head 2, total 3 → 溢出 1
+    assert "另 1 条" in out  # head 2, total 3 → 溢出 1
 
 
 def test_format_stop_recall_systemmessage_pattern_only() -> None:
@@ -762,13 +764,14 @@ def test_format_stop_recall_systemmessage_pattern_only() -> None:
 
     record = {
         "items": [
-            {"short_id": "", "src": "pattern"},
-            {"short_id": "", "src": "pattern"},
+            {"short_id": "", "src": "pattern", "canonical": "project:demo", "heading": "部署"},
+            {"short_id": "", "src": "pattern", "canonical": "user:gaooooosh", "heading": "偏好"},
         ]
     }
     out = hmod._format_stop_recall_systemmessage(record)
-    assert "本次使用 2 条记忆" in out
-    assert "pattern" in out
+    assert "本次引用 2 条记忆" in out
+    assert "档案:project:demo · 部署" in out
+    assert "档案:user:gaooooosh · 偏好" in out
 
 
 def test_format_stop_recall_systemmessage_empty() -> None:
@@ -867,7 +870,48 @@ def test_hook_stop_claude_full_path(monkeypatch, capsys) -> None:
     )
     out = capsys.readouterr().out
     data = json.loads(out)
-    assert "本次使用 2 条记忆" in data["systemMessage"]
+    assert "本次引用 2 条记忆" in data["systemMessage"]
+
+
+def test_hook_stop_codex_stderr_keeps_readable_chinese(monkeypatch, capsys, tmp_path) -> None:
+    """Codex 不识别 stdout JSON 时，stderr 兜底也应保留用户可读的中文摘要。"""
+    from limem import hooks as hmod
+
+    monkeypatch.setattr(hmod, "SESSIONS_DIR", tmp_path)
+    monkeypatch.setattr(hmod, "_flush_codex_session", lambda *_, **__: None)
+    monkeypatch.setattr(
+        hmod.daemon_client,
+        "consume_pending_recall",
+        lambda *_, **__: {
+            "items": [
+                {
+                    "short_id": "abcd00001111",
+                    "src": "hard",
+                    "summary_head": "部署后运行 docker:rebuild",
+                }
+            ]
+        },
+    )
+
+    class _NotPaused:
+        def is_active(self):
+            return False
+
+    monkeypatch.setattr(hmod, "read_pause_from_disk", lambda: _NotPaused())
+
+    from limem.config import Credentials, RuntimeConfig
+
+    hmod._hook_stop_codex(
+        "codex",
+        {"session_id": "sess-z"},
+        Credentials(api_key="k", db_id="db", user_id="u"),
+        RuntimeConfig(),
+    )
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert "本次引用 1 条记忆" in data["systemMessage"]
+    assert "部署后运行 docker:rebuild" in captured.err
+    assert "强规则:#abcd00001111" in captured.err
     assert "#abcd00001111" in data["systemMessage"]
 
 

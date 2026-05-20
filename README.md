@@ -319,6 +319,14 @@ LiMem Agent Plugin 使用三层召回：
 </limem_memory>
 ```
 
+回答结束时，Stop hook 会给用户显示本轮引用摘要，例如：
+
+```text
+📚 LiMem · 本次引用 2 条记忆：强规则:#aaa111aaa111 不要运行 npm dev；档案:project:demo · 部署
+```
+
+短 ID 可以继续用于 `/limem.no #<id>`、`/limem.fix #<id>` 或 `limem_recent_recalls` 审计。
+
 ---
 
 ## 被动学习
