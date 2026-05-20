@@ -13,7 +13,7 @@ LiMem long-term memory bridge for Claude Code and Codex CLI.
 ## 快速使用
 
 ```bash
-pipx install ./limem-cli
+uv tool install --force ./limem-cli
 limem init                 # 全局安装到 Claude Code + Codex
 cd your-project && limem init --project
 ```

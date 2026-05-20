@@ -33,7 +33,13 @@ DRY_RUN=0
 OS=""
 ARCH=""
 PYTHON=""
-PIPX=""
+UV=""
+INSTALL_BACKEND=""
+BACKEND_PLAN=""
+VENV_DIR="${LIMEM_INSTALL_VENV:-$HOME/.local/share/limem-agent-plugin/venv}"
+USER_BIN_DIR="${LIMEM_INSTALL_BIN:-$HOME/.local/bin}"
+LIMEM_CMD=""
+LIMEM_CMD_DIR=""
 WORKDIR=""
 SRC_DIR=""
 INSTALLED_VERSION=""
@@ -55,6 +61,14 @@ ok()   { printf "%s[OK]%s %s\n" "$C_GREEN"  "$C_RESET" "$*" >&2; }
 warn() { printf "%s[!]%s %s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die()  { printf "%s[ERR]%s %s\n" "$C_RED"   "$C_RESET" "$*" >&2; exit "${2:-1}"; }
 dbg()  { (( VERBOSE )) && printf "%s[debug]%s %s\n" "$C_DIM" "$C_RESET" "$*" >&2 || true; }
+
+print_kv() {
+  printf "  %-14s %s\n" "$1:" "$2" >&2
+}
+
+action_label() {
+  [[ "$ACTION" == "update" ]] && echo "更新" || echo "安装"
+}
 
 # ============================================================
 # parse_args
@@ -139,7 +153,9 @@ parse_args() {
 
 print_banner() {
   cat >&2 <<EOF
-${C_BLUE}LiMem Agent Plugin - 安装 / 更新${C_RESET}
+${C_BLUE}┌──────────────────────────────────────────────┐${C_RESET}
+${C_BLUE}│        LiMem Agent Plugin Installer          │${C_RESET}
+${C_BLUE}└──────────────────────────────────────────────┘${C_RESET}
 ${C_DIM}${REPO_URL}${C_RESET}
 
 EOF
@@ -232,59 +248,50 @@ ensure_python() {
 }
 
 # ============================================================
-# ensure_pipx
+# install backend
 # ============================================================
 
-detect_existing_pipx() {
-  if command -v pipx >/dev/null 2>&1; then
-    PIPX="$(command -v pipx)"
-    return
-  fi
-
-  local user_base
-  user_base="$("$PYTHON" -m site --user-base 2>/dev/null || echo "")"
-  if [[ -n "$user_base" && -x "$user_base/bin/pipx" ]]; then
-    export PATH="$user_base/bin:$PATH"
-    PIPX="$user_base/bin/pipx"
+detect_uv() {
+  if command -v uv >/dev/null 2>&1; then
+    UV="$(command -v uv)"
   fi
 }
 
-ensure_pipx() {
-  step "检查 pipx"
-  detect_existing_pipx
-  if [[ -n "$PIPX" ]]; then
-    ok "pipx：$PIPX"
+ensure_venv_support() {
+  if "$PYTHON" -m venv --help >/dev/null 2>&1; then
     return
   fi
 
-  warn "未找到 pipx，开始安装"
-  local pip_out user_base
-  if ! pip_out="$("$PYTHON" -m pip install --user pipx 2>&1)"; then
-    if printf '%s' "$pip_out" | grep -q 'externally-managed-environment'; then
-      die "当前发行版禁止 pip --user 直接装包（PEP 668）。请改用系统包：
-  Debian/Ubuntu : sudo apt install -y pipx
-  Fedora        : sudo dnf install -y pipx
-然后重新执行本安装命令。" 12
-    fi
-    printf '%s\n' "$pip_out" >&2
-    die "pipx 安装失败" 12
+  die "当前 Python 缺少 venv 支持。请按发行版安装后重试：
+  Debian/Ubuntu : sudo apt update && sudo apt install -y python3-venv python3-pip
+  Fedora        : sudo dnf install -y python3-pip
+  Arch          : sudo pacman -S python python-pip" 12
+}
+
+ensure_user_bin_on_path() {
+  mkdir -p "$USER_BIN_DIR"
+  case ":$PATH:" in
+    *":$USER_BIN_DIR:"*) ;;
+    *) export PATH="$USER_BIN_DIR:$PATH" ;;
+  esac
+}
+
+select_install_backend() {
+  step "选择 Python 安装方式"
+  detect_uv
+  if [[ -n "$UV" ]]; then
+    INSTALL_BACKEND="uv"
+    BACKEND_PLAN="uv tool ($UV)"
+    ok "安装方式：uv tool"
+    return
   fi
 
-  "$PYTHON" -m pipx ensurepath >/dev/null 2>&1 || true
-
-  user_base="$("$PYTHON" -m site --user-base)"
-  export PATH="$user_base/bin:$PATH"
-
-  if [[ ! -x "$user_base/bin/pipx" ]]; then
-    die "pipx 已 pip install 但 $user_base/bin/pipx 不可执行" 12
-  fi
-  PIPX="$user_base/bin/pipx"
-
-  if ! command -v pipx >/dev/null 2>&1; then
-    warn "pipx 已装；本次会话已临时把 $user_base/bin 加进 PATH"
-    warn "完成后请 source 你的 shell rc（~/.bashrc / ~/.zshrc）或重开终端"
-  fi
-  ok "pipx：$PIPX"
+  ensure_venv_support
+  ensure_user_bin_on_path
+  INSTALL_BACKEND="venv"
+  BACKEND_PLAN="自管 venv + pip ($VENV_DIR -> $USER_BIN_DIR)"
+  warn "未找到 uv，改用 LiMem 自管 venv 安装"
+  ok "安装方式：自管 venv"
 }
 
 # ============================================================
@@ -356,27 +363,51 @@ read_installed_version() {
     INSTALLED_VERSION="$(limem --version 2>/dev/null | sed -E 's/.* ([0-9][^[:space:]]*)$/\1/' || true)"
   fi
 
-  if [[ -z "$INSTALLED_VERSION" && -z "${PIPX:-}" ]]; then
-    detect_existing_pipx
-  fi
-  if [[ -z "$INSTALLED_VERSION" && -n "${PIPX:-}" ]]; then
-    INSTALLED_VERSION="$("$PIPX" list 2>/dev/null | sed -nE 's/.*package limem-cli ([^, ]+).*/\1/p' | head -n 1 || true)"
-  fi
-
   [[ -n "$INSTALLED_VERSION" ]] || INSTALLED_VERSION="未安装"
+}
+
+detect_backend_plan() {
+  if [[ -n "${INSTALL_BACKEND:-}" ]]; then
+    return
+  fi
+  detect_uv
+  if [[ -n "$UV" ]]; then
+    BACKEND_PLAN="uv tool ($UV)"
+  else
+    BACKEND_PLAN="自管 venv + pip ($VENV_DIR -> $USER_BIN_DIR)"
+  fi
+}
+
+bootstrap_plan_text() {
+  if (( DO_BOOTSTRAP )); then
+    if [[ -n "$API_KEY" ]]; then
+      echo "是（使用已提供的 API key）"
+    else
+      echo "是（有 tty 时交互输入）"
+    fi
+  else
+    echo "否"
+  fi
 }
 
 show_version_plan() {
   read_installed_version
   read_target_version
+  detect_backend_plan
 
-  if [[ "$ACTION" == "update" ]]; then
-    step "版本计划"
-  else
-    step "安装版本"
-  fi
-  printf "    当前版本：%s\n" "$INSTALLED_VERSION" >&2
-  printf "    目标版本：%s (ref=%s)\n" "$TARGET_VERSION" "$REF" >&2
+  cat >&2 <<EOF
+
+${C_BLUE}┌─ 安装计划${C_RESET}
+EOF
+  print_kv "动作" "$(action_label)"
+  print_kv "源码" "${REPO_OWNER}/${REPO_NAME}@${REF}"
+  print_kv "当前版本" "$INSTALLED_VERSION"
+  print_kv "目标版本" "$TARGET_VERSION"
+  print_kv "安装方式" "$BACKEND_PLAN"
+  print_kv "Agent 目标" "$INSTALL_TARGETS"
+  print_kv "刷新配置" "$([[ "$DO_INIT" == "1" ]] && echo 是 || echo 否)"
+  print_kv "Bootstrap" "$(bootstrap_plan_text)"
+  printf "%s└────────────%s\n\n" "$C_BLUE" "$C_RESET" >&2
 }
 
 # ============================================================
@@ -390,35 +421,64 @@ install_pkg() {
     step "安装 limem CLI"
   fi
 
-  local already_installed=0
-  if "$PIPX" list 2>/dev/null | grep -q 'package limem-cli '; then
-    already_installed=1
-    warn "检测到已安装的 limem-cli，使用 --force 重建 venv（凭证不变）"
-  elif [[ "$ACTION" == "update" ]]; then
-    warn "未检测到已安装的 limem-cli，本次按全新安装处理"
-  fi
-
-  if (( already_installed )); then
-    "$PIPX" install --force "$SRC_DIR" || die "pipx install --force 失败" 14
-  else
-    if ! "$PIPX" install "$SRC_DIR"; then
-      warn "pipx install 失败，回退 pip --user（不推荐）"
-      "$PYTHON" -m pip install --user --force-reinstall "$SRC_DIR" \
-        || die "pip --user 安装也失败" 14
-    fi
-  fi
+  case "$INSTALL_BACKEND" in
+    uv)
+      if ! install_pkg_uv; then
+        warn "uv tool 安装失败，切换到 LiMem 自管 venv"
+        ensure_venv_support
+        INSTALL_BACKEND="venv"
+        BACKEND_PLAN="自管 venv + pip ($VENV_DIR -> $USER_BIN_DIR)"
+        install_pkg_venv
+      fi
+      ;;
+    venv) install_pkg_venv ;;
+    *) die "内部错误：未知安装方式 ${INSTALL_BACKEND:-空}" 14 ;;
+  esac
 
   # 二次确认 limem 可执行
   if ! command -v limem >/dev/null 2>&1; then
-    local user_base
-    user_base="$("$PYTHON" -m site --user-base)"
-    if [[ -x "$user_base/bin/limem" ]]; then
-      export PATH="$user_base/bin:$PATH"
+    if [[ -x "$USER_BIN_DIR/limem" ]]; then
+      export PATH="$USER_BIN_DIR:$PATH"
     else
-      die "limem 已安装但 PATH 中找不到（检查 $user_base/bin 是否在 PATH 中）" 14
+      die "limem 已安装但 PATH 中找不到（检查 $USER_BIN_DIR 是否在 PATH 中）" 14
     fi
   fi
-  ok "limem：$(command -v limem)"
+  LIMEM_CMD="$(command -v limem)"
+  LIMEM_CMD_DIR="$(dirname "$LIMEM_CMD")"
+  ok "limem：$LIMEM_CMD"
+}
+
+install_pkg_uv() {
+  local uv_bin_dir
+  uv_bin_dir="$("$UV" tool dir --bin 2>/dev/null || true)"
+  if [[ -n "$uv_bin_dir" ]]; then
+    export PATH="$uv_bin_dir:$PATH"
+  fi
+
+  "$UV" tool install --force --python "$PYTHON" "$SRC_DIR" || return 1
+}
+
+install_pkg_venv() {
+  ensure_user_bin_on_path
+  mkdir -p "$(dirname "$VENV_DIR")" "$USER_BIN_DIR"
+
+  if [[ -d "$VENV_DIR" ]]; then
+    warn "检测到已有自管 venv，重新安装 limem-cli（凭证不变）"
+  else
+    "$PYTHON" -m venv "$VENV_DIR" || die "创建 venv 失败：$VENV_DIR" 14
+  fi
+
+  "$VENV_DIR/bin/python" -m pip install --upgrade pip >/dev/null \
+    || die "venv 内升级 pip 失败" 14
+  "$VENV_DIR/bin/python" -m pip install --force-reinstall "$SRC_DIR" \
+    || die "venv 安装 limem-cli 失败" 14
+
+  local bin
+  for bin in limem limem-mcp limemd limem-statusline; do
+    [[ -x "$VENV_DIR/bin/$bin" ]] || die "安装后缺少可执行文件：$bin" 14
+    ln -sfn "$VENV_DIR/bin/$bin" "$USER_BIN_DIR/$bin"
+  done
+  ok "已链接命令到 $USER_BIN_DIR"
 }
 
 # ============================================================
@@ -508,7 +568,14 @@ print_next_steps() {
   [[ "$ACTION" == "update" ]] && done_word="更新"
   cat >&2 <<EOF
 
-${C_GREEN}[DONE] LiMem Agent Plugin ${done_word}完成${C_RESET}
+${C_GREEN}┌─ 完成${C_RESET}
+EOF
+  print_kv "结果" "LiMem Agent Plugin ${done_word}完成"
+  print_kv "版本" "${INSTALLED_VERSION} -> ${TARGET_VERSION}"
+  print_kv "安装方式" "$BACKEND_PLAN"
+  print_kv "命令路径" "${LIMEM_CMD:-$(command -v limem 2>/dev/null || echo 未找到)}"
+  printf "%s└────────%s\n" "$C_GREEN" "$C_RESET" >&2
+  cat >&2 <<EOF
 
 下一步：
   - 重启 Claude Code / Codex 会话，让 SessionStart hook 注入 LiMem skills
@@ -517,6 +584,7 @@ ${C_GREEN}[DONE] LiMem Agent Plugin ${done_word}完成${C_RESET}
   - 文档：${C_BLUE}${REPO_URL}${C_RESET}
 
 如果新终端找不到 limem 命令：
+  export PATH="${LIMEM_CMD_DIR:-$USER_BIN_DIR}:\$PATH"
   source ~/.bashrc      # bash
   source ~/.zshrc       # zsh
 或直接重开终端窗口。
@@ -541,7 +609,7 @@ main() {
     trap - EXIT
     return
   fi
-  ensure_pipx
+  select_install_backend
   install_pkg
   cleanup_workdir
   trap - EXIT

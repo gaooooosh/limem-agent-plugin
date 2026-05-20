@@ -137,7 +137,7 @@ curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/i
 
 1. 检测 macOS / Linux / WSL。
 2. 验证 Python 3.10+。
-3. 安装或复用 `pipx`。
+3. 优先使用 `uv tool install`；没有 `uv` 时改用插件自管 venv，并在 venv 内执行 `pip install`。
 4. 安装 `limem-cli`。
 5. 按目标 patch Claude Code 和/或 Codex 配置，接入 hooks、MCP server、statusline 和 skills。
 6. 进入 `limem bootstrap`，配置 LiMem API Key 与数据库。
@@ -215,7 +215,22 @@ curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/i
 ```bash
 git clone https://github.com/gaooooosh/limem-agent-plugin.git
 cd limem-agent-plugin
-pipx install ./limem-cli
+uv tool install --force ./limem-cli
+limem bootstrap --api-key <YOUR_API_KEY>
+limem init
+```
+
+没有 `uv` 时也可以用 venv 手动安装：
+
+```bash
+python3 -m venv ~/.local/share/limem-agent-plugin/venv
+~/.local/share/limem-agent-plugin/venv/bin/python -m pip install ./limem-cli
+mkdir -p ~/.local/bin
+ln -sfn ~/.local/share/limem-agent-plugin/venv/bin/limem ~/.local/bin/limem
+ln -sfn ~/.local/share/limem-agent-plugin/venv/bin/limem-mcp ~/.local/bin/limem-mcp
+ln -sfn ~/.local/share/limem-agent-plugin/venv/bin/limemd ~/.local/bin/limemd
+ln -sfn ~/.local/share/limem-agent-plugin/venv/bin/limem-statusline ~/.local/bin/limem-statusline
+export PATH="$HOME/.local/bin:$PATH"
 limem bootstrap --api-key <YOUR_API_KEY>
 limem init
 ```
