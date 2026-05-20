@@ -247,20 +247,27 @@ def _active_principals(
     tool: str,
     *,
     lazy_ensure: bool = True,
+    include_agent: bool = True,
 ) -> list[PrincipalRow]:
-    """读取 active principals；若空且允许，触发 ensure_default_principals 后再读一次。"""
-    try:
-        principals = idx.list_principals(active_only=True)
-    except Exception:
-        principals = []
-    if principals or not lazy_ensure:
-        return principals
-    try:
-        ensure_default_principals(
-            creds, project_id=project_id, tool=tool, idx=idx, client=None
-        )
-    except Exception:
-        pass
+    """读取 active principals；主 hook 每次幂等 ensure 默认主体。
+
+    不能只在 principals 为空时 ensure：旧安装可能已有 project/team 但缺 user 或
+    agent。include_agent 只应由主 Agent hook 传 True，daemon/MCP/sub-agent 路径不猜。
+    """
+    if lazy_ensure:
+        try:
+            ensure_default_principals(
+                creds,
+                project_id=project_id,
+                tool=tool,
+                idx=idx,
+                client=None,
+                include_user=True,
+                include_agent=include_agent,
+                include_project=True,
+            )
+        except Exception:
+            pass
     try:
         return idx.list_principals(active_only=True)
     except Exception:

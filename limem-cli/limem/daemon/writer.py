@@ -64,7 +64,7 @@ def build_natural_detail(
     return f"现在的情况是：{'，'.join(context_parts)}。这是一条 {type_desc} 类型的 LiMem 记忆。{body}"
 
 
-def _infer_principal_ids(
+def _infer_subject_principal_ids(
     *,
     scope: str,
     mem_type: str,
@@ -73,7 +73,7 @@ def _infer_principal_ids(
     session_id: str,
     idx: EntityIndex,
 ) -> list[str]:
-    """根据 scope / mem_type 推断本次 event 应挂的 principals（stable entity_id）。"""
+    """根据 scope / mem_type 推断本次 event 观察到的用户数据主体。"""
     from ..principals import PrincipalSpec, entity_id_for
 
     user_id = (creds.user_id if creds else "") or ""
@@ -172,8 +172,11 @@ def remember_impl(
 
     canonicals = [e["canonical"] for e in entities or [] if e.get("canonical")]
 
-    # principals 推断 + lazy ensure（agent tool 在 daemon 路径未知，跳过；hook 路径会确保）
-    principal_ids = _infer_principal_ids(
+    # principal 语义：记忆是主 Agent 对用户数据的观测。
+    # writer/daemon 路径不知道可靠的顶层 agent tool，因此只 ensure user/project，不凭空
+    # 注册 agent；hook 层负责注册主 observer agent。这里从 active agent 中择一作为
+    # observer metadata，subjects 则按 scope / mem_type 推断。
+    subject_principal_ids = _infer_subject_principal_ids(
         scope=scope,
         mem_type=mem_type,
         creds=creds,
@@ -181,14 +184,40 @@ def remember_impl(
         session_id=session_id,
         idx=idx,
     )
+    observer_principal_id = ""
+    try:
+        agents = idx.list_principals(active_only=True, principal_types=["agent"])
+        if len(agents) == 1:
+            observer_principal_id = agents[0].entity_id
+        elif source.startswith("codex"):
+            observer_principal_id = next(
+                (p.entity_id for p in agents if p.tool == "codex" or p.slug == "codex"), ""
+            )
+        elif source.startswith("claude-code"):
+            observer_principal_id = next(
+                (p.entity_id for p in agents if p.tool == "claude-code" or p.slug == "claude-code"), ""
+            )
+    except Exception:
+        observer_principal_id = ""
+
+    principal_ids: list[str] = []
+    seen_principals: set[str] = set()
+    for eid in [observer_principal_id, *subject_principal_ids]:
+        if eid and eid not in seen_principals:
+            seen_principals.add(eid)
+            principal_ids.append(eid)
+
     try:
         client = LimemClient(creds=creds)
         ensure_default_principals(
             creds,
             project_id=project_id,
-            tool="",  # writer 不知 tool；hook 已在 SessionStart 注册过 agent
+            tool="",  # writer 不知 tool；hook 已在 SessionStart 注册主 observer agent
             idx=idx,
             client=client,
+            include_user=True,
+            include_agent=False,
+            include_project=True,
         )
     except Exception:
         client = LimemClient(creds=creds)
@@ -238,6 +267,8 @@ def remember_impl(
             "raw_metadata": {
                 "canonicals": canonicals,
                 "original_text": text,
+                "observer_principal_id": observer_principal_id,
+                "subject_principal_ids": subject_principal_ids,
                 "principal_ids": principal_ids,
                 "mentions": [
                     {
@@ -263,6 +294,8 @@ def remember_impl(
         "scope": scope,
         "summary": ingest_res.summary or text[:200],
         "principal_ids": principal_ids,
+        "observer_principal_id": observer_principal_id,
+        "subject_principal_ids": subject_principal_ids,
         "canonicals": canonicals,
         # 旧字段保留兼容 RPC 调用方；v3 语义已无 entity 注册行为
         "entities_registered": [],

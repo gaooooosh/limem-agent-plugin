@@ -69,6 +69,16 @@ def test_remember_writes_event_but_no_entity_registration(monkeypatch, tmp_path)
     fake = _FakeClient()
     _patch(monkeypatch, fake)
     idx = EntityIndex(db_path=tmp_path / "patterns.sqlite")
+    idx.upsert_principal(
+        entity_id="principal_agent_codex",
+        principal_type="agent",
+        slug="codex",
+        canonical="agent:codex",
+        aliases=[],
+        description="",
+        scope="global",
+        tool="codex",
+    )
 
     out = remember_impl(
         text="禁用 npm run dev，用 docker compose up --build",
@@ -96,12 +106,16 @@ def test_remember_writes_event_but_no_entity_registration(monkeypatch, tmp_path)
     assert out["entities_registered"] == []  # 显式空
     # principal_ids 包含 project principal
     assert any(p.startswith("principal_project_") for p in out["principal_ids"])
+    assert out["observer_principal_id"] == "principal_agent_codex"
+    assert any(p.startswith("principal_project_") for p in out["subject_principal_ids"])
 
     # 本地 event_metadata.raw_metadata 完整
     meta = idx.lookup_event(out["event_id"])
     assert meta is not None
     assert meta.raw_metadata.get("canonicals") == ["npm run dev", "docker compose up --build"]
     assert meta.raw_metadata.get("principal_ids") == out["principal_ids"]
+    assert meta.raw_metadata.get("observer_principal_id") == "principal_agent_codex"
+    assert meta.raw_metadata.get("subject_principal_ids") == out["subject_principal_ids"]
     assert meta.raw_metadata.get("original_text", "").startswith("禁用 npm run dev")
 
 

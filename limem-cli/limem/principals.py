@@ -139,16 +139,21 @@ def default_principals(
     creds: Credentials | None,
     project_id: str,
     tool: str,
+    *,
+    include_user: bool = True,
+    include_agent: bool = True,
+    include_project: bool = True,
 ) -> list[PrincipalSpec]:
     """生成当前会话应该自动 ensure 的默认 principals。
 
     - 缺 ``user_id`` 时跳过 user（避免污染：sha8("") = 00000000）
     - ``project_id`` 缺则跳过 project
     - ``tool`` 缺则跳过 agent
+    - include_* 用于区分主 Agent hook 与 daemon/MCP 等非观测入口
     """
     out: list[PrincipalSpec] = []
     user_id = (creds.user_id if creds else "") or ""
-    if user_id:
+    if include_user and user_id:
         out.append(
             PrincipalSpec(
                 principal_type="user",
@@ -160,7 +165,7 @@ def default_principals(
             )
         )
 
-    if tool:
+    if include_agent and tool:
         out.append(
             PrincipalSpec(
                 principal_type="agent",
@@ -173,7 +178,7 @@ def default_principals(
             )
         )
 
-    if project_id:
+    if include_project and project_id:
         basename = _project_basename(project_id) or project_id
         # 只保留可唯一识别该项目的字符串；指代词（"本项目"/"当前项目"/"this project"）
         # 是跨项目歧义的，统一在 normalize_project_deictics 里做文本侧归一化。
@@ -344,6 +349,86 @@ def register_principal(
 _ENSURE_MARKER_DIR = Path("~/.cache/limem/principals_ensured").expanduser()
 
 
+def _user_id_from_me_payload(payload: object) -> str:
+    """Best-effort extract current user id from /me response variants."""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("user_id", "uid", "id", "sub"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    user = payload.get("user")
+    if isinstance(user, dict):
+        for key in ("user_id", "uid", "id", "sub"):
+            val = user.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return ""
+
+
+def ensure_current_user_principal(
+    creds: Credentials | None,
+    *,
+    idx: EntityIndex,
+    client: LimemClient | None = None,
+    force: bool = False,
+) -> str:
+    """确保当前 LiMem 账号用户 principal 存在。
+
+    这是 user principal 的专用入口：如果 credentials 缺 user_id，会尝试用当前
+    API key 调 /me 补齐并回写 credentials。失败静默返回空串，绝不创建
+    ``principal_user_00000000``。
+    """
+    if creds is None:
+        return ""
+
+    from .client import LimemClient as _LimemClient
+
+    user_id = (creds.user_id or "").strip()
+    if not user_id and creds.api_key:
+        if client is None:
+            client = _LimemClient(creds=creds, timeout=2.0)
+        try:
+            user_id = _user_id_from_me_payload(client.me())
+        except Exception:
+            user_id = ""
+        if user_id:
+            try:
+                creds.user_id = user_id
+                creds.save()
+            except Exception:
+                pass
+    if not user_id:
+        return ""
+
+    spec = PrincipalSpec(
+        principal_type="user",
+        slug=user_id,
+        description=f"当前 LiMem 账号用户：{user_id}",
+        aliases=["我", "用户", "the user", "myself", user_id],
+        scope="global",
+        canonical=f"user:{user_id}",
+    )
+    eid = entity_id_for(spec)
+    local_hit = None
+    try:
+        local_hit = idx.lookup_principal(eid)
+    except Exception:
+        local_hit = None
+    if not force and local_hit is not None and _ensured_marker(eid).exists():
+        return eid
+    try:
+        _ENSURE_MARKER_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    register_principal(spec, creds=creds, idx=idx, client=client, swallow=True)
+    try:
+        _ensured_marker(eid).touch(exist_ok=True)
+    except Exception:
+        pass
+    return eid
+
+
 def _ensured_marker(eid: str) -> Path:
     return _ENSURE_MARKER_DIR / eid
 
@@ -356,6 +441,9 @@ def ensure_default_principals(
     idx: EntityIndex,
     client: LimemClient | None = None,
     force: bool = False,
+    include_user: bool = True,
+    include_agent: bool = True,
+    include_project: bool = True,
 ) -> list[str]:
     """幂等地确保默认 principals 在后端与本地都注册过。
 
@@ -363,7 +451,14 @@ def ensure_default_principals(
     粗粒度去重；hook 多次触发也只重试本地缺失的项。后端失败永远 swallow。
     """
     out: list[str] = []
-    specs = default_principals(creds, project_id, tool)
+    specs = default_principals(
+        creds,
+        project_id,
+        tool,
+        include_user=include_user,
+        include_agent=include_agent,
+        include_project=include_project,
+    )
     if not specs:
         return out
 
@@ -396,6 +491,7 @@ __all__ = [
     "PrincipalSpec",
     "PrincipalType",
     "default_principals",
+    "ensure_current_user_principal",
     "ensure_default_principals",
     "entity_id_for",
     "normalize_project_deictics",

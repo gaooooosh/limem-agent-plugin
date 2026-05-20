@@ -664,13 +664,18 @@ def entity_register_cmd(
     principal_type: str, slug: str, description: str, aliases: tuple[str, ...], scope: str
 ) -> None:
     from .entity_index import EntityIndex
-    from .principals import PrincipalSpec, register_principal
+    from .principals import PrincipalSpec, ensure_current_user_principal, register_principal
 
     creds = Credentials.load()
     if not creds.api_key or not creds.db_id:
         console.print("[red]缺凭证/db_id[/red]")
         sys.exit(2)
     idx = EntityIndex()
+    ensured_user = ""
+    try:
+        ensured_user = ensure_current_user_principal(creds, idx=idx)
+    except Exception:
+        ensured_user = ""
     spec = PrincipalSpec(
         principal_type=principal_type,  # type: ignore[arg-type]
         slug=slug,
@@ -684,6 +689,8 @@ def entity_register_cmd(
     except LimemError as e:
         console.print(f"[red]register failed: {e}[/red]")
         sys.exit(1)
+    if ensured_user:
+        console.print(f"[green]principal user → {ensured_user}[/green]")
     console.print(f"[green]registered[/green] {eid}")
 
 
