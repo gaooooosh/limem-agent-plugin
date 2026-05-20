@@ -110,7 +110,7 @@ def test_active_principals_lazy_ensures_when_empty(monkeypatch, tmp_path) -> Non
     creds = Credentials(api_key="k", db_id="db_1", user_id="u_42")
 
     # patch ensure_default_principals 来注册一个 sentinel principal
-    def _ensure(creds, *, project_id, tool, idx, client=None, force=False):  # noqa: ARG001
+    def _ensure(creds, *, project_id, tool, idx, client=None, force=False, **kwargs):  # noqa: ARG001
         idx.upsert_principal(
             entity_id="principal_user_cafebabe",
             principal_type="user",
@@ -128,7 +128,7 @@ def test_active_principals_lazy_ensures_when_empty(monkeypatch, tmp_path) -> Non
     assert any(p.entity_id == "principal_user_cafebabe" for p in out)
 
 
-def test_active_principals_no_ensure_when_already_present(monkeypatch, tmp_path) -> None:
+def test_active_principals_ensures_even_when_some_principals_exist(monkeypatch, tmp_path) -> None:
     from limem import hooks as hmod
     from limem.config import Credentials
 
@@ -145,15 +145,45 @@ def test_active_principals_no_ensure_when_already_present(monkeypatch, tmp_path)
 
     calls: list[int] = []
 
-    def _ensure(*args, **kwargs):  # noqa: ARG001
+    def _ensure(creds, *, project_id, tool, idx, client=None, force=False, **kwargs):  # noqa: ARG001
         calls.append(1)
+        idx.upsert_principal(
+            entity_id="principal_agent_codex",
+            principal_type="agent",
+            slug="codex",
+            canonical="agent:codex",
+            scope="global",
+            tool="codex",
+            description="",
+        )
+        return ["principal_agent_codex"]
+
+    monkeypatch.setattr(hmod, "ensure_default_principals", _ensure)
+
+    creds = Credentials(api_key="k", db_id="db_1", user_id="u_x")
+    out = hmod._active_principals(idx, creds, "foo/bar", "codex", lazy_ensure=True)
+    assert calls == [1]
+    assert any(p.entity_id == "principal_agent_codex" for p in out)
+
+
+def test_active_principals_can_skip_agent_for_non_observer_paths(monkeypatch, tmp_path) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials
+
+    idx = EntityIndex(db_path=tmp_path / "patterns.sqlite")
+    seen_kwargs: list[dict] = []
+
+    def _ensure(creds, *, project_id, tool, idx, client=None, force=False, **kwargs):  # noqa: ARG001
+        seen_kwargs.append(kwargs)
         return []
 
     monkeypatch.setattr(hmod, "ensure_default_principals", _ensure)
 
     creds = Credentials(api_key="k", db_id="db_1", user_id="u_x")
-    hmod._active_principals(idx, creds, "foo/bar", "codex", lazy_ensure=True)
-    assert calls == []  # already has principal → no ensure
+    hmod._active_principals(
+        idx, creds, "foo/bar", "codex", lazy_ensure=True, include_agent=False
+    )
+    assert seen_kwargs[-1]["include_agent"] is False
 
 
 def test_filter_query_results_downweights_principal_mismatch(tmp_path) -> None:

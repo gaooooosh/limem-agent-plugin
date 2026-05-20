@@ -49,6 +49,7 @@ from .memory_writer import (
 )
 from .principals import (
     PrincipalSpec,
+    ensure_current_user_principal,
     ensure_default_principals,
     entity_id_for,
     principal_alias_to_id,
@@ -435,7 +436,13 @@ def _t_search(
     if include_patterns and creds.api_key and creds.db_id:
         try:
             ensure_default_principals(
-                creds, project_id=project_id, tool="claude-code", idx=idx
+                creds,
+                project_id=project_id,
+                tool="",
+                idx=idx,
+                include_user=True,
+                include_agent=False,
+                include_project=True,
             )
         except Exception:
             pass
@@ -770,6 +777,11 @@ def _t_principal_register(
 ) -> str:
     creds = Credentials.load()
     idx = EntityIndex()
+    ensured_user = ""
+    try:
+        ensured_user = ensure_current_user_principal(creds, idx=idx)
+    except Exception:
+        ensured_user = ""
     spec = PrincipalSpec(
         principal_type=principal_type,  # type: ignore[arg-type]
         slug=slug,
@@ -779,7 +791,10 @@ def _t_principal_register(
         canonical=f"{principal_type}:{slug}",
     )
     eid = register_principal(spec, creds=creds, idx=idx, swallow=False)
-    return json.dumps({"entity_id": eid, "registered": True}, ensure_ascii=False)
+    return json.dumps(
+        {"entity_id": eid, "registered": True, "ensured_user_principal_id": ensured_user},
+        ensure_ascii=False,
+    )
 
 
 def _t_principal_activate(entity_id: str) -> str:
