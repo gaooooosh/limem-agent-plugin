@@ -4,8 +4,7 @@
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --api-key sk-xxx
-#   bash install.sh --target codex --ref v0.2.0 --no-bootstrap
-#   bash install.sh --update --target both
+#   bash install.sh --ref v0.3.1
 #
 # 平台：macOS / Linux / WSL；Windows 请用 WSL。
 
@@ -22,13 +21,16 @@ REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}"
 REF="main"
 API_KEY="${LIMEM_API_KEY:-}"
 API_KEY_ARG_SET=0
-ACTION="install"
+ACTION="auto"
 INSTALL_TARGETS="auto"
 DO_INIT=1
 DO_BOOTSTRAP=1
 BOOTSTRAP_SET=0
 VERBOSE=0
 DRY_RUN=0
+INSTALL_NEEDED=1
+SKIP_BOOTSTRAP_REASON=""
+VERSION_COMPARE="unknown"
 
 OS=""
 ARCH=""
@@ -67,7 +69,13 @@ print_kv() {
 }
 
 action_label() {
-  [[ "$ACTION" == "update" ]] && echo "更新" || echo "安装"
+  case "$ACTION" in
+    install) echo "安装" ;;
+    update) echo "更新" ;;
+    refresh) echo "刷新配置" ;;
+    downgrade) echo "回退安装" ;;
+    *) echo "自动判断" ;;
+  esac
 }
 
 # ============================================================
@@ -79,21 +87,18 @@ print_help() {
 LiMem Agent Plugin 安装器
 
 用法：
-  curl -fsSL <url> | bash                            # 默认 main，交互式 bootstrap
+  curl -fsSL <url> | bash                            # 自动安装或更新，必要时交互式 bootstrap
   curl -fsSL <url> | bash -s -- --api-key sk-xxx     # 一行装完
-  bash install.sh --target codex --no-bootstrap      # 只接入 Codex
-  bash install.sh --target claude-code               # 只接入 Claude Code
-  bash install.sh --target both                      # 同时接入 Claude Code + Codex
-  bash install.sh --update --target both             # 更新 CLI 并刷新两边配置
+  bash install.sh --ref v0.3.1                       # 安装指定 tag 或分支
 
 选项：
   --api-key TOKEN     LiMem API key（也可通过 $LIMEM_API_KEY）
   --ref REF           git 分支或 tag（默认：main）
-  --target TARGET      安装目标：auto / claude-code / codex / both（默认：auto）
+  --target TARGET      高级选项：auto / claude-code / codex / both（默认：auto）
   --targets TARGETS    同 --target；也接受 claude-code,codex
-  --update             更新已安装的 limem-cli，并刷新 hooks / skills（默认不重新 bootstrap）
+  --update             兼容旧用法：强制重装当前 ref，并刷新 hooks / skills
   --no-init           跳过 limem init
-  --bootstrap          即使 --update 也运行 limem bootstrap
+  --bootstrap          即使已有凭证也运行 limem bootstrap
   --no-bootstrap      跳过 limem bootstrap
   --dry-run           只检测环境、下载源码并显示版本计划，不安装
   --verbose, -v       打印调试信息
@@ -130,7 +135,7 @@ parse_args() {
                          INSTALL_TARGETS="$(normalize_targets "${2:?--target 需要一个值}")"; shift 2 ;;
       --target=*|--targets=*)
                          INSTALL_TARGETS="$(normalize_targets "${1#*=}")"; shift ;;
-      --update)         ACTION="update"; shift ;;
+      --update)         ACTION="update"; INSTALL_NEEDED=1; shift ;;
       --no-init)        DO_INIT=0; shift ;;
       --bootstrap)      DO_BOOTSTRAP=1; BOOTSTRAP_SET=1; shift ;;
       --no-bootstrap)   DO_BOOTSTRAP=0; BOOTSTRAP_SET=1; shift ;;
@@ -146,9 +151,7 @@ parse_args() {
     die "ref 不能包含斜杠：${REF}（GitHub tarball URL 无法表达带斜杠的 ref）" 2
   fi
 
-  if [[ "$ACTION" == "update" && "$BOOTSTRAP_SET" == "0" && "$API_KEY_ARG_SET" == "0" ]]; then
-    DO_BOOTSTRAP=0
-  fi
+  # bootstrap 默认由安装器按凭证状态自动判断；用户显式传参时再覆盖。
 }
 
 print_banner() {
@@ -359,11 +362,129 @@ read_target_version() {
 
 read_installed_version() {
   INSTALLED_VERSION=""
+  if ! command -v limem >/dev/null 2>&1 && [[ -x "$USER_BIN_DIR/limem" ]]; then
+    export PATH="$USER_BIN_DIR:$PATH"
+  fi
   if command -v limem >/dev/null 2>&1; then
     INSTALLED_VERSION="$(limem --version 2>/dev/null | sed -E 's/.* ([0-9][^[:space:]]*)$/\1/' || true)"
   fi
 
   [[ -n "$INSTALLED_VERSION" ]] || INSTALLED_VERSION="未安装"
+}
+
+compare_versions() {
+  if [[ "$INSTALLED_VERSION" == "未安装" || "$TARGET_VERSION" == "未知" ]]; then
+    VERSION_COMPARE="unknown"
+    return
+  fi
+
+  VERSION_COMPARE="$("$PYTHON" - "$INSTALLED_VERSION" "$TARGET_VERSION" <<'PY'
+import re
+import sys
+
+
+def parts(v: str) -> tuple[list[int], str]:
+    base, _, suffix = v.lstrip("v").partition("-")
+    nums = [int(x) for x in re.findall(r"\d+", base)]
+    return nums, suffix
+
+
+installed, target = sys.argv[1], sys.argv[2]
+a_nums, a_suffix = parts(installed)
+b_nums, b_suffix = parts(target)
+max_len = max(len(a_nums), len(b_nums))
+a_nums.extend([0] * (max_len - len(a_nums)))
+b_nums.extend([0] * (max_len - len(b_nums)))
+if a_nums < b_nums:
+    print("older")
+elif a_nums > b_nums:
+    print("newer")
+elif a_suffix == b_suffix:
+    print("same")
+else:
+    print("different")
+PY
+)"
+}
+
+prompt_yes_no() {
+  local question="$1"
+  local default="${2:-yes}"
+  local hint="[Y/n]"
+  local answer=""
+
+  [[ "$default" == "no" ]] && hint="[y/N]"
+  if ! can_prompt; then
+    [[ "$default" == "yes" ]]
+    return
+  fi
+  printf "%s %s " "$question" "$hint" > /dev/tty
+  IFS= read -r answer < /dev/tty || answer=""
+  answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
+  if [[ -z "$answer" ]]; then
+    [[ "$default" == "yes" ]]
+    return
+  fi
+  [[ "$answer" == "y" || "$answer" == "yes" ]]
+}
+
+credentials_present() {
+  local cred="$HOME/.config/limem/credentials.json"
+  [[ -s "$cred" ]] || return 1
+  "$PYTHON" - "$cred" <<'PY' >/dev/null 2>&1
+import json
+import sys
+
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+api_key = data.get("api_key") or ""
+db_id = data.get("db_id") or ""
+sys.exit(0 if api_key and db_id else 1)
+PY
+}
+
+decide_install_plan() {
+  read_installed_version
+  read_target_version
+  compare_versions
+
+  if [[ "$ACTION" == "update" ]]; then
+    ACTION="update"
+    INSTALL_NEEDED=1
+  elif [[ "$INSTALLED_VERSION" == "未安装" ]]; then
+    ACTION="install"
+    INSTALL_NEEDED=1
+  elif [[ "$VERSION_COMPARE" == "older" || "$VERSION_COMPARE" == "different" ]]; then
+    ACTION="update"
+    INSTALL_NEEDED=1
+  elif [[ "$VERSION_COMPARE" == "same" ]]; then
+    ACTION="refresh"
+    INSTALL_NEEDED=0
+  elif [[ "$VERSION_COMPARE" == "newer" ]]; then
+    ACTION="refresh"
+    INSTALL_NEEDED=0
+    if prompt_yes_no "已安装版本 ${INSTALLED_VERSION} 高于目标版本 ${TARGET_VERSION}，是否回退到目标版本？" "no"; then
+      ACTION="downgrade"
+      INSTALL_NEEDED=1
+    else
+      warn "保持当前版本，仅刷新 hooks / MCP / skills"
+    fi
+  else
+    ACTION="update"
+    INSTALL_NEEDED=1
+    warn "无法可靠比较版本，默认重装当前 ref"
+  fi
+
+  if [[ "$BOOTSTRAP_SET" == "0" && "$API_KEY_ARG_SET" == "0" ]]; then
+    if credentials_present; then
+      DO_BOOTSTRAP=0
+      SKIP_BOOTSTRAP_REASON="已有凭证"
+    else
+      DO_BOOTSTRAP=1
+    fi
+  fi
 }
 
 detect_backend_plan() {
@@ -391,8 +512,6 @@ bootstrap_plan_text() {
 }
 
 show_version_plan() {
-  read_installed_version
-  read_target_version
   detect_backend_plan
 
   cat >&2 <<EOF
@@ -403,7 +522,9 @@ EOF
   print_kv "源码" "${REPO_OWNER}/${REPO_NAME}@${REF}"
   print_kv "当前版本" "$INSTALLED_VERSION"
   print_kv "目标版本" "$TARGET_VERSION"
+  print_kv "版本判断" "$VERSION_COMPARE"
   print_kv "安装方式" "$BACKEND_PLAN"
+  print_kv "重装 CLI" "$([[ "$INSTALL_NEEDED" == "1" ]] && echo 是 || echo 否)"
   print_kv "Agent 目标" "$INSTALL_TARGETS"
   print_kv "刷新配置" "$([[ "$DO_INIT" == "1" ]] && echo 是 || echo 否)"
   print_kv "Bootstrap" "$(bootstrap_plan_text)"
@@ -415,11 +536,16 @@ EOF
 # ============================================================
 
 install_pkg() {
-  if [[ "$ACTION" == "update" ]]; then
-    step "更新 limem CLI"
-  else
-    step "安装 limem CLI"
+  if (( ! INSTALL_NEEDED )); then
+    step "检查 limem CLI"
+    LIMEM_CMD="$(command -v limem 2>/dev/null || true)"
+    [[ -n "$LIMEM_CMD" ]] || die "内部错误：计划刷新配置，但 PATH 中找不到 limem" 14
+    LIMEM_CMD_DIR="$(dirname "$LIMEM_CMD")"
+    ok "已是目标版本：$LIMEM_CMD ($INSTALLED_VERSION)"
+    return
   fi
+
+  step "$(action_label) limem CLI"
 
   case "$INSTALL_BACKEND" in
     uv)
@@ -528,7 +654,11 @@ can_prompt() {
 
 run_bootstrap() {
   if (( ! DO_BOOTSTRAP )); then
-    warn "已跳过 limem bootstrap（--no-bootstrap）"
+    if [[ -n "$SKIP_BOOTSTRAP_REASON" ]]; then
+      ok "已跳过 bootstrap（${SKIP_BOOTSTRAP_REASON}）"
+    else
+      warn "已跳过 limem bootstrap（--no-bootstrap）"
+    fi
     return
   fi
   step "运行 limem bootstrap（验证 API key + 解析/创建 db）"
@@ -564,8 +694,8 @@ EOF
 # ============================================================
 
 print_next_steps() {
-  local done_word="安装"
-  [[ "$ACTION" == "update" ]] && done_word="更新"
+  local done_word
+  done_word="$(action_label)"
   cat >&2 <<EOF
 
 ${C_GREEN}┌─ 完成${C_RESET}
@@ -602,6 +732,7 @@ main() {
   ensure_curl_tar
   ensure_python
   fetch_source
+  decide_install_plan
   show_version_plan
   if (( DRY_RUN )); then
     warn "dry-run：已停止在安装前"
@@ -609,7 +740,9 @@ main() {
     trap - EXIT
     return
   fi
-  select_install_backend
+  if (( INSTALL_NEEDED )); then
+    select_install_backend
+  fi
   install_pkg
   cleanup_workdir
   trap - EXIT
