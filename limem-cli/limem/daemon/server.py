@@ -155,6 +155,7 @@ class Daemon:
             "auto_init_project": self._h_auto_init_project,
             "report_recall": self._h_report_recall,
             "list_recent_recalls": self._h_list_recent_recalls,
+            "seen_recall_keys": self._h_seen_recall_keys,
             "consume_pending_recall": self._h_consume_pending_recall,
             "shutdown": self._h_shutdown,
         }
@@ -430,6 +431,11 @@ class Daemon:
                 for it in rec.items
             ],
         }
+
+    async def _h_seen_recall_keys(self, p: dict[str, Any]) -> dict[str, Any]:
+        """UserPromptSubmit 用：返回本 session 已经自动注入过的 memory keys。"""
+        session_id = str(p.get("session_id") or "")
+        return {"keys": sorted(self.state.seen_recall_keys(session_id))}
 
     async def _h_list_recent_recalls(self, p: dict[str, Any]) -> list[dict[str, Any]]:
         limit = int(p.get("limit") or 20)

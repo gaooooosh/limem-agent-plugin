@@ -309,6 +309,8 @@ LiMem Agent Plugin 使用三层召回：
 2. **Pattern recall**：LiMem 后端对 principal Markdown 档案做 H2 section 匹配。
 3. **Task recall**：LiMem 后端 `/recall` 接收 Agent 当前真实任务，返回 Rule / Context / Event 等可直接注入 prompt 的轻量 Markdown。
 
+这些召回在 `UserPromptSubmit` 自动执行，不需要用户手动搜索。Hook 会按当前任务拉取相关记忆，并在同一 session 内跳过已经注入过的 event、pattern 切片和 task recall 文本，避免反复把同一条记忆塞进上下文。
+
 显式搜索仍通过 `/query` 执行 BM25 事件检索，例如 `/limem.recall` 和 `limem_search`。
 
 注入块保持紧凑，并带有来源、预算、项目标识和短 ID：

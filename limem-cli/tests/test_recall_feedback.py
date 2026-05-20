@@ -269,6 +269,11 @@ def test_daemon_state_record_recall_updates_last_recall(tmp_path, monkeypatch) -
     assert st.last_recall.counts_by_src == {"hard": 1, "bm25": 1, "pattern": 1}
     # short_ids 只取有 short_id 的两条，且最多 2 个
     assert st.last_recall.short_ids_head == ["aaa111aaa111", "bbb222bbb222"]
+    assert st.seen_recall_keys("sess-1700000000") == {
+        "event:e_a",
+        "event:e_b",
+        "pattern:project:proj:命令规约",
+    }
 
 
 def test_daemon_state_recent_recalls_capped_at_max(tmp_path, monkeypatch) -> None:
@@ -359,6 +364,8 @@ def test_daemon_h_report_recall_updates_state_and_emits_event(
     }
     result = asyncio.run(fake._h_report_recall(payload))
     assert result == {"ok": True}
+    seen = asyncio.run(fake._h_seen_recall_keys({"session_id": "sess-1"}))
+    assert seen == {"keys": ["event:e1", "event:e2"]}
     assert len(fake.state.recent_recalls) == 1
     assert fake.state.last_recall.count == 2
     assert fake.state.last_recall.short_ids_head == ["aaaa11112222", "bbbb33334444"]
@@ -561,6 +568,69 @@ def test_hook_report_recall_safe_swallows_daemon_exception(monkeypatch) -> None:
         via_keywords=[],
         injected_chars=0,
     )
+
+
+def test_hook_filter_seen_recall_items_drops_session_repeats(monkeypatch) -> None:
+    """UserPromptSubmit keeps automatic recall on, but skips memories already injected."""
+    from limem import hooks as hmod
+
+    monkeypatch.setattr(
+        hmod.daemon_client,
+        "seen_recall_keys",
+        lambda session_id: {"event:e_seen", "pattern:project:demo:部署"},
+    )
+
+    items = [
+        InjectItem(kind="hard", score=1.0, event_id="e_seen", summary="old"),
+        InjectItem(
+            kind="pattern",
+            score=1.0,
+            canonical="project:demo",
+            heading="部署",
+            pattern_content="old pattern",
+        ),
+        InjectItem(kind="hard", score=1.0, event_id="e_new", summary="new"),
+    ]
+
+    out = hmod._filter_seen_recall_items(items, session_id="sess-1")
+    assert [it.event_id for it in out] == ["e_new"]
+
+
+def test_hook_filter_seen_task_recall_drops_same_backend_text(monkeypatch) -> None:
+    from limem import hooks as hmod
+
+    text = "## Relevant Memory\n- [Context] 已经注入过的后端任务召回"
+    key = hmod._task_recall_key(text)
+    monkeypatch.setattr(
+        hmod.daemon_client,
+        "seen_recall_keys",
+        lambda session_id: {key},
+    )
+
+    assert hmod._filter_seen_task_recall(text, session_id="sess-1") == ""
+
+
+def test_hook_report_backend_recall_safe_records_task_source(monkeypatch) -> None:
+    from limem import hooks as hmod
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(hmod.daemon_client, "report_recall", lambda p: calls.append(p))
+
+    hmod._report_backend_recall_safe(
+        task_text="## Relevant Memory\n- [Context] 自动任务召回",
+        session_id="sess-1",
+        project_id="proj",
+        scope="project:proj",
+        prompt="修复问题",
+        via_keywords=["修复"],
+        injected_chars=123,
+    )
+
+    assert len(calls) == 1
+    item = calls[0]["items"][0]
+    assert item["src"] == "task"
+    assert item["mem_type"] == "task_recall"
+    assert item["summary_head"].startswith("## Relevant Memory")
 
 
 def test_mcp_recent_recalls_calls_daemon_first(monkeypatch) -> None:

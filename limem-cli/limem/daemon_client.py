@@ -236,6 +236,17 @@ def list_recent_recalls(limit: int = 20) -> list[dict[str, Any]] | None:
     return r if isinstance(r, list) else None
 
 
+def seen_recall_keys(session_id: str) -> set[str]:
+    """Return memory keys already injected in this session; empty on daemon failure."""
+    if not session_id:
+        return set()
+    r = safe_call("seen_recall_keys", {"session_id": session_id})
+    if not isinstance(r, dict):
+        return set()
+    keys = r.get("keys") or []
+    return {str(k) for k in keys if k}
+
+
 def consume_pending_recall(
     session_id: str, *, dedupe: bool = True
 ) -> dict[str, Any] | None:

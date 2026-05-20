@@ -107,12 +107,27 @@ class RecalledItem:
 
     short_id: str = ""  # 不带 "#" 前缀；pattern src 可空
     event_id: str = ""  # pattern src 可空
-    src: str = ""  # "hard" | "pattern" | "bm25"
+    src: str = ""  # "hard" | "pattern" | "bm25" | "task"
     mem_type: str = ""  # rule / feedback / preference / note / ""
     scope: str = ""
     summary_head: str = ""  # ≤60 chars
     canonical: str = ""  # 仅 pattern
     heading: str = ""  # 仅 pattern
+
+
+def recall_item_key(item: RecalledItem) -> str:
+    """Session-level de-dupe key for memories already injected into the model."""
+    if item.event_id:
+        return f"event:{item.event_id}"
+    if item.short_id:
+        return f"short:{item.short_id}"
+    if item.src == "pattern" and (item.canonical or item.heading):
+        return f"pattern:{item.canonical}:{item.heading}"
+    if item.src == "task" and item.summary_head:
+        return f"task:{item.summary_head}"
+    if item.src and item.summary_head:
+        return f"{item.src}:{item.summary_head}"
+    return ""
 
 
 @dataclass
@@ -193,6 +208,8 @@ class DaemonState:
     pending_recall_by_session: dict[str, RecallEmittedRecord] = field(default_factory=dict)
     # Stop hook 去重签名：session_id -> 上次已展示给用户的 record 签名（hash of short_ids+counts）
     last_displayed_signature_by_session: dict[str, str] = field(default_factory=dict)
+    # UserPromptSubmit 自动召回去重：session_id -> 已注入过的 memory keys
+    seen_recall_keys_by_session: dict[str, set[str]] = field(default_factory=dict)
 
     # ----- session 维度 -----
 
@@ -281,6 +298,16 @@ class DaemonState:
         # 若同一 session 两轮间均无 Stop 触达，新 record 覆盖旧的 —— 这是预期行为：用户只关心最近一轮。
         if record.session_id:
             self.pending_recall_by_session[record.session_id] = record
+            seen = self.seen_recall_keys_by_session.setdefault(record.session_id, set())
+            for item in record.items:
+                key = recall_item_key(item)
+                if key:
+                    seen.add(key)
+
+    def seen_recall_keys(self, session_id: str) -> set[str]:
+        if not session_id:
+            return set()
+        return set(self.seen_recall_keys_by_session.get(session_id) or set())
 
     @staticmethod
     def _record_signature(record: RecallEmittedRecord) -> str:

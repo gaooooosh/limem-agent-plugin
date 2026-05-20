@@ -103,31 +103,81 @@ def _report_recall_safe(
 
     永不抛、永不阻塞 hook；daemon 不可达静默放弃（statusline / dash 最多显示上次缓存）。
     """
-    if not rendered:
+    items_payload = _recall_items_payload(rendered)
+    if not items_payload:
         return
     try:
-        items_payload: list[dict[str, Any]] = []
-        for it in rendered:
-            short = it.short_id or (it.event_id[:12] if it.event_id else "")
-            # injector.render_line 里 src 文案对 soft 用 "soft"，但为统一展示
-            # （README + statusline 习惯 "bm25"），转换一次
-            src = "bm25" if it.kind == "soft" else it.kind
-            if it.kind == "pattern":
-                summary_head = (it.pattern_content or "").strip()[:60]
-            else:
-                summary_head = (it.summary or "").strip()[:60]
-            items_payload.append(
-                {
-                    "short_id": short,
-                    "event_id": it.event_id,
-                    "src": src,
-                    "mem_type": it.mem_type,
-                    "scope": it.scope,
-                    "summary_head": summary_head,
-                    "canonical": it.canonical,
-                    "heading": it.heading,
-                }
-            )
+        _report_recall_payload_safe(
+            items_payload=items_payload,
+            session_id=session_id,
+            project_id=project_id,
+            scope=scope,
+            prompt=prompt,
+            via_patterns=via_patterns,
+            via_keywords=via_keywords,
+            injected_chars=injected_chars,
+        )
+    except Exception:
+        # 上报失败永不阻塞 hook
+        pass
+
+
+def _recall_items_payload(rendered: list[InjectItem]) -> list[dict[str, Any]]:
+    items_payload: list[dict[str, Any]] = []
+    for it in rendered:
+        short = it.short_id or (it.event_id[:12] if it.event_id else "")
+        # injector.render_line 里 src 文案对 soft 用 "soft"，但为统一展示
+        # （README + statusline 习惯 "bm25"），转换一次
+        src = "bm25" if it.kind == "soft" else it.kind
+        if it.kind == "pattern":
+            summary_head = (it.pattern_content or "").strip()[:60]
+        else:
+            summary_head = (it.summary or "").strip()[:60]
+        items_payload.append(
+            {
+                "short_id": short,
+                "event_id": it.event_id,
+                "src": src,
+                "mem_type": it.mem_type,
+                "scope": it.scope,
+                "summary_head": summary_head,
+                "canonical": it.canonical,
+                "heading": it.heading,
+            }
+        )
+    return items_payload
+
+
+def _task_recall_payload(task_text: str, *, scope: str) -> dict[str, Any] | None:
+    body = (task_text or "").strip()
+    if not body:
+        return None
+    return {
+        "short_id": "",
+        "event_id": "",
+        "src": "task",
+        "mem_type": "task_recall",
+        "scope": scope,
+        "summary_head": _task_recall_summary(body),
+        "canonical": "",
+        "heading": "",
+    }
+
+
+def _report_recall_payload_safe(
+    *,
+    items_payload: list[dict[str, Any]],
+    session_id: str,
+    project_id: str,
+    scope: str,
+    prompt: str,
+    via_patterns: list[str] | None,
+    via_keywords: list[str] | None,
+    injected_chars: int,
+) -> None:
+    if not items_payload:
+        return
+    try:
         daemon_client.report_recall(
             {
                 "ts": int(time.time()),
@@ -142,8 +192,33 @@ def _report_recall_safe(
             }
         )
     except Exception:
-        # 上报失败永不阻塞 hook
         pass
+
+
+def _report_backend_recall_safe(
+    *,
+    task_text: str,
+    session_id: str,
+    project_id: str,
+    scope: str,
+    prompt: str,
+    via_keywords: list[str] | None,
+    injected_chars: int,
+) -> None:
+    """Report backend task recall so automatic recall can be audited/de-duped."""
+    item = _task_recall_payload(task_text, scope=scope)
+    if not item:
+        return
+    _report_recall_payload_safe(
+        items_payload=[item],
+        session_id=session_id,
+        project_id=project_id,
+        scope=scope,
+        prompt=prompt,
+        via_patterns=[],
+        via_keywords=via_keywords,
+        injected_chars=injected_chars,
+    )
 
 
 # ---------- 召回辅助 ----------
@@ -178,6 +253,68 @@ def _via_keywords(prompt: str, *, limit: int = 2) -> list[str]:
         if len(seen) >= limit:
             break
     return seen
+
+
+def _inject_item_key(item: InjectItem) -> str:
+    if item.event_id:
+        return f"event:{item.event_id}"
+    if item.short_id:
+        return f"short:{item.short_id}"
+    if item.kind == "pattern" and (item.canonical or item.heading):
+        return f"pattern:{item.canonical}:{item.heading}"
+    return ""
+
+
+def _task_recall_key(text: str) -> str:
+    head = _task_recall_summary(text)
+    if not head:
+        return ""
+    return f"task:{head}"
+
+
+def _task_recall_summary(text: str) -> str:
+    return " ".join((text or "").split())[:60]
+
+
+def _filter_seen_recall_items(
+    items: list[InjectItem], *, session_id: str
+) -> list[InjectItem]:
+    """Drop memories already injected earlier in this session.
+
+    The hook still performs automatic recall every turn; this only prevents the
+    same event/pattern slice from being re-injected repeatedly.
+    """
+    if not session_id or not items:
+        return items
+    try:
+        seen = daemon_client.seen_recall_keys(session_id)
+    except Exception:
+        seen = set()
+    if not seen:
+        return items
+    out: list[InjectItem] = []
+    local_seen: set[str] = set()
+    for item in items:
+        key = _inject_item_key(item)
+        if key and (key in seen or key in local_seen):
+            continue
+        if key:
+            local_seen.add(key)
+        out.append(item)
+    return out
+
+
+def _filter_seen_task_recall(text: str, *, session_id: str) -> str:
+    if not text or not session_id:
+        return text
+    key = _task_recall_key(text)
+    if not key:
+        return text
+    try:
+        seen = daemon_client.seen_recall_keys(session_id)
+    except Exception:
+        seen = set()
+    return "" if key in seen else text
 
 
 def _degraded_banner(reason: str) -> str:
@@ -399,6 +536,7 @@ def _hook_user_prompt_submit(
         hard_recall_to_items(hard_metas, idx=idx)
         + pattern_recall_to_items(pattern_slices)
     )
+    items = _filter_seen_recall_items(items, session_id=session_id)
 
     muted = session_mute.get_muted(session_id) if session_id else set()
     if muted:
@@ -419,15 +557,23 @@ def _hook_user_prompt_submit(
         via_patterns=via_patterns,
         via_keywords=via_keywords,
     )
+    task_recall_text = _filter_seen_task_recall(
+        task_recall_text, session_id=session_id
+    )
     backend_text = render_backend_recall(task_recall_text)
     if backend_text:
         text = "\n\n".join(part for part in (text, backend_text) if part)
     if items or backend_text:
         daemon_client.bump_hit(session_id)
-    # 注入完成后 fire-and-forget 上报本轮实际渲染的 items（含 short_id），
-    # 供 statusline / dash 显示「上轮 / 最近召回」反馈。失败永不阻塞。
-    _report_recall_safe(
-        rendered=rendered_items,
+    # 注入完成后 fire-and-forget 上报本轮实际渲染的 items（含 short_id）；
+    # hard/pattern/task 合并成一次 record，避免 Stop 提示只看见最后一次来源。
+    recall_payload = _recall_items_payload(rendered_items)
+    if task_recall_text:
+        task_payload = _task_recall_payload(task_recall_text, scope=scope)
+        if task_payload:
+            recall_payload.append(task_payload)
+    _report_recall_payload_safe(
+        items_payload=recall_payload,
         session_id=session_id,
         project_id=project_id,
         scope=scope,
@@ -639,6 +785,7 @@ def _format_stop_recall_systemmessage(record: dict[str, Any]) -> str:
             "bm25": "语义记忆",
             "soft": "语义记忆",
             "pattern": "档案",
+            "task": "任务召回",
         }.get(src or "", src or "记忆")
 
     def _item_label(it: dict[str, Any]) -> str:
