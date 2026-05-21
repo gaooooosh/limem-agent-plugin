@@ -4,7 +4,7 @@
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --api-key sk-xxx
-#   bash install.sh --ref v0.3.1
+#   bash install.sh --ref v0.3.2
 #
 # 平台：macOS / Linux / WSL；Windows 请用 WSL。
 
@@ -89,7 +89,7 @@ LiMem Agent Plugin 安装器
 用法：
   curl -fsSL <url> | bash                            # 自动安装或更新，必要时交互式 bootstrap
   curl -fsSL <url> | bash -s -- --api-key sk-xxx     # 一行装完
-  bash install.sh --ref v0.3.1                       # 安装指定 tag 或分支
+  bash install.sh --ref v0.3.2                       # 安装指定 tag 或分支
 
 选项：
   --api-key TOKEN     LiMem API key（也可通过 $LIMEM_API_KEY）
