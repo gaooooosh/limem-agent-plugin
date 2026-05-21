@@ -1038,7 +1038,9 @@ def test_emit_inject_can_emit_independent_system_message(capsys) -> None:
     )
     captured = capsys.readouterr()
     data = json.loads(captured.out)
+    assert "decision" not in data
     assert data["systemMessage"] == "📚 LiMem · 本次引用 1 条记忆"
+    assert data["suppressOutput"] is False
     assert data["hookSpecificOutput"]["additionalContext"] == "<limem_memory>ctx</limem_memory>"
     assert "本次引用" not in data["hookSpecificOutput"]["additionalContext"]
 

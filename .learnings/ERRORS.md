@@ -80,6 +80,33 @@ Use `.venv/bin/pytest ...` for this repository unless the environment is refresh
 - Related Files: limem-cli/pyproject.toml
 
 ---
+## [ERR-20260521-003] zsh_url_glob_in_curl
+
+**Logged**: 2026-05-21T16:06:22+08:00
+**Priority**: low
+**Status**: pending
+**Area**: infra
+
+### Summary
+Unquoted GitHub API URLs with `?` fail in zsh because the shell treats them as glob patterns.
+
+### Error
+```text
+zsh:1: no matches found: https://api.github.com/repos/openai/codex/git/trees/main?recursive=1
+```
+
+### Context
+- Tried to inspect Codex hook source through the GitHub tree API.
+- The URL was not quoted, so zsh expanded `?` before `curl` ran.
+
+### Suggested Fix
+Quote URLs containing `?`, `&`, or glob-like characters in zsh commands.
+
+### Metadata
+- Reproducible: yes
+- Related Files: limem-cli/limem/hooks.py
+
+---
 ## [ERR-20260521-002] limem_mcp_write_feedback_500
 
 **Logged**: 2026-05-21T15:51:15+08:00

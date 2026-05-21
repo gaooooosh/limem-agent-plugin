@@ -321,7 +321,7 @@ LiMem Agent Plugin 使用三层召回：
 </limem_memory>
 ```
 
-回答结束时，Stop hook 会给用户显示本轮引用摘要，例如：
+每次提交提示词时，`UserPromptSubmit` hook 会通过独立 hook 提示显示本次召回摘要，不把提示混进 Agent 正文；回答结束时，Stop hook 也会尽量给用户显示本轮引用摘要，例如：
 
 ```text
 📚 LiMem · 本次引用 2 条记忆：强规则:#aaa111aaa111 不要运行 npm dev；档案:project:demo · 部署

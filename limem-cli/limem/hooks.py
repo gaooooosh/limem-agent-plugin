@@ -89,7 +89,6 @@ def _emit_inject(
         return
     payload: dict[str, Any] = {}
     if system_message:
-        payload["decision"] = "allow"
         payload["systemMessage"] = system_message
         payload["suppressOutput"] = False
     if text:
