@@ -81,16 +81,22 @@ def _log(event: str, tool: str, **fields: Any) -> None:
         pass
 
 
-def _emit_inject(event_name: str, text: str) -> None:
-    if not text:
+def _emit_inject(
+    event_name: str, text: str, *, system_message: str = ""
+) -> None:
+    if not text and not system_message:
         sys.stdout.write("")
         return
-    payload = {
-        "hookSpecificOutput": {
+    payload: dict[str, Any] = {}
+    if system_message:
+        payload["decision"] = "allow"
+        payload["systemMessage"] = system_message
+        payload["suppressOutput"] = False
+    if text:
+        payload["hookSpecificOutput"] = {
             "hookEventName": event_name,
             "additionalContext": text,
         }
-    }
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
 
 
@@ -528,7 +534,7 @@ def _hook_user_prompt_submit(
             banner = _degraded_banner(reason)
             if session_id:
                 _mark_degraded_emitted(session_id)
-            _emit_inject("UserPromptSubmit", banner)
+            _emit_inject("UserPromptSubmit", "", system_message=banner)
         _emit_event_safe(
             "user_prompt_submit",
             tool,
@@ -638,6 +644,18 @@ def _hook_user_prompt_submit(
         task_payload = _task_recall_payload(task_recall_text, scope=scope)
         if task_payload:
             recall_payload.append(task_payload)
+    recall_record = {
+        "ts": int(time.time()),
+        "session_id": session_id,
+        "project_id": project_id,
+        "scope": scope,
+        "items": recall_payload,
+        "via_patterns": via_patterns,
+        "via_keywords": via_keywords,
+        "prompt_head": (prompt or "")[:60],
+        "injected_chars": len(text),
+    }
+    recall_notice = _format_prompt_recall_systemmessage(recall_record)
     _report_recall_payload_safe(
         items_payload=recall_payload,
         session_id=session_id,
@@ -673,7 +691,7 @@ def _hook_user_prompt_submit(
         runtime,
         extra_payload=extra_payload or None,
     )
-    _emit_inject("UserPromptSubmit", text)
+    _emit_inject("UserPromptSubmit", text, system_message=recall_notice)
 
 
 def _mark_degraded_emitted(session_id: str) -> None:
@@ -866,6 +884,19 @@ def _format_stop_recall_systemmessage(record: dict[str, Any]) -> str:
     extra = n - len(head_items)
     suffix = f"；另 {extra} 条" if extra > 0 else ""
     return f"📚 LiMem · 本次引用 {n} 条记忆：{detail}{suffix}"
+
+
+def _format_prompt_recall_systemmessage(record: dict[str, Any]) -> str:
+    """User-visible recall notice emitted by UserPromptSubmit.
+
+    This is intentionally not injected into ``additionalContext``. Hosts that
+    surface top-level hook ``systemMessage`` can show it as a separate hook/tool
+    style notice while the model only receives the actual memory context.
+    """
+    base = _format_stop_recall_systemmessage(record).replace("📚 LiMem · ", "", 1)
+    ts = int(record.get("ts") or time.time())
+    recalled_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    return f"📚 LiMem · UserPromptSubmit {recalled_at} · {base}"
 
 
 def _emit_stop_systemmessage(text: str) -> None:

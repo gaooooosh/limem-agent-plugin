@@ -80,3 +80,31 @@ Use `.venv/bin/pytest ...` for this repository unless the environment is refresh
 - Related Files: limem-cli/pyproject.toml
 
 ---
+## [ERR-20260521-002] limem_mcp_write_feedback_500
+
+**Logged**: 2026-05-21T15:51:15+08:00
+**Priority**: medium
+**Status**: pending
+**Area**: infra
+
+### Summary
+`limem_write` failed with a LiMem 500 while trying to persist user feedback about recall visibility.
+
+### Error
+```text
+{"error": "LiMem 500: Internal Server Error"}
+```
+
+### Context
+- The user corrected the design: recall usage should appear as a separate hook/tool-style notice, not inside the agent's final prose.
+- Attempted to persist that project feedback through the LiMem MCP `limem_write` tool.
+- The code fix continued locally despite the backend failure.
+
+### Suggested Fix
+Diagnose the LiMem service ingest/write path before assuming feedback persistence succeeded; retry once the backend is healthy.
+
+### Metadata
+- Reproducible: unknown
+- Related Files: limem-cli/limem/hooks.py
+
+---

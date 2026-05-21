@@ -1008,6 +1008,41 @@ def test_format_stop_recall_systemmessage_empty() -> None:
     assert hmod._format_stop_recall_systemmessage({}) == "📚 LiMem · 本次未召回记忆"
 
 
+def test_format_prompt_recall_systemmessage_includes_timing_and_summary() -> None:
+    from limem import hooks as hmod
+
+    out = hmod._format_prompt_recall_systemmessage(
+        {
+            "ts": 1700000000,
+            "items": [
+                {
+                    "short_id": "aaa111aaa111",
+                    "src": "hard",
+                    "summary_head": "不要运行 npm dev",
+                }
+            ],
+        }
+    )
+    assert out.startswith("📚 LiMem · UserPromptSubmit 2023-")
+    assert "本次引用 1 条记忆" in out
+    assert "规则 #aaa111aaa111 不要运行 npm dev" in out
+
+
+def test_emit_inject_can_emit_independent_system_message(capsys) -> None:
+    from limem import hooks as hmod
+
+    hmod._emit_inject(
+        "UserPromptSubmit",
+        "<limem_memory>ctx</limem_memory>",
+        system_message="📚 LiMem · 本次引用 1 条记忆",
+    )
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["systemMessage"] == "📚 LiMem · 本次引用 1 条记忆"
+    assert data["hookSpecificOutput"]["additionalContext"] == "<limem_memory>ctx</limem_memory>"
+    assert "本次引用" not in data["hookSpecificOutput"]["additionalContext"]
+
+
 def test_emit_stop_systemmessage_writes_json(capsys) -> None:
     from limem import hooks as hmod
 

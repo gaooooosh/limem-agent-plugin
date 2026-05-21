@@ -290,6 +290,9 @@ def test_user_prompt_submit_uses_task_recall_not_query(monkeypatch, tmp_path, ca
     context = out["hookSpecificOutput"]["additionalContext"]
     assert '<limem_memory source="task">' in context
     assert "[Context] 用新接口按真实任务召回" in context
+    assert out["systemMessage"].startswith("📚 LiMem · UserPromptSubmit ")
+    assert "本次引用 1 条记忆" in out["systemMessage"]
+    assert "UserPromptSubmit" not in context
 
 
 def test_user_prompt_submit_auto_recall_skips_seen_items_but_keeps_task_recall(
@@ -374,5 +377,8 @@ def test_user_prompt_submit_auto_recall_skips_seen_items_but_keeps_task_recall(
     assert "新的相关规则" in context
     assert "已召回过的规则" not in context
     assert "task recall 仍自动召回" in context
+    assert out["systemMessage"].startswith("📚 LiMem · UserPromptSubmit ")
+    assert "本次引用 2 条记忆" in out["systemMessage"]
+    assert "UserPromptSubmit" not in context
     assert len(reports) == 1
     assert [item["src"] for item in reports[0]["items"]] == ["hard", "task"]
