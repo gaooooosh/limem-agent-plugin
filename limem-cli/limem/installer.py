@@ -55,6 +55,13 @@ class ProjectInitPlan:
     notes: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ProjectInitState:
+    project_root: Path
+    local_path: Path
+    existing_project_id: str = ""
+
+
 # ---------- 工具探测 ----------
 
 
@@ -376,18 +383,57 @@ def install_all(
 # ---------- 项目级 init（阶段 2/10：不再写 AGENTS.md/CLAUDE.md） ----------
 
 
-def project_init(project_root: Path | None = None) -> ProjectInitPlan:
+def project_init_state(project_root: Path | None = None) -> ProjectInitState:
+    from .scope import git_root
+
+    requested_root = (project_root or Path.cwd()).resolve()
+    root = git_root(requested_root) or requested_root
+    local_path = root / ".limem" / "local.json"
+    existing: dict[str, Any] = {}
+    if local_path.exists():
+        try:
+            loaded = json.loads(local_path.read_text() or "{}")
+            if isinstance(loaded, dict):
+                existing = loaded
+        except json.JSONDecodeError:
+            existing = {}
+    return ProjectInitState(
+        project_root=root,
+        local_path=local_path,
+        existing_project_id=str(existing.get("project_id") or "").strip(),
+    )
+
+
+def project_init(
+    project_root: Path | None = None,
+    *,
+    project_id: str = "",
+) -> ProjectInitPlan:
     from .scope import detect_project_id
 
-    root = (project_root or Path.cwd()).resolve()
-    pid = detect_project_id(root)
+    state = project_init_state(project_root)
+    root = state.project_root
+    local_dir = state.local_path.parent
+    local_dir.mkdir(exist_ok=True)
+    local_path = state.local_path
+
+    existing: dict[str, Any] = {}
+    if local_path.exists():
+        try:
+            loaded = json.loads(local_path.read_text() or "{}")
+            if isinstance(loaded, dict):
+                existing = loaded
+        except json.JSONDecodeError:
+            existing = {}
+
+    requested_pid = project_id.strip()
+    pid = str(existing.get("project_id") or "").strip() or requested_pid or detect_project_id(root)
     plan = ProjectInitPlan(project_id=pid, project_root=root)
 
-    local_dir = root / ".limem"
-    local_dir.mkdir(exist_ok=True)
-    local_path = local_dir / "local.json"
-    payload = {"project_id": pid, "enabled_hooks": []}
-    if not local_path.exists() or json.loads(local_path.read_text() or "{}") != payload:
+    payload = dict(existing)
+    payload["project_id"] = pid
+    payload.setdefault("enabled_hooks", [])
+    if not local_path.exists() or payload != existing:
         local_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
         plan.local_json_written = True
         plan.notes.append(f"wrote {local_path.relative_to(root)}")

@@ -14,6 +14,7 @@ import json
 import os
 import signal
 import sys
+from pathlib import Path
 
 import click
 from rich.console import Console
@@ -395,20 +396,53 @@ def remember(text: str, scope: str, mem_type: str, importance: float, entities: 
 # ---------- init ----------
 
 
+def _resolve_init_project_id(project_id: str, project_root: Path | None = None) -> str:
+    if project_id.strip():
+        return project_id.strip()
+
+    from .installer import project_init_state
+
+    state = project_init_state(project_root)
+    if state.existing_project_id:
+        return ""
+    if not _init_is_interactive():
+        return ""
+
+    suggested = ""
+    try:
+        from .scope import detect_project_id
+
+        suggested = detect_project_id(state.project_root)
+    except Exception:
+        suggested = ""
+
+    prompt = "Project id"
+    if suggested:
+        prompt += f" [Enter 使用 {suggested}]"
+    value = click.prompt(prompt, default="", show_default=False).strip()
+    return value
+
+
+def _init_is_interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 @main.command()
 @click.option("--project", is_flag=True, help="项目级 init（仅写 .limem/local.json + .gitignore）")
+@click.option("--project-id", default="", help="首次项目级 init 时写入的稳定项目 id")
 @click.option("--targets", default="")
 @click.option("--no-hooks", is_flag=True)
 @click.option("--no-mcp", is_flag=True)
 @click.option("--no-skills", is_flag=True)
 @click.option("--no-statusline", is_flag=True)
-def init(project: bool, targets: str, no_hooks: bool, no_mcp: bool, no_skills: bool,
-         no_statusline: bool) -> None:
+def init(project: bool, project_id: str, targets: str, no_hooks: bool, no_mcp: bool,
+         no_skills: bool, no_statusline: bool) -> None:
     """安装 LiMem 到 Claude Code 和/或 Codex。"""
     from .installer import detect_targets, install_all, project_init
 
     if project:
-        plan = project_init()
+        resolved_project_id = _resolve_init_project_id(project_id)
+        plan = project_init(project_id=resolved_project_id)
         t = Table(title=f"Project init ({plan.project_id})", show_header=False)
         t.add_row("project_id", plan.project_id)
         t.add_row("root", str(plan.project_root))
@@ -447,6 +481,8 @@ def init(project: bool, targets: str, no_hooks: bool, no_mcp: bool, no_skills: b
 
     target_list = [t.strip() for t in targets.split(",") if t.strip()] or detect_targets()
     console.print(f"[bold]targets:[/bold] {', '.join(target_list)}")
+    resolved_project_id = _resolve_init_project_id(project_id)
+    project_plan = project_init(project_id=resolved_project_id)
     plan = install_all(
         targets=target_list,
         enable_hooks=not no_hooks,
@@ -460,6 +496,12 @@ def init(project: bool, targets: str, no_hooks: bool, no_mcp: bool, no_skills: b
     t.add_row("codex patched", "yes" if plan.codex_config_patched else "no")
     t.add_row("codex skills", str(plan.codex_skills_copied))
     t.add_row("statusline", "yes" if plan.statusline_installed else "no")
+    t.add_row("project_id", project_plan.project_id)
+    t.add_row("project root", str(project_plan.project_root))
+    if not (project_plan.local_json_written or project_plan.gitignore_patched):
+        t.add_row("project init", "already initialized")
+    for note in project_plan.notes:
+        t.add_row("project ·", note)
     for note in plan.notes:
         t.add_row("·", note)
     console.print(t)
@@ -784,6 +826,50 @@ def entity_prune_legacy_cmd(delete: bool) -> None:
         except LimemError as e:
             console.print(f"[red]delete {ent['entity_id']} failed: {e}[/red]")
     console.print(f"[green]deleted {deleted}/{len(legacy)} legacy entities[/green]")
+
+
+# ---------- project 管理 ----------
+
+
+@main.group()
+def project() -> None:
+    """项目管理：列出已注册项目 principal。"""
+
+
+@project.command("list")
+@click.option("--all", "show_all", is_flag=True, help="包含未激活的项目")
+def project_list_cmd(show_all: bool) -> None:
+    from .entity_index import EntityIndex
+    from .scope import detect_project_id
+
+    idx = EntityIndex()
+    current_project_id = detect_project_id()
+    rows = idx.list_principals(
+        active_only=not show_all,
+        principal_types=["project"],
+    )
+    if not rows:
+        console.print("[dim]no projects registered yet[/dim]")
+        if current_project_id:
+            console.print(f"[dim]current project_id: {current_project_id}[/dim]")
+        return
+
+    t = Table(title=f"Projects ({len(rows)})")
+    t.add_column("current", justify="center")
+    t.add_column("project_id", no_wrap=True)
+    t.add_column("entity_id", no_wrap=True)
+    t.add_column("pattern", justify="center")
+    t.add_column("active", justify="center")
+    for r in rows:
+        pid = r.project_id or r.slug
+        t.add_row(
+            "✓" if pid == current_project_id else "",
+            pid,
+            r.entity_id,
+            "✓" if r.has_pattern else "",
+            "✓" if r.active else "·",
+        )
+    console.print(t)
 
 
 # ---------- daemon ----------

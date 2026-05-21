@@ -65,3 +65,47 @@ def test_mcp_search_does_not_guess_agent_principal(monkeypatch, tmp_path) -> Non
     assert kwargs_seen
     assert kwargs_seen[-1]["tool"] == ""
     assert kwargs_seen[-1]["include_agent"] is False
+
+
+def test_mcp_project_list_marks_current_project(monkeypatch, tmp_path) -> None:
+    from limem import mcp_server as mcp
+    from limem.entity_index import EntityIndex
+
+    idx = EntityIndex(db_path=tmp_path / "patterns.sqlite")
+    idx.upsert_principal(
+        entity_id="principal_project_deadbeef",
+        principal_type="project",
+        slug="github.com/foo/bar",
+        canonical="project:bar",
+        aliases=["bar"],
+        description="测试项目",
+        scope="project:github.com/foo/bar",
+        project_id="github.com/foo/bar",
+        has_pattern=True,
+    )
+    idx.upsert_principal(
+        entity_id="principal_project_cafebabe",
+        principal_type="project",
+        slug="github.com/foo/baz",
+        canonical="project:baz",
+        aliases=["baz"],
+        description="另一个项目",
+        scope="project:github.com/foo/baz",
+        project_id="github.com/foo/baz",
+        active=False,
+    )
+
+    monkeypatch.setattr(mcp, "EntityIndex", lambda: idx)
+    monkeypatch.setattr(mcp, "detect_project_id", lambda: "github.com/foo/bar")
+
+    out = json.loads(mcp._t_project_list())
+
+    assert out["current_project_id"] == "github.com/foo/bar"
+    assert [p["project_id"] for p in out["projects"]] == ["github.com/foo/bar"]
+    assert out["projects"][0]["is_current"] is True
+
+    out = json.loads(mcp._t_project_list(active_only=False))
+    assert {p["project_id"] for p in out["projects"]} == {
+        "github.com/foo/bar",
+        "github.com/foo/baz",
+    }

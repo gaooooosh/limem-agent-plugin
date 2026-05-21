@@ -14,8 +14,10 @@ LiMem long-term memory bridge for Claude Code and Codex CLI.
 
 ```bash
 uv tool install --force ./limem-cli
-limem init                 # 全局安装到 Claude Code + Codex
-cd your-project && limem init --project
+cd your-project && limem init  # 安装到 Claude Code + Codex，并自动写 .limem/local.json
+limem init --project           # 只初始化当前项目；提示输入 project id，回车自动生成
+limem init --project --project-id github.com/owner/repo  # 跳过提示，首次显式固定项目 id
+limem project list             # 查看已注册项目
 ```
 
 详见 `limem --help`。

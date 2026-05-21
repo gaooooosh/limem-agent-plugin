@@ -215,11 +215,14 @@ limem bootstrap --api-key <YOUR_API_KEY>
 limem init
 ```
 
-为当前项目建立 project scope：
+`limem init` 会同时刷新全局 hooks / MCP / skills，并在当前项目目录自动写入
+`.limem/local.json`，用于固定 project scope。只想初始化当前项目时可使用：
 
 ```bash
 cd your-project
 limem init --project
+# 首次 init 会提示输入 project id；直接回车会自动生成。也可以用参数跳过提示：
+limem init --project --project-id github.com/owner/repo
 ```
 
 ---
@@ -250,6 +253,7 @@ limem export --format markdown
 ```bash
 limem pattern get project
 limem pattern put project ./PROJECT_MEMORY.md
+limem project list
 limem entity list
 limem daemon status
 limem dash
@@ -291,6 +295,7 @@ limem dash
 | 诊断 | `limem_ping`, `limem_stats` |
 | Principal 档案 | `limem_pattern_get`, `limem_pattern_put`, `limem_pattern_delete` |
 | Principal 管理 | `limem_principal_list`, `limem_principal_register`, `limem_principal_activate`, `limem_principal_deactivate` |
+| 项目管理 | `limem_project_list` |
 
 MCP 层复用 CLI、Hooks 和写入模块的业务逻辑，不重复拼接后端 HTTP 请求。
 

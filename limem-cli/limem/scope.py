@@ -52,6 +52,23 @@ def _git_remote(cwd: Path) -> str:
     return ""
 
 
+def git_root(cwd: Path | None = None) -> Path | None:
+    """返回 cwd 所在 git worktree 根目录；不在 git 仓库时返回 None。"""
+    root = (cwd or Path.cwd()).resolve()
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return Path(out.stdout.strip()).resolve()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
 def _package_json_name(cwd: Path) -> str:
     p = cwd / "package.json"
     if p.exists():

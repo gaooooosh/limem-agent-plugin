@@ -11,6 +11,7 @@ v3 工具集（principal-centric）：
 - ``limem_pattern_{get,put,delete}`` ：principal markdown CRUD，入参支持 alias
   (``"project" / "user" / "agent"``) 或 stable entity_id
 - ``limem_principal_{list,register,activate,deactivate}`` ：principal 管理（v3 新增）
+- ``limem_project_list`` ：列出已注册 project principals
 """
 
 from __future__ import annotations
@@ -310,6 +311,16 @@ async def _list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="limem_project_list",
+            description="List registered projects (project principals), marking the current project when detectable.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "active_only": {"type": "boolean", "default": True},
+                },
+            },
+        ),
+        Tool(
             name="limem_recent_recalls",
             description=(
                 "Show which LiMem memories were injected into the most recent prompts. "
@@ -380,6 +391,8 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             text = _t_principal_activate(**arguments)
         elif name == "limem_principal_deactivate":
             text = _t_principal_deactivate(**arguments)
+        elif name == "limem_project_list":
+            text = _t_project_list(**arguments)
         elif name == "limem_recent_recalls":
             text = _t_recent_recalls(**arguments)
         else:
@@ -809,6 +822,37 @@ def _t_principal_deactivate(entity_id: str) -> str:
     eid = _resolve_principal_id(entity_id, idx=idx)
     idx.deactivate_principal(eid)
     return json.dumps({"entity_id": eid, "active": False}, ensure_ascii=False)
+
+
+def _t_project_list(*, active_only: bool = True) -> str:
+    idx = EntityIndex()
+    current_project_id = detect_project_id()
+    rows = idx.list_principals(
+        active_only=active_only,
+        principal_types=["project"],
+    )
+    return json.dumps(
+        {
+            "current_project_id": current_project_id,
+            "projects": [
+                {
+                    "entity_id": r.entity_id,
+                    "project_id": r.project_id or r.slug,
+                    "slug": r.slug,
+                    "canonical": r.canonical,
+                    "aliases": r.aliases,
+                    "description": r.description,
+                    "scope": r.scope,
+                    "has_pattern": r.has_pattern,
+                    "active": r.active,
+                    "last_seen_ts": r.last_seen_ts,
+                    "is_current": (r.project_id or r.slug) == current_project_id,
+                }
+                for r in rows
+            ],
+        },
+        ensure_ascii=False,
+    )
 
 
 def _read_recent_recalls_fallback() -> list[dict[str, Any]]:

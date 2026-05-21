@@ -146,6 +146,71 @@ def test_project_init_does_not_touch_agents_or_claude(tmp_path) -> None:
     assert (tmp_path / "CLAUDE.md").read_text() == "# claude rules\n"
 
 
+def test_project_init_preserves_existing_project_id(tmp_path) -> None:
+    import json
+
+    from limem.installer import project_init
+    from limem.principals import PrincipalSpec, entity_id_for
+    from limem.scope import detect_project_id
+
+    limem_dir = tmp_path / ".limem"
+    limem_dir.mkdir()
+    local_json = limem_dir / "local.json"
+    local_json.write_text(json.dumps({"project_id": "stable-project"}))
+
+    before_id = detect_project_id(tmp_path)
+    before_principal = entity_id_for(
+        PrincipalSpec(principal_type="project", slug=before_id, description="")
+    )
+
+    plan = project_init(tmp_path, project_id="new-project-id")
+
+    after_payload = json.loads(local_json.read_text())
+    after_id = detect_project_id(tmp_path)
+    after_principal = entity_id_for(
+        PrincipalSpec(principal_type="project", slug=after_id, description="")
+    )
+
+    assert before_id == "stable-project"
+    assert plan.project_id == "stable-project"
+    assert after_id == "stable-project"
+    assert after_payload["project_id"] == "stable-project"
+    assert after_payload["enabled_hooks"] == []
+    assert before_principal == after_principal
+
+
+def test_project_init_accepts_explicit_project_id_on_first_init(tmp_path) -> None:
+    import json
+
+    from limem.installer import project_init
+    from limem.scope import detect_project_id
+
+    plan = project_init(tmp_path, project_id="manual-project-id")
+    payload = json.loads((tmp_path / ".limem" / "local.json").read_text())
+
+    assert plan.project_id == "manual-project-id"
+    assert payload["project_id"] == "manual-project-id"
+    assert detect_project_id(tmp_path) == "manual-project-id"
+
+
+def test_project_init_writes_to_git_root_from_subdir(tmp_path) -> None:
+    import subprocess
+
+    from limem.installer import project_init
+    from limem.scope import detect_project_id
+
+    subprocess.run(["git", "-C", str(tmp_path), "init"], check=True, capture_output=True)
+    nested = tmp_path / "packages" / "app"
+    nested.mkdir(parents=True)
+
+    plan = project_init(nested)
+
+    assert plan.project_root == tmp_path.resolve()
+    assert (tmp_path / ".limem" / "local.json").exists()
+    assert not (nested / ".limem" / "local.json").exists()
+    assert detect_project_id(nested) == plan.project_id
+
+
 def test_pause_state_disk_roundtrip(tmp_path, monkeypatch) -> None:
     import limem.config as cfg
     import limem.daemon.state as state
