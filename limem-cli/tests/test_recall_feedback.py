@@ -123,6 +123,7 @@ def test_render_backend_recall_empty_returns_empty_string() -> None:
 def test_statusline_format_with_last_recall() -> None:
     from limem.statusline import format_text
 
+    now = int(time.time())
     out = format_text(
         active=5,
         hits=12,
@@ -134,15 +135,22 @@ def test_statusline_format_with_last_recall() -> None:
         init_pending_until_ts=None,
         inited_now_ts=None,
         last_recall={
-            "ts": 1700000000,
+            "ts": now,
             "count": 3,
             "short_ids_head": ["a3f1c0a3f1c0", "9b22d79b22d7"],
             "counts_by_src": {"hard": 1, "pattern": 1, "bm25": 1},
+            "items_head": [
+                "规则 #a3f1c0a3f1c0 提交前更新版本号",
+                "档案 project:demo 命令规约",
+            ],
         },
     )
     assert "✨" in out
+    assert "刚刚" in out
+    assert "规则1/档案1/语义1" in out
     assert "#a3f1c0a3f1c0" in out
-    assert "#9b22d79b22d7" in out
+    assert "提交前更新版本号" in out
+    assert "命令规约" in out
     assert "(+1)" in out  # count=3, head=2 → 溢出 1
 
 
@@ -174,6 +182,30 @@ def test_statusline_format_without_last_recall_backward_compat() -> None:
     )
     assert "✨" not in out_old
     assert out_old == out_none
+
+
+def test_statusline_format_with_empty_last_recall() -> None:
+    from limem.statusline import format_text
+
+    out = format_text(
+        active=5,
+        hits=12,
+        sug=3,
+        pause_on=False,
+        pause_until_ts=None,
+        connectivity="healthy",
+        reason=None,
+        init_pending_until_ts=None,
+        inited_now_ts=None,
+        last_recall={
+            "ts": int(time.time()),
+            "count": 0,
+            "short_ids_head": [],
+            "counts_by_src": {},
+            "items_head": [],
+        },
+    )
+    assert "✨ 刚刚 · 未召回记忆" in out
 
 
 def test_statusline_format_disabled_skips_last_recall() -> None:
@@ -211,7 +243,31 @@ def test_statusline_format_pattern_only_shows_count() -> None:
         inited_now_ts=None,
         last_recall={"count": 2, "short_ids_head": [], "counts_by_src": {"pattern": 2}},
     )
-    assert "✨ 2 条" in out
+    assert "✨ 档案2 · 2 条" in out
+
+
+def test_statusline_format_legacy_last_recall_still_shows_short_ids() -> None:
+    from limem.statusline import format_text
+
+    out = format_text(
+        active=1,
+        hits=1,
+        sug=0,
+        pause_on=False,
+        pause_until_ts=None,
+        connectivity="healthy",
+        reason=None,
+        init_pending_until_ts=None,
+        inited_now_ts=None,
+        last_recall={
+            "count": 2,
+            "short_ids_head": ["aaa111", "bbb222"],
+            "counts_by_src": {"hard": 1, "bm25": 1},
+        },
+    )
+    assert "#aaa111" in out
+    assert "#bbb222" in out
+    assert "规则1/语义1" in out
 
 
 # ---------- daemon state ----------
@@ -231,7 +287,11 @@ def _make_state(tmp_cache_dir, monkeypatch):
 
 
 def _make_record(
-    *, ts: int, items: list[dict[str, Any]] | None = None, scope: str = "global"
+    *,
+    ts: int,
+    items: list[dict[str, Any]] | None = None,
+    scope: str = "global",
+    prompt_head: str | None = None,
 ) -> Any:
     from limem.daemon.state import RecalledItem, RecallEmittedRecord
 
@@ -243,7 +303,7 @@ def _make_record(
         items=[RecalledItem(**it) for it in (items or [])],
         via_patterns=["proj"],
         via_keywords=["docker"],
-        prompt_head=f"prompt {ts}",
+        prompt_head=prompt_head if prompt_head is not None else f"prompt {ts}",
         injected_chars=100,
     )
 
@@ -269,11 +329,27 @@ def test_daemon_state_record_recall_updates_last_recall(tmp_path, monkeypatch) -
     assert st.last_recall.counts_by_src == {"hard": 1, "bm25": 1, "pattern": 1}
     # short_ids 只取有 short_id 的两条，且最多 2 个
     assert st.last_recall.short_ids_head == ["aaa111aaa111", "bbb222bbb222"]
+    assert st.last_recall.items_head == [
+        "规则 #aaa111aaa111 rule body",
+        "语义 #bbb222bbb222 note body",
+    ]
     assert st.seen_recall_keys("sess-1700000000") == {
         "event:e_a",
         "event:e_b",
         "pattern:project:proj:命令规约",
     }
+
+
+def test_daemon_state_record_empty_recall_updates_last_recall(tmp_path, monkeypatch) -> None:
+    st, _ = _make_state(tmp_path, monkeypatch)
+    rec = _make_record(ts=1700000000, items=[], prompt_head="没有匹配的请求")
+    st.record_recall(rec)
+    assert len(st.recent_recalls) == 1
+    assert st.last_recall is not None
+    assert st.last_recall.count == 0
+    assert st.last_recall.short_ids_head == []
+    assert st.last_recall.items_head == []
+    assert st.consume_pending_recall("sess-1700000000") is rec
 
 
 def test_daemon_state_recent_recalls_capped_at_max(tmp_path, monkeypatch) -> None:
@@ -369,6 +445,10 @@ def test_daemon_h_report_recall_updates_state_and_emits_event(
     assert len(fake.state.recent_recalls) == 1
     assert fake.state.last_recall.count == 2
     assert fake.state.last_recall.short_ids_head == ["aaaa11112222", "bbbb33334444"]
+    assert fake.state.last_recall.items_head == [
+        "规则 #aaaa11112222 禁止 npm run dev",
+        "语义 #bbbb33334444 另一条",
+    ]
 
     # 审计行写到了 events.ndjson
     assert events_path.exists()
@@ -477,6 +557,7 @@ def test_daemon_h_get_status_includes_last_recall(tmp_path, monkeypatch) -> None
     assert lr is not None
     assert lr["count"] == 1
     assert lr["short_ids_head"] == ["ssss00001111"]
+    assert lr["items_head"] == ["规则 #ssss00001111"]
 
 
 # ---------- hook 上报 ----------
@@ -541,6 +622,28 @@ def test_hook_report_recall_safe_calls_daemon(monkeypatch) -> None:
     assert p["items"][2]["summary_head"] == "内容"
     assert p["items"][2]["canonical"] == "project:foo"
     assert p["items"][2]["heading"] == "规约"
+
+
+def test_hook_report_recall_payload_allows_empty_when_requested(monkeypatch) -> None:
+    from limem import hooks as hmod
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(hmod.daemon_client, "report_recall", lambda p: calls.append(p))
+
+    hmod._report_recall_payload_safe(
+        items_payload=[],
+        session_id="s",
+        project_id="p",
+        scope="global",
+        prompt="没有匹配",
+        via_patterns=["project:p"],
+        via_keywords=["没有"],
+        injected_chars=0,
+        allow_empty=True,
+    )
+    assert len(calls) == 1
+    assert calls[0]["items"] == []
+    assert calls[0]["prompt_head"] == "没有匹配"
 
 
 def test_hook_report_recall_safe_swallows_daemon_exception(monkeypatch) -> None:
@@ -740,6 +843,24 @@ def test_daemon_consume_pending_recall_dedupe(tmp_path, monkeypatch) -> None:
     assert st.consume_pending_recall("sess-B") is None
 
 
+def test_daemon_consume_empty_recall_dedupe_uses_prompt_head(tmp_path, monkeypatch) -> None:
+    st, _ = _make_state(tmp_path, monkeypatch)
+    r1 = _make_record(ts=1700000001, items=[], prompt_head="请求 A")
+    r1.session_id = "sess-B"
+    st.record_recall(r1)
+    assert st.consume_pending_recall("sess-B") is not None
+
+    r2 = _make_record(ts=1700000002, items=[], prompt_head="请求 A")
+    r2.session_id = "sess-B"
+    st.record_recall(r2)
+    assert st.consume_pending_recall("sess-B") is None
+
+    r3 = _make_record(ts=1700000003, items=[], prompt_head="请求 B")
+    r3.session_id = "sess-B"
+    st.record_recall(r3)
+    assert st.consume_pending_recall("sess-B") is not None
+
+
 def test_daemon_consume_pending_recall_different_session_independent(
     tmp_path, monkeypatch
 ) -> None:
@@ -821,8 +942,8 @@ def test_format_stop_recall_systemmessage_with_short_ids() -> None:
     }
     out = hmod._format_stop_recall_systemmessage(record)
     assert "📚 LiMem · 本次引用 3 条记忆" in out
-    assert "强规则:#aaa111aaa111 不要运行 npm dev" in out
-    assert "语义记忆:#bbb222bbb222 Docker rebuild 流程" in out
+    assert "规则 #aaa111aaa111 不要运行 npm dev" in out
+    assert "语义 #bbb222bbb222 Docker rebuild 流程" in out
     assert "#aaa111aaa111" in out
     assert "#bbb222bbb222" in out
     assert "另 1 条" in out  # head 2, total 3 → 溢出 1
@@ -840,15 +961,15 @@ def test_format_stop_recall_systemmessage_pattern_only() -> None:
     }
     out = hmod._format_stop_recall_systemmessage(record)
     assert "本次引用 2 条记忆" in out
-    assert "档案:project:demo · 部署" in out
-    assert "档案:user:gaooooosh · 偏好" in out
+    assert "档案 project:demo · 部署" in out
+    assert "档案 user:gaooooosh · 偏好" in out
 
 
 def test_format_stop_recall_systemmessage_empty() -> None:
     from limem import hooks as hmod
 
-    assert hmod._format_stop_recall_systemmessage({"items": []}) == ""
-    assert hmod._format_stop_recall_systemmessage({}) == ""
+    assert hmod._format_stop_recall_systemmessage({"items": []}) == "📚 LiMem · 本次未召回记忆"
+    assert hmod._format_stop_recall_systemmessage({}) == "📚 LiMem · 本次未召回记忆"
 
 
 def test_emit_stop_systemmessage_writes_json(capsys) -> None:
@@ -981,7 +1102,7 @@ def test_hook_stop_codex_stderr_keeps_readable_chinese(monkeypatch, capsys, tmp_
     data = json.loads(captured.out)
     assert "本次引用 1 条记忆" in data["systemMessage"]
     assert "部署后运行 docker:rebuild" in captured.err
-    assert "强规则:#abcd00001111" in captured.err
+    assert "规则 #abcd00001111" in captured.err
     assert "#abcd00001111" in data["systemMessage"]
 
 

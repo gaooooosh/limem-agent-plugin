@@ -130,6 +130,29 @@ def recall_item_key(item: RecalledItem) -> str:
     return ""
 
 
+def recall_item_label(item: RecalledItem, *, max_chars: int = 34) -> str:
+    """Compact human label for statusline/notification surfaces."""
+    src_label = {
+        "hard": "规则",
+        "bm25": "语义",
+        "soft": "语义",
+        "pattern": "档案",
+        "task": "任务",
+    }.get(item.src or "", item.src or "记忆")
+    summary = (item.summary_head or "").strip()
+    if not summary and item.src == "pattern":
+        summary = " · ".join(
+            part for part in ((item.canonical or "").strip(), (item.heading or "").strip()) if part
+        )
+    summary = " ".join(summary.split())
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 1] + "…"
+    ident = f" #{item.short_id}" if item.short_id else ""
+    if summary:
+        return f"{src_label}{ident} {summary}"
+    return f"{src_label}{ident}".strip()
+
+
 @dataclass
 class RecallEmittedRecord:
     """一次 UserPromptSubmit 注入产出的元数据快照，供 dash / statusline 反向消费。"""
@@ -153,6 +176,7 @@ class LastRecallSummary:
     count: int = 0
     short_ids_head: list[str] = field(default_factory=list)  # 最多 2 个
     counts_by_src: dict[str, int] = field(default_factory=dict)
+    items_head: list[str] = field(default_factory=list)  # 最多 2 条用户可读摘要
 
 
 def _record_from_dict(data: dict[str, Any]) -> RecallEmittedRecord:
@@ -283,16 +307,22 @@ class DaemonState:
         self.recent_recalls.appendleft(record)
         counts: dict[str, int] = {}
         short_ids: list[str] = []
+        items_head: list[str] = []
         for it in record.items:
             if it.src:
                 counts[it.src] = counts.get(it.src, 0) + 1
             if it.short_id:
                 short_ids.append(it.short_id)
+            if len(items_head) < 2:
+                label = recall_item_label(it)
+                if label:
+                    items_head.append(label)
         self.last_recall = LastRecallSummary(
             ts=record.ts,
             count=len(record.items),
             short_ids_head=short_ids[:2],
             counts_by_src=counts,
+            items_head=items_head,
         )
         # Stop hook 主动提示用：把该 session 的最新 record 标记为 pending（未消费）。
         # 若同一 session 两轮间均无 Stop 触达，新 record 覆盖旧的 —— 这是预期行为：用户只关心最近一轮。
@@ -327,6 +357,7 @@ class DaemonState:
             + "::"
             + ";".join(f"{k}={counts[k]}" for k in sorted(counts.keys()))
             + f"::pattern_only={1 if not short_ids and record.items else 0}"
+            + f"::empty_prompt={record.prompt_head if not record.items else ''}"
         )
         return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
 
@@ -381,16 +412,22 @@ class DaemonState:
             latest = new_deque[0]
             counts: dict[str, int] = {}
             short_ids: list[str] = []
+            items_head: list[str] = []
             for it in latest.items:
                 if it.src:
                     counts[it.src] = counts.get(it.src, 0) + 1
                 if it.short_id:
                     short_ids.append(it.short_id)
+                if len(items_head) < 2:
+                    label = recall_item_label(it)
+                    if label:
+                        items_head.append(label)
             self.last_recall = LastRecallSummary(
                 ts=latest.ts,
                 count=len(latest.items),
                 short_ids_head=short_ids[:2],
                 counts_by_src=counts,
+                items_head=items_head,
             )
 
     def save_recent_recalls_to_disk(self) -> None:

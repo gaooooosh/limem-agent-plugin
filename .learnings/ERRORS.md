@@ -25,6 +25,33 @@ Use `head -n -1 install.sh` or a dedicated test harness when sourcing shell scri
 - Related Files: install.sh
 
 ---
+## [ERR-20260521-001] python_entrypoint_missing
+
+**Logged**: 2026-05-21T16:00:00+08:00
+**Priority**: low
+**Status**: pending
+**Area**: tests
+
+### Summary
+The repo shell does not provide a `python` command; use `.venv/bin/pytest`, `python3`, or `uv` for local verification.
+
+### Error
+```text
+zsh:1: command not found: python
+```
+
+### Context
+- Attempted `python -m pytest ...` in `/home/gaooooosh/limem-agent-plugin/limem-cli`.
+- `python3` and `uv` exist, and older project notes already prefer the project virtualenv test runner.
+
+### Suggested Fix
+Use `.venv/bin/pytest ...` for this repository when available.
+
+### Metadata
+- Reproducible: yes
+- Related Files: limem-cli/pyproject.toml
+
+---
 ## [ERR-20260520-001] pytest_entrypoint_missing
 
 **Logged**: 2026-05-20T13:42:11+08:00

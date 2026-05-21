@@ -34,7 +34,9 @@ from .config import (
 )
 from .daemon.eventbus import emit_event
 from .daemon.state import (
+    RecalledItem,
     is_degraded_banner_emitted_on_disk,
+    recall_item_label,
     read_pause_from_disk,
 )
 from .daemon.writer import build_natural_detail
@@ -178,8 +180,9 @@ def _report_recall_payload_safe(
     via_patterns: list[str] | None,
     via_keywords: list[str] | None,
     injected_chars: int,
+    allow_empty: bool = False,
 ) -> None:
-    if not items_payload:
+    if not items_payload and not allow_empty:
         return
     try:
         daemon_client.report_recall(
@@ -644,6 +647,7 @@ def _hook_user_prompt_submit(
         via_patterns=via_patterns,
         via_keywords=via_keywords,
         injected_chars=len(text),
+        allow_empty=True,
     )
     _log(
         "user_prompt_submit",
@@ -840,31 +844,21 @@ def _format_stop_recall_systemmessage(record: dict[str, Any]) -> str:
     """
     items = record.get("items") or []
     if not items:
-        return ""
-
-    def _src_label(src: str) -> str:
-        return {
-            "hard": "强规则",
-            "bm25": "语义记忆",
-            "soft": "语义记忆",
-            "pattern": "档案",
-            "task": "任务召回",
-        }.get(src or "", src or "记忆")
+        return "📚 LiMem · 本次未召回记忆"
 
     def _item_label(it: dict[str, Any]) -> str:
-        src = _src_label(str(it.get("src") or ""))
-        short_id = str(it.get("short_id") or "").strip()
-        summary = str(it.get("summary_head") or "").strip()
-        if not summary and it.get("src") == "pattern":
-            canonical = str(it.get("canonical") or "").strip()
-            heading = str(it.get("heading") or "").strip()
-            summary = " · ".join(part for part in (canonical, heading) if part)
-        if not summary:
-            summary = "已匹配记忆"
-        if len(summary) > 32:
-            summary = summary[:31] + "..."
-        ident = f"#{short_id} " if short_id else ""
-        return f"{src}:{ident}{summary}"
+        return recall_item_label(
+            RecalledItem(
+                short_id=str(it.get("short_id") or ""),
+                event_id=str(it.get("event_id") or ""),
+                src=str(it.get("src") or ""),
+                mem_type=str(it.get("mem_type") or ""),
+                scope=str(it.get("scope") or ""),
+                summary_head=str(it.get("summary_head") or ""),
+                canonical=str(it.get("canonical") or ""),
+                heading=str(it.get("heading") or ""),
+            )
+        ) or "已匹配记忆"
 
     n = len(items)
     head_items = items[:2]

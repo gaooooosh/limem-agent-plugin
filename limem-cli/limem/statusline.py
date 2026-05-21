@@ -20,24 +20,75 @@ def _format_last_recall(
     *,
     short_ids_max: int = 2,
 ) -> str:
-    """把 daemon 的 last_recall 摘要拼成 statusline 尾段，例如 `✨ #a3f #9b2 (+1)`。
+    """把 daemon 的 last_recall 摘要拼成 statusline 尾段。
 
     返回空串表示无需追加（last_recall 为空 / count==0）。
     """
     if not last_recall:
         return ""
     count = int(last_recall.get("count") or 0)
+    age = _format_age(int(last_recall.get("ts") or 0))
+    src = _format_src_counts(last_recall.get("counts_by_src") or {})
     if count <= 0:
-        return ""
+        prefix = age or "刚刚"
+        return f"✨ {prefix} · 未召回记忆"
+    items = list(last_recall.get("items_head") or [])[:short_ids_max]
+    if items:
+        tail = "；".join(str(x) for x in items if str(x).strip())
+        extra = count - len(items)
+        suffix = f" (+{extra})" if extra > 0 else ""
+        prefix = " · ".join(part for part in (age, src) if part)
+        if prefix:
+            return f"✨ {prefix} · {tail}{suffix}"
+        return f"✨ {tail}{suffix}"
+
     short_ids = list(last_recall.get("short_ids_head") or [])[:short_ids_max]
     if short_ids:
         tail = " ".join(f"#{s}" for s in short_ids)
         extra = count - len(short_ids)
+        prefix = " · ".join(part for part in (age, src) if part)
         if extra > 0:
-            return f"✨ {tail} (+{extra})"
-        return f"✨ {tail}"
+            return f"✨ {prefix + ' · ' if prefix else ''}{tail} (+{extra})"
+        return f"✨ {prefix + ' · ' if prefix else ''}{tail}"
     # 仅有计数（pattern-only 场景：pattern 没有 short_id）
-    return f"✨ {count} 条"
+    prefix = " · ".join(part for part in (age, src) if part)
+    return f"✨ {prefix + ' · ' if prefix else ''}{count} 条"
+
+
+def _format_age(ts: int) -> str:
+    if ts <= 0:
+        return ""
+    delta = max(0, int(time.time()) - ts)
+    if delta < 60:
+        return "刚刚"
+    mins = delta // 60
+    if mins < 60:
+        return f"{mins}分钟前"
+    hours = mins // 60
+    if hours < 24:
+        return f"{hours}小时前"
+    days = hours // 24
+    return f"{days}天前"
+
+
+def _format_src_counts(counts: dict[str, Any]) -> str:
+    labels = {
+        "hard": "规则",
+        "bm25": "语义",
+        "soft": "语义",
+        "pattern": "档案",
+        "task": "任务",
+    }
+    parts: list[str] = []
+    for key in ("hard", "pattern", "bm25", "soft", "task"):
+        n = int(counts.get(key) or 0)
+        if n <= 0:
+            continue
+        label = labels.get(key, key)
+        if key == "soft" and any(p.startswith("语义") for p in parts):
+            continue
+        parts.append(f"{label}{n}")
+    return "/".join(parts)
 
 
 def format_text(
