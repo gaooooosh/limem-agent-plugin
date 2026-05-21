@@ -128,6 +128,70 @@ def test_default_init_creates_local_project_config(monkeypatch, tmp_path) -> Non
     assert payload["project_id"]
 
 
+def test_default_init_ensures_project_principal(monkeypatch, tmp_path) -> None:
+    """普通 limem init 写出 project_id 后应立即 ensure 当前项目 principal。"""
+    import json
+    from types import SimpleNamespace
+
+    import limem.cli as cli
+    import limem.installer as installer
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(installer, "detect_targets", lambda: [])
+    monkeypatch.setattr(
+        installer,
+        "install_all",
+        lambda **_: SimpleNamespace(
+            claude_settings_patched=False,
+            claude_skills_copied=0,
+            codex_config_patched=False,
+            codex_skills_copied=0,
+            statusline_installed=False,
+            notes=[],
+        ),
+    )
+
+    ensured: list[dict] = []
+
+    def _ensure_init_principals(project_id: str, *, tool: str = "") -> list[str]:
+        ensured.append({"project_id": project_id, "tool": tool})
+        return ["principal_project_12345678"]
+
+    monkeypatch.setattr(cli, "_ensure_init_principals", _ensure_init_principals)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["init"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads((tmp_path / ".limem" / "local.json").read_text())
+    assert ensured == [{"project_id": payload["project_id"], "tool": ""}]
+    assert "principal project → principal_project_12345678" in result.output
+
+
+def test_project_init_ensures_project_principal_without_agent(monkeypatch, tmp_path) -> None:
+    import limem.cli as cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.Credentials, "load", lambda: type("Creds", (), {"api_key": "", "db_id": ""})())
+
+    ensured: list[dict] = []
+
+    def _ensure_init_principals(project_id: str, *, tool: str = "") -> list[str]:
+        ensured.append({"project_id": project_id, "tool": tool})
+        return ["principal_project_deadbeef"]
+
+    monkeypatch.setattr(cli, "_ensure_init_principals", _ensure_init_principals)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["init", "--project", "--project-id", "manual-project-id"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert ensured == [{"project_id": "manual-project-id", "tool": ""}]
+    assert "principal project → principal_project_deadbeef" in result.output
+
+
 def test_project_list_shows_registered_projects(monkeypatch, tmp_path) -> None:
     import limem.cli as cli
     import limem.entity_index as entity_index

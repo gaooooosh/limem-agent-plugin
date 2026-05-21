@@ -427,6 +427,33 @@ def _init_is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
+def _ensure_init_principals(project_id: str, *, tool: str = "") -> list[str]:
+    """Best-effort ensure for principals after `limem init` writes project config."""
+    if not project_id:
+        return []
+    try:
+        from .client import LimemClient
+        from .entity_index import EntityIndex
+        from .principals import ensure_default_principals
+
+        creds = Credentials.load()
+        if not (creds.api_key and creds.db_id):
+            return []
+        client = LimemClient(creds=creds, timeout=2.0)
+        return ensure_default_principals(
+            creds,
+            project_id=project_id,
+            tool=tool,
+            idx=EntityIndex(),
+            client=client,
+            include_user=True,
+            include_agent=bool(tool),
+            include_project=True,
+        )
+    except Exception:
+        return []
+
+
 @main.command()
 @click.option("--project", is_flag=True, help="项目级 init（仅写 .limem/local.json + .gitignore）")
 @click.option("--project-id", default="", help="首次项目级 init 时写入的稳定项目 id")
@@ -452,31 +479,12 @@ def init(project: bool, project_id: str, targets: str, no_hooks: bool, no_mcp: b
         if not (plan.local_json_written or plan.gitignore_patched):
             console.print("[yellow](no changes — already initialized)[/yellow]")
 
-        # v3：注册默认 principals（失败静默）。aliases 行为的 source-of-truth 统一在
-        # principals.default_principals()；此处不再手工构造 PrincipalSpec，避免漂移。
-        try:
-            from .client import LimemClient
-            from .entity_index import EntityIndex
-            from .principals import ensure_default_principals
-
-            creds = Credentials.load()
-            if creds.api_key and creds.db_id and plan.project_id:
-                idx = EntityIndex()
-                client = LimemClient(creds=creds, timeout=2.0)
-                eids = ensure_default_principals(
-                    creds,
-                    project_id=plan.project_id,
-                    tool="claude-code",
-                    idx=idx,
-                    client=client,
-                )
-                proj_eid = next(
-                    (e for e in eids if e.startswith("principal_project_")), ""
-                )
-                if proj_eid:
-                    console.print(f"[green]principal project → {proj_eid}[/green]")
-        except Exception as e:  # noqa: BLE001
-            console.print(f"[yellow]principal project 注册失败（已忽略）：{e}[/yellow]")
+        # v3：init 写出项目配置后立即幂等 ensure user/project principals。
+        # agent observer 仍由真实 SessionStart hook 按 tool 注册，避免 init 猜测执行主体。
+        eids = _ensure_init_principals(plan.project_id)
+        proj_eid = next((e for e in eids if e.startswith("principal_project_")), "")
+        if proj_eid:
+            console.print(f"[green]principal project → {proj_eid}[/green]")
         return
 
     target_list = [t.strip() for t in targets.split(",") if t.strip()] or detect_targets()
@@ -505,6 +513,10 @@ def init(project: bool, project_id: str, targets: str, no_hooks: bool, no_mcp: b
     for note in plan.notes:
         t.add_row("·", note)
     console.print(t)
+    eids = _ensure_init_principals(project_plan.project_id)
+    proj_eid = next((e for e in eids if e.startswith("principal_project_")), "")
+    if proj_eid:
+        console.print(f"[green]principal project → {proj_eid}[/green]")
     creds = Credentials.load()
     if not creds.api_key:
         console.print(
