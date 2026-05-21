@@ -53,6 +53,10 @@ from .principals import ensure_default_principals
 from .redact import contains_secret
 from .scope import detect_project_id, project_scope
 
+_CODEX_SESSION_PROMPT_CHARS = 4000
+_CODEX_SESSION_PACKET_CHARS = 12000
+_CODEX_SESSION_EVIDENCE_LIMIT = 20
+
 # ---------- 日志 ----------
 
 
@@ -240,6 +244,57 @@ def _safe_redact(text: str, patterns: list[str]) -> tuple[str, bool]:
     return text, False
 
 
+def _codex_session_buffer_path(session_id: str) -> Path:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in session_id)
+    return SESSIONS_DIR / f"{safe or 'unknown'}.ndjson"
+
+
+def _append_codex_session_observation(
+    *,
+    session_id: str,
+    kind: str,
+    payload: dict[str, Any],
+    runtime: RuntimeConfig,
+) -> None:
+    try:
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        row = {
+            "ts": int(time.time()),
+            "kind": kind,
+            "payload": payload,
+        }
+        with _codex_session_buffer_path(session_id or "unknown").open("a") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    _ = runtime
+
+
+def _append_codex_user_prompt_observation(
+    *,
+    session_id: str,
+    prompt: str,
+    project_id: str,
+    scope: str,
+    runtime: RuntimeConfig,
+) -> None:
+    safe_prompt, redacted = _safe_redact(
+        prompt[:_CODEX_SESSION_PROMPT_CHARS], runtime.redact_patterns
+    )
+    _append_codex_session_observation(
+        session_id=session_id,
+        kind="user_prompt",
+        payload={
+            "role": "user",
+            "content": safe_prompt,
+            "project_id": project_id,
+            "scope": scope,
+            "redacted": redacted,
+        },
+        runtime=runtime,
+    )
+
+
 def _via_keywords(prompt: str, *, limit: int = 2) -> list[str]:
     import re
 
@@ -425,6 +480,14 @@ def _hook_user_prompt_submit(
     session_id = payload.get("session_id") or payload.get("sessionId") or ""
     project_id = detect_project_id()
     scope = f"project:{project_id}" if project_id else "global"
+    if tool == "codex" and prompt:
+        _append_codex_user_prompt_observation(
+            session_id=session_id,
+            prompt=prompt,
+            project_id=project_id,
+            scope=scope,
+            runtime=runtime,
+        )
 
     # A4.1：可选探测 transcript_path，提取上一条 assistant 回复 head，供 daemon 改进 is_correction 判定。
     # payload 是自由 dict，本字段挂在 payload["prev_assistant_head"] 内，**不**新增 events.ndjson envelope 字段。
@@ -932,10 +995,12 @@ def _hook_stop_codex(
     tool: str, payload: dict[str, Any], creds: Credentials, runtime: RuntimeConfig
 ) -> None:
     sid = payload.get("session_id") or payload.get("sessionId") or "unknown"
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    buf = SESSIONS_DIR / f"{sid}.ndjson"
-    with buf.open("a") as f:
-        f.write(json.dumps({"ts": int(time.time()), "payload": payload}, ensure_ascii=False) + "\n")
+    _append_codex_session_observation(
+        session_id=sid,
+        kind="stop",
+        payload={"hook": "Stop"},
+        runtime=runtime,
+    )
 
     now = int(time.time())
     threshold = now - runtime.codex_stop_idle_seconds
@@ -963,6 +1028,67 @@ def _hook_stop_codex(
             pass
 
 
+def _markdown_escape(text: str) -> str:
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _build_codex_evidence_packet(
+    events: list[dict[str, Any]],
+    *,
+    project_id: str,
+    tool: str,
+    source: str,
+) -> str:
+    lines = [
+        "# Agent Observation Packet",
+        "",
+        "## Context",
+    ]
+    if project_id:
+        lines.append(f"- Project: {project_id}")
+    lines.append(f"- Tool: {tool}")
+    lines.append(f"- Source: {source}")
+    lines.extend(["", "## Evidence Timeline"])
+
+    evidence_count = 0
+    for ev in events:
+        kind = ev.get("kind") or "event"
+        payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+        if kind == "user_prompt":
+            content = _markdown_escape(str(payload.get("content") or ""))
+            if not content:
+                continue
+            evidence_count += 1
+            lines.extend(
+                [
+                    "",
+                    f"### {evidence_count}. User Message",
+                    "",
+                    content,
+                ]
+            )
+        elif kind == "stop":
+            evidence_count += 1
+            lines.extend(
+                [
+                    "",
+                    f"### {evidence_count}. Stop Hook",
+                    "",
+                    "Codex emitted a Stop hook for this session.",
+                ]
+            )
+        if evidence_count >= _CODEX_SESSION_EVIDENCE_LIMIT:
+            break
+
+    if evidence_count == 0:
+        lines.extend(["", "No conversation evidence was captured before this stop event."])
+
+    packet = "\n".join(lines).strip()
+    if len(packet) > _CODEX_SESSION_PACKET_CHARS:
+        packet = packet[: _CODEX_SESSION_PACKET_CHARS - 20].rstrip() + "\n\n[truncated]"
+    return packet
+
+
 def _flush_codex_session(buf: Path, creds: Credentials, tool: str) -> None:
     try:
         lines = buf.read_text().splitlines()
@@ -977,26 +1103,27 @@ def _flush_codex_session(buf: Path, creds: Credentials, tool: str) -> None:
     scope = project_scope()
     project_id = detect_project_id()
     source = f"{tool}:stop_flush"
-    text = f"Codex session {sid}, {len(events)} turns"
-    detail = f"first_turn_ts={events[0]['ts']} last_turn_ts={events[-1]['ts']}"
+    text = "Codex conversation evidence packet"
+    detail = _build_codex_evidence_packet(
+        events,
+        project_id=project_id,
+        tool=tool,
+        source=source,
+    )
     summary_payload = {
         "limem_scope": scope,
-        "limem_type": "session_summary",
+        "limem_type": "session_observation",
         "project_id": project_id,
         "session_id": sid,
         "source": source,
         "importance": 0.3,
         "text": text,
-        "detail": build_natural_detail(
-            text=text,
-            detail=detail,
-            scope=scope,
-            mem_type="session_summary",
-            project_id=project_id,
-            session_id=sid,
-            source=source,
-            timestamp=ts,
-        ),
+        "detail": detail,
+        "metadata": {
+            "turn_count": len(events),
+            "first_event_ts": events[0].get("ts"),
+            "last_event_ts": events[-1].get("ts"),
+        },
     }
     try:
         LimemClient(creds=creds).ingest(summary_payload, timestamp=ts)

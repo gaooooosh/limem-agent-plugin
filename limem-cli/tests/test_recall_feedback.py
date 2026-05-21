@@ -985,6 +985,95 @@ def test_hook_stop_codex_stderr_keeps_readable_chinese(monkeypatch, capsys, tmp_
     assert "#abcd00001111" in data["systemMessage"]
 
 
+def test_build_codex_evidence_packet_keeps_raw_timeline() -> None:
+    from limem import hooks as hmod
+
+    packet = hmod._build_codex_evidence_packet(
+        [
+            {
+                "ts": 1700000000,
+                "kind": "user_prompt",
+                "payload": {
+                    "role": "user",
+                    "content": "不要替后端 LLM 总结，只提交观察材料。",
+                },
+            },
+            {"ts": 1700000001, "kind": "stop", "payload": {"hook": "Stop"}},
+        ],
+        project_id="github.com/gaooooosh/limem-agent-plugin",
+        tool="codex",
+        source="codex:stop_flush",
+    )
+
+    assert packet.startswith("# Agent Observation Packet")
+    assert "## Evidence Timeline" in packet
+    assert "### 1. User Message" in packet
+    assert "不要替后端 LLM 总结，只提交观察材料。" in packet
+    assert "### 2. Stop Hook" in packet
+    assert "User Intent" not in packet
+    assert "Key Points" not in packet
+    assert "first_turn_ts" not in packet
+    assert "session_id" not in packet
+
+
+def test_flush_codex_session_ingests_markdown_evidence_packet(monkeypatch, tmp_path) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials
+
+    captured: dict[str, Any] = {}
+
+    class _Result:
+        event_id = "evt_1"
+        summary = "ok"
+
+    class _Client:
+        def __init__(self, **_kw):
+            pass
+
+        def ingest(self, data, *, timestamp=None):
+            captured["data"] = data
+            captured["timestamp"] = timestamp
+            return _Result()
+
+    monkeypatch.setattr(hmod, "LimemClient", _Client)
+    monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda **_kw: None)
+    monkeypatch.setattr(hmod.session_mute, "clear", lambda _sid: None)
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "github.com/gaooooosh/limem-agent-plugin")
+    monkeypatch.setattr(hmod, "project_scope", lambda: "project:github.com/gaooooosh/limem-agent-plugin")
+
+    buf = tmp_path / "sess-md.ndjson"
+    rows = [
+        {
+            "ts": 1700000000,
+            "kind": "user_prompt",
+            "payload": {
+                "role": "user",
+                "content": "payload 正文使用 Markdown，但不要替后端总结。",
+            },
+        },
+        {"ts": 1700000001, "kind": "stop", "payload": {"hook": "Stop"}},
+    ]
+    buf.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows))
+
+    hmod._flush_codex_session(
+        buf,
+        Credentials(api_key="k", db_id="db", user_id="u"),
+        "codex",
+    )
+
+    data = captured["data"]
+    assert data["limem_type"] == "session_observation"
+    assert data["text"] == "Codex conversation evidence packet"
+    assert data["detail"].startswith("# Agent Observation Packet")
+    assert "payload 正文使用 Markdown，但不要替后端总结。" in data["detail"]
+    assert "User Intent" not in data["detail"]
+    assert "Key Points" not in data["detail"]
+    assert "first_turn_ts" not in data["detail"]
+    assert data["metadata"]["turn_count"] == 2
+    assert data["metadata"]["first_event_ts"] == 1700000000
+    assert not buf.exists()
+
+
 def test_hook_report_recall_safe_completes_under_50ms(monkeypatch) -> None:
     """daemon 失败时整个上报路径仍快于 50ms（hook 预算）。"""
     from limem import hooks as hmod
