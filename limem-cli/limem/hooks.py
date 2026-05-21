@@ -1126,7 +1126,21 @@ def _flush_codex_session(buf: Path, creds: Credentials, tool: str) -> None:
         },
     }
     try:
-        LimemClient(creds=creds).ingest(summary_payload, timestamp=ts)
+        client = LimemClient(creds=creds)
+        try:
+            ensure_default_principals(
+                creds,
+                project_id=project_id,
+                tool=tool,
+                idx=EntityIndex(),
+                client=client,
+                include_user=True,
+                include_agent=True,
+                include_project=True,
+            )
+        except Exception:
+            pass
+        client.ingest(summary_payload, timestamp=ts)
         daemon_client.set_connectivity(status=200, ok=True)
         _log("stop_flush", tool, buffer=str(buf), turns=len(events))
         session_mute.clear(sid)

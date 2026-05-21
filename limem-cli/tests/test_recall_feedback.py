@@ -1074,6 +1074,75 @@ def test_flush_codex_session_ingests_markdown_evidence_packet(monkeypatch, tmp_p
     assert not buf.exists()
 
 
+def test_flush_codex_session_ensures_default_principals_before_ingest(monkeypatch, tmp_path) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials
+
+    order: list[str] = []
+    ensured: dict[str, Any] = {}
+
+    class _Result:
+        event_id = "evt_1"
+        summary = "ok"
+
+    class _Client:
+        def __init__(self, **_kw):
+            pass
+
+        def ingest(self, data, *, timestamp=None):  # noqa: ARG002
+            order.append("ingest")
+            return _Result()
+
+    def _ensure(creds, *, project_id, tool, idx, client=None, **kwargs):  # noqa: ARG001
+        order.append("ensure")
+        ensured.update(
+            {
+                "project_id": project_id,
+                "tool": tool,
+                "include_user": kwargs.get("include_user"),
+                "include_agent": kwargs.get("include_agent"),
+                "include_project": kwargs.get("include_project"),
+                "client_type": type(client).__name__,
+            }
+        )
+        return ["principal_project_x"]
+
+    monkeypatch.setattr(hmod, "LimemClient", _Client)
+    monkeypatch.setattr(hmod, "ensure_default_principals", _ensure)
+    monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda **_kw: None)
+    monkeypatch.setattr(hmod.session_mute, "clear", lambda _sid: None)
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "github.com/gaooooosh/limem-agent-plugin")
+    monkeypatch.setattr(hmod, "project_scope", lambda: "project:github.com/gaooooosh/limem-agent-plugin")
+
+    buf = tmp_path / "sess-ensure.ndjson"
+    buf.write_text(
+        json.dumps(
+            {
+                "ts": 1700000000,
+                "kind": "user_prompt",
+                "payload": {"role": "user", "content": "hello"},
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    hmod._flush_codex_session(
+        buf,
+        Credentials(api_key="k", db_id="db", user_id="u"),
+        "codex",
+    )
+
+    assert order == ["ensure", "ingest"]
+    assert ensured == {
+        "project_id": "github.com/gaooooosh/limem-agent-plugin",
+        "tool": "codex",
+        "include_user": True,
+        "include_agent": True,
+        "include_project": True,
+        "client_type": "_Client",
+    }
+
+
 def test_hook_report_recall_safe_completes_under_50ms(monkeypatch) -> None:
     """daemon 失败时整个上报路径仍快于 50ms（hook 预算）。"""
     from limem import hooks as hmod
