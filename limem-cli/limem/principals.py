@@ -415,7 +415,8 @@ def ensure_current_user_principal(
         local_hit = idx.lookup_principal(eid)
     except Exception:
         local_hit = None
-    if not force and local_hit is not None and _ensured_marker(eid).exists():
+    backend_ok = bool((local_hit.raw_metadata or {}).get("backend_ok")) if local_hit else False
+    if not force and local_hit is not None and backend_ok and _ensured_marker(eid).exists():
         return eid
     try:
         _ENSURE_MARKER_DIR.mkdir(parents=True, exist_ok=True)
@@ -423,7 +424,9 @@ def ensure_current_user_principal(
         pass
     register_principal(spec, creds=creds, idx=idx, client=client, swallow=True)
     try:
-        _ensured_marker(eid).touch(exist_ok=True)
+        row = idx.lookup_principal(eid)
+        if row and bool((row.raw_metadata or {}).get("backend_ok")):
+            _ensured_marker(eid).touch(exist_ok=True)
     except Exception:
         pass
     return eid
@@ -475,12 +478,15 @@ def ensure_default_principals(
             local_hit = idx.lookup_principal(eid)
         except Exception:
             local_hit = None
-        if not force and local_hit is not None and marker.exists():
+        backend_ok = bool((local_hit.raw_metadata or {}).get("backend_ok")) if local_hit else False
+        if not force and local_hit is not None and backend_ok and marker.exists():
             out.append(eid)
             continue
         register_principal(spec, creds=creds, idx=idx, client=client, swallow=True)
         try:
-            marker.touch(exist_ok=True)
+            row = idx.lookup_principal(eid)
+            if row and bool((row.raw_metadata or {}).get("backend_ok")):
+                marker.touch(exist_ok=True)
         except Exception:
             pass
         out.append(eid)
