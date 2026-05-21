@@ -19,6 +19,7 @@ from typing import Any
 from .config import (
     LIMEMD_FORK_LOCK_PATH,
     LIMEMD_SOCK_PATH,
+    PENDING_RECALLS_PATH,
     STATUSLINE_CACHE_PATH,
 )
 from .daemon.lock import FileLock
@@ -226,7 +227,17 @@ def discard_suggestion(sid: str) -> dict[str, Any] | None:
 
 
 def report_recall(params: dict[str, Any]) -> None:
-    """fire-and-forget：daemon 不可达静默；hook 调用永不阻塞。"""
+    """fire-and-forget recall report.
+
+    The daemon is still the primary path, but hooks also write a tiny disk
+    fallback so Stop hooks can show a user-visible recall notice even when the
+    background daemon is not running.
+    """
+    _write_pending_recall_fallback(params)
+    try:
+        ensure_or_spawn(max_wait_ms=80)
+    except Exception:
+        pass
     safe_call("report_recall", params)
 
 
@@ -258,8 +269,62 @@ def consume_pending_recall(
     r = safe_call(
         "consume_pending_recall", {"session_id": session_id, "dedupe": dedupe}
     )
-    return r if isinstance(r, dict) else None
+    if isinstance(r, dict):
+        _consume_pending_recall_fallback(session_id)
+        return r
+    return _consume_pending_recall_fallback(session_id)
 
 
 def shutdown() -> dict[str, Any] | None:
     return safe_call("shutdown")
+
+
+def _write_pending_recall_fallback(params: dict[str, Any]) -> None:
+    session_id = str(params.get("session_id") or "")
+    if not session_id:
+        return
+    record = {
+        "ts": int(params.get("ts") or time.time()),
+        "session_id": session_id,
+        "project_id": str(params.get("project_id") or ""),
+        "scope": str(params.get("scope") or ""),
+        "items": list(params.get("items") or []),
+        "via_patterns": list(params.get("via_patterns") or []),
+        "via_keywords": list(params.get("via_keywords") or []),
+        "prompt_head": str(params.get("prompt_head") or "")[:60],
+        "injected_chars": int(params.get("injected_chars") or 0),
+    }
+    try:
+        path = PENDING_RECALLS_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            data = json.loads(path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data[session_id] = record
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False))
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def _consume_pending_recall_fallback(session_id: str) -> dict[str, Any] | None:
+    if not session_id:
+        return None
+    try:
+        path = PENDING_RECALLS_PATH
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            return None
+        record = data.pop(session_id, None)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False))
+        tmp.replace(path)
+        return record if isinstance(record, dict) else None
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    except Exception:
+        return None

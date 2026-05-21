@@ -930,6 +930,42 @@ def test_daemon_h_consume_pending_recall_via_rpc(tmp_path, monkeypatch) -> None:
     assert out_again is None
 
 
+def test_daemon_client_recall_fallback_when_daemon_unavailable(tmp_path, monkeypatch) -> None:
+    from limem import daemon_client
+
+    pending_path = tmp_path / "pending_recalls.json"
+    monkeypatch.setattr(daemon_client, "PENDING_RECALLS_PATH", pending_path)
+    monkeypatch.setattr(daemon_client, "ensure_or_spawn", lambda **__: False)
+    monkeypatch.setattr(daemon_client, "safe_call", lambda *_, **__: None)
+
+    payload = {
+        "ts": 1700000000,
+        "session_id": "sess-fallback",
+        "project_id": "proj",
+        "scope": "global",
+        "items": [
+            {
+                "short_id": "aaaa11112222",
+                "event_id": "e1",
+                "src": "hard",
+                "mem_type": "rule",
+                "scope": "global",
+                "summary_head": "提交前更新版本号",
+            }
+        ],
+        "via_patterns": [],
+        "via_keywords": ["提交"],
+        "prompt_head": "提交前检查",
+        "injected_chars": 100,
+    }
+    daemon_client.report_recall(payload)
+
+    record = daemon_client.consume_pending_recall("sess-fallback")
+    assert record is not None
+    assert record["items"][0]["summary_head"] == "提交前更新版本号"
+    assert daemon_client.consume_pending_recall("sess-fallback") is None
+
+
 def test_format_stop_recall_systemmessage_with_short_ids() -> None:
     from limem import hooks as hmod
 

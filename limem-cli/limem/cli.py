@@ -34,6 +34,25 @@ from .config import DEFAULT_BASE_URL, USER_CREDENTIALS_PATH, Credentials
 console = Console()
 
 
+def _daemon_health(*, spawn: bool = False) -> dict[str, object]:
+    from . import daemon_client as dc
+    from .config import LIMEMD_PID_PATH
+    from .daemon.lock import read_pid
+
+    if spawn:
+        try:
+            dc.ensure_or_spawn(max_wait_ms=300)
+        except Exception:
+            pass
+    pid = read_pid(LIMEMD_PID_PATH)
+    info = dc.get_status()
+    return {
+        "running": bool(info),
+        "pid": pid,
+        "status": info or {},
+    }
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__)
 def main() -> None:
@@ -45,7 +64,7 @@ def main() -> None:
 
 @main.command()
 def ping() -> None:
-    """ping LiMem 后端，验证 key 与 db_id 可用。"""
+    """ping LiMem 后端，并检查本地 daemon 健康。"""
     creds = Credentials.load()
     if not creds.api_key:
         console.print(
@@ -69,6 +88,15 @@ def ping() -> None:
     except LimemError as e:
         console.print(f"[red]LiMem error {e.status}[/red]: {e.message}")
         sys.exit(1)
+    daemon = _daemon_health(spawn=True)
+    pid = daemon.get("pid") or "(none)"
+    if daemon.get("running"):
+        console.print(f"[green]limemd ok[/green]: pid={pid}")
+    else:
+        console.print(
+            f"[yellow]limemd not running[/yellow]: pid={pid}; "
+            "recall notices and passive learning are degraded. Run `limem daemon start`."
+        )
 
 
 @main.command()
@@ -535,7 +563,7 @@ def init(project: bool, project_id: str, targets: str, no_hooks: bool, no_mcp: b
 
 @main.command()
 def stats() -> None:
-    """本地 SQLite 缓存统计 + 后端 stats（若可达）。"""
+    """本地 SQLite 缓存统计 + daemon/backend stats（若可达）。"""
     from .entity_index import EntityIndex
     idx = EntityIndex()
     s = idx.stats()
@@ -543,6 +571,18 @@ def stats() -> None:
     t.add_row("[bold]local[/bold]", "")
     for k, v in s.items():
         t.add_row(f"  {k}", str(v))
+
+    daemon = _daemon_health(spawn=False)
+    t.add_row("[bold]daemon[/bold]", "")
+    t.add_row("  running", "yes" if daemon.get("running") else "no")
+    t.add_row("  pid", str(daemon.get("pid") or "(none)"))
+    status = daemon.get("status")
+    if isinstance(status, dict) and status:
+        t.add_row("  connectivity", str((status.get("connectivity") or {}).get("state", "unknown")))
+        t.add_row("  hit_count", str(status.get("hit_count", 0)))
+        t.add_row("  suggestion_count", str(status.get("suggestion_count", 0)))
+    else:
+        t.add_row("  hint", "run `limem daemon start`")
 
     creds = Credentials.load()
     if creds.api_key and creds.db_id:

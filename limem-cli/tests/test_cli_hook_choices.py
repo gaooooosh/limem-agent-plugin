@@ -34,6 +34,78 @@ def test_hook_unknown_event_rejected() -> None:
     assert result.exit_code == 2
 
 
+def test_stats_reports_daemon_health(monkeypatch, tmp_path) -> None:
+    import limem.cli as cli
+    import limem.entity_index as entity_index
+
+    idx = entity_index.EntityIndex(db_path=tmp_path / "patterns.sqlite")
+    monkeypatch.setattr(cli, "EntityIndex", lambda: idx, raising=False)
+    monkeypatch.setattr(
+        cli,
+        "_daemon_health",
+        lambda *, spawn=False: {
+            "running": False,
+            "pid": None,
+            "status": {},
+        },
+    )
+    monkeypatch.setattr(
+        cli.Credentials,
+        "load",
+        lambda: type("Creds", (), {"api_key": "", "db_id": ""})(),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["stats"])
+
+    assert result.exit_code == 0, result.output
+    assert "daemon" in result.output
+    assert "running" in result.output
+    assert "no" in result.output
+    assert "limem daemon start" in result.output
+
+
+def test_ping_reports_daemon_health(monkeypatch) -> None:
+    import limem.cli as cli
+
+    class _Client:
+        def __init__(self, creds):
+            self.creds = creds
+
+        def me(self):
+            return {"user_id": "u"}
+
+        def db_health(self):
+            return {"status": "ok"}
+
+        def list_databases(self):
+            return []
+
+    monkeypatch.setattr(cli, "LimemClient", _Client)
+    monkeypatch.setattr(
+        cli.Credentials,
+        "load",
+        lambda: type("Creds", (), {"api_key": "k", "db_id": "db"})(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_daemon_health",
+        lambda *, spawn=False: {
+            "running": False,
+            "pid": None,
+            "status": {},
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["ping"])
+
+    assert result.exit_code == 0, result.output
+    assert "/db/db/health ok" in result.output
+    assert "limemd not running" in result.output
+    assert "limem daemon start" in result.output
+
+
 def test_init_project_id_option_is_accepted(monkeypatch, tmp_path) -> None:
     """首次 project init 可显式写入稳定 project_id，重复 init 不覆盖旧值。"""
     import json

@@ -35,6 +35,7 @@ DEGRADED_SEEN_PATH = USER_CACHE_DIR / "degraded_seen.json"
 SESSION_MUTE_PATH = USER_CACHE_DIR / "session_mute.json"
 # 最近召回环形缓冲落盘（daemon 5s 原子写；daemon 重启 / 用户工具 fallback 读）
 RECENT_RECALLS_PATH = USER_CACHE_DIR / "recent_recalls.json"
+PENDING_RECALLS_PATH = USER_CACHE_DIR / "pending_recalls.json"
 
 PROJECT_CONFIG_FILENAME = ".limem/local.json"
 
