@@ -349,23 +349,6 @@ def register_principal(
 _ENSURE_MARKER_DIR = Path("~/.cache/limem/principals_ensured").expanduser()
 
 
-def _user_id_from_me_payload(payload: object) -> str:
-    """Best-effort extract current user id from /me response variants."""
-    if not isinstance(payload, dict):
-        return ""
-    for key in ("user_id", "uid", "id", "sub"):
-        val = payload.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    user = payload.get("user")
-    if isinstance(user, dict):
-        for key in ("user_id", "uid", "id", "sub"):
-            val = user.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-    return ""
-
-
 def ensure_current_user_principal(
     creds: Credentials | None,
     *,
@@ -383,13 +366,14 @@ def ensure_current_user_principal(
         return ""
 
     from .client import LimemClient as _LimemClient
+    from .identity import resolve_current_user_id
 
     user_id = (creds.user_id or "").strip()
     if not user_id and creds.api_key:
         if client is None:
             client = _LimemClient(creds=creds, timeout=2.0)
         try:
-            user_id = _user_id_from_me_payload(client.me())
+            user_id = resolve_current_user_id(client)
         except Exception:
             user_id = ""
         if user_id:
@@ -454,11 +438,22 @@ def ensure_default_principals(
     粗粒度去重；hook 多次触发也只重试本地缺失的项。后端失败永远 swallow。
     """
     out: list[str] = []
+
+    if include_user:
+        user_eid = ensure_current_user_principal(
+            creds,
+            idx=idx,
+            client=client,
+            force=force,
+        )
+        if user_eid:
+            out.append(user_eid)
+
     specs = default_principals(
         creds,
         project_id,
         tool,
-        include_user=include_user,
+        include_user=False,
         include_agent=include_agent,
         include_project=include_project,
     )

@@ -24,16 +24,26 @@ class _FakeClient:
     def __init__(
         self,
         *,
+        me_resp=None,
+        me_exc: Exception | None = None,
         list_resp=None,
         list_exc: Exception | None = None,
         create_resp=None,
         create_exc: Exception | None = None,
     ):
+        self.me_resp = me_resp if me_resp is not None else {}
+        self.me_exc = me_exc
         self.list_resp = list_resp if list_resp is not None else []
         self.list_exc = list_exc
         self.create_resp = create_resp
         self.create_exc = create_exc
         self.calls: list[tuple[str, dict]] = []
+
+    def me(self):
+        self.calls.append(("me", {}))
+        if self.me_exc:
+            raise self.me_exc
+        return self.me_resp
 
     def list_databases(self):
         self.calls.append(("list_databases", {}))
@@ -80,8 +90,8 @@ def test_zero_db_auto_creates(patch_client):
     assert r.db_action == "created"
     assert r.api_key == "user_token_abc"
     # 顺序：先 list 探活，再 create
-    assert [c[0] for c in fake.calls] == ["list_databases", "create_database"]
-    assert fake.calls[1][1]["display_name"] == "claude-code-personal"
+    assert [c[0] for c in fake.calls] == ["list_databases", "me", "create_database"]
+    assert fake.calls[2][1]["display_name"] == "claude-code-personal"
 
 
 def test_single_db_reused_silently(patch_client):
@@ -95,7 +105,7 @@ def test_single_db_reused_silently(patch_client):
     assert r.db_id == "db_only"
     assert r.db_action == "reused"
     # 关键：不该再调 create
-    assert [c[0] for c in fake.calls] == ["list_databases"]
+    assert [c[0] for c in fake.calls] == ["list_databases", "me"]
 
 
 def test_multi_db_without_picker_raises(patch_client):
@@ -175,6 +185,24 @@ def test_list_response_as_dict_with_databases_key(patch_client):
     assert r.db_id == "db_x"
     assert r.user_id == "u_42"
     assert r.db_action == "reused"
+    assert [c[0] for c in fake.calls] == ["list_databases"]
+
+
+def test_list_response_owner_user_id_fills_user_id_when_me_missing(patch_client):
+    """后端 /databases 若只在列表项提供 owner_user_id，也要持久化 user identity。"""
+    fake = patch_client(_FakeClient(
+        me_resp={},
+        list_resp=[
+            {
+                "db_id": "db_x",
+                "display_name": "x",
+                "owner_user_id": "owner_42",
+            }
+        ],
+    ))
+    r = bootstrap_user_session(base_url="https://x", api_key="tok")
+    assert r.db_id == "db_x"
+    assert r.user_id == "owner_42"
     assert [c[0] for c in fake.calls] == ["list_databases"]
 
 

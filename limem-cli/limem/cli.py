@@ -722,8 +722,27 @@ def entity() -> None:
 @click.option("--type", "principal_types", multiple=True, help="按类型过滤")
 def entity_list_cmd(show_all: bool, principal_types: tuple[str, ...]) -> None:
     from .entity_index import EntityIndex
+    from .principals import ensure_default_principals
+    from .scope import detect_project_id
 
     idx = EntityIndex()
+    creds = Credentials.load()
+    ensured_user = ""
+    if creds.api_key and creds.db_id:
+        try:
+            eids = ensure_default_principals(
+                creds,
+                project_id=detect_project_id(),
+                tool="",
+                idx=idx,
+                client=LimemClient(creds=creds, timeout=2.0),
+                include_user=True,
+                include_agent=False,
+                include_project=True,
+            )
+            ensured_user = next((eid for eid in eids if eid.startswith("principal_user_")), "")
+        except Exception:
+            ensured_user = ""
     rows = idx.list_principals(
         active_only=not show_all,
         principal_types=list(principal_types) or None,
@@ -746,6 +765,8 @@ def entity_list_cmd(show_all: bool, principal_types: tuple[str, ...]) -> None:
             "✓" if r.active else "·",
         )
     console.print(t)
+    if ensured_user:
+        console.print(f"[green]principal user ensured → {ensured_user}[/green]")
 
 
 @entity.command("register")

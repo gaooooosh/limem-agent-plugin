@@ -12,6 +12,7 @@ from typing import Any
 
 from .client import LimemClient, LimemError
 from .config import Credentials
+from .identity import resolve_current_user_id, user_id_from_payload
 
 
 @dataclass
@@ -64,10 +65,8 @@ def _db_name_of(db: dict[str, Any]) -> str:
 
 
 def _user_id_of_listing(resp: Any) -> str:
-    """``list_databases()`` 响应顶层若含 ``user_id`` 则提取，否则空。"""
-    if isinstance(resp, dict):
-        return resp.get("user_id") or resp.get("uid") or ""
-    return ""
+    """Best-effort current-user id from ``list_databases()`` response."""
+    return user_id_from_payload(resp)
 
 
 # ---------- 主流程 ----------
@@ -102,7 +101,7 @@ def bootstrap_user_session(
     # 拉库列表（兼任 token 有效性探针：无效 key 后端返回 401/403）
     resp = client.list_databases()
     dbs = _normalize_db_listing(resp)
-    user_id = _user_id_of_listing(resp)
+    user_id = resolve_current_user_id(client, database_listing=resp)
 
     # 显式指定 select_db_id：必须在已有 db 列表内
     if select_db_id:

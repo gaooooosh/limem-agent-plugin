@@ -172,6 +172,21 @@ def remember_impl(
 
     canonicals = [e["canonical"] for e in entities or [] if e.get("canonical")]
 
+    client = LimemClient(creds=creds)
+    try:
+        ensure_default_principals(
+            creds,
+            project_id=project_id,
+            tool="",  # writer 不知 tool；hook 已在 SessionStart 注册主 observer agent
+            idx=idx,
+            client=client,
+            include_user=True,
+            include_agent=False,
+            include_project=True,
+        )
+    except Exception:
+        pass
+
     # principal 语义：记忆是主 Agent 对用户数据的观测。
     # writer/daemon 路径不知道可靠的顶层 agent tool，因此只 ensure user/project，不凭空
     # 注册 agent；hook 层负责注册主 observer agent。这里从 active agent 中择一作为
@@ -206,21 +221,6 @@ def remember_impl(
         if eid and eid not in seen_principals:
             seen_principals.add(eid)
             principal_ids.append(eid)
-
-    try:
-        client = LimemClient(creds=creds)
-        ensure_default_principals(
-            creds,
-            project_id=project_id,
-            tool="",  # writer 不知 tool；hook 已在 SessionStart 注册主 observer agent
-            idx=idx,
-            client=client,
-            include_user=True,
-            include_agent=False,
-            include_project=True,
-        )
-    except Exception:
-        client = LimemClient(creds=creds)
 
     tag_block = encode_tags(
         scope=scope,

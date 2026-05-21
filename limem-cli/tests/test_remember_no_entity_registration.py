@@ -31,6 +31,9 @@ class _FakeClient:
             summary=(data.get("text") or "")[:100],
         )
 
+    def me(self):
+        return {"user_id": self.creds_user_id}
+
     def entity_create_or_promote(self, *args, **kwargs):  # noqa: ARG002
         self.entity_create_calls.append({"args": args, "kwargs": kwargs})
         raise AssertionError("v3: remember_impl 不应注册后端 entity")
@@ -144,6 +147,35 @@ def test_remember_ingest_detail_is_natural_context(monkeypatch, tmp_path) -> Non
     assert "工具来源是 codex:test" in detail
     assert "会话是 sess_1" in detail
     assert "具体发生的内容是：用户明确要求 Docker 优先。" in detail
+
+
+def test_global_remember_subject_includes_resolved_user_principal(monkeypatch, tmp_path) -> None:
+    fake = _FakeClient(user_id="u_from_me")
+    _patch(monkeypatch, fake)
+    idx = EntityIndex(db_path=tmp_path / "patterns.sqlite")
+
+    class CredsWithoutUser:
+        api_key = "k"
+        db_id = "db_1"
+        user_id = ""
+
+        def save(self):
+            pass
+
+    creds = CredsWithoutUser()
+    out = remember_impl(
+        text="Always prefer concise summaries.",
+        scope="global",
+        mem_type="preference",
+        importance=0.8,
+        creds=creds,
+        idx=idx,
+        skip_redact=True,
+    )
+
+    assert creds.user_id == "u_from_me"
+    assert any(p.startswith("principal_user_") for p in out["subject_principal_ids"])
+    assert out["subject_principal_ids"] == out["principal_ids"]
 
 
 def test_ten_consecutive_remembers_do_not_inflate_entities(monkeypatch, tmp_path) -> None:
