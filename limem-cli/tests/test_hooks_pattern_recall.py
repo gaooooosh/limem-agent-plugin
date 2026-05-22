@@ -297,7 +297,7 @@ def test_user_prompt_submit_uses_task_recall_not_query(monkeypatch, tmp_path, ca
     assert "UserPromptSubmit" in visible_notice
 
 
-def test_user_prompt_submit_auto_recall_skips_seen_items_but_keeps_task_recall(
+def test_user_prompt_submit_auto_recall_keeps_seen_hard_items_and_task_recall(
     monkeypatch, tmp_path, capsys
 ) -> None:
     from limem import hooks as hmod
@@ -377,12 +377,12 @@ def test_user_prompt_submit_auto_recall_skips_seen_items_but_keeps_task_recall(
     out = json.loads(capsys.readouterr().out)
     context = out["hookSpecificOutput"]["additionalContext"]
     assert "新的相关规则" in context
-    assert "已召回过的规则" not in context
+    assert "已召回过的规则" in context
     assert "task recall 仍自动召回" in context
     assert out["systemMessage"].startswith("📚 LiMem · UserPromptSubmit ")
-    assert "本次引用 2 条记忆" in out["systemMessage"]
+    assert "本次引用 3 条记忆" in out["systemMessage"]
     memory_context, visible_notice = context.split("<limem_visible_notice>", 1)
     assert "UserPromptSubmit" not in memory_context
     assert "UserPromptSubmit" in visible_notice
     assert len(reports) == 1
-    assert [item["src"] for item in reports[0]["items"]] == ["hard", "task"]
+    assert [item["src"] for item in reports[0]["items"]] == ["hard", "hard", "task"]

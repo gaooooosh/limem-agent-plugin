@@ -673,8 +673,8 @@ def test_hook_report_recall_safe_swallows_daemon_exception(monkeypatch) -> None:
     )
 
 
-def test_hook_filter_seen_recall_items_drops_session_repeats(monkeypatch) -> None:
-    """UserPromptSubmit keeps automatic recall on, but skips memories already injected."""
+def test_hook_filter_seen_recall_items_keeps_hard_but_drops_seen_patterns(monkeypatch) -> None:
+    """Hard rules remain citable each turn; session de-dupe only drops repeat context."""
     from limem import hooks as hmod
 
     monkeypatch.setattr(
@@ -696,7 +696,8 @@ def test_hook_filter_seen_recall_items_drops_session_repeats(monkeypatch) -> Non
     ]
 
     out = hmod._filter_seen_recall_items(items, session_id="sess-1")
-    assert [it.event_id for it in out] == ["e_new"]
+    assert [it.event_id for it in out] == ["e_seen", "e_new"]
+    assert all(it.kind == "hard" for it in out)
 
 
 def test_hook_filter_seen_task_recall_drops_same_backend_text(monkeypatch) -> None:

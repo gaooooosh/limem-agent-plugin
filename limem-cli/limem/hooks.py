@@ -362,8 +362,10 @@ def _filter_seen_recall_items(
 ) -> list[InjectItem]:
     """Drop memories already injected earlier in this session.
 
-    The hook still performs automatic recall every turn; this only prevents the
-    same event/pattern slice from being re-injected repeatedly.
+    Hard rules/feedback/preferences are intentionally not filtered. They are the
+    durable instructions users expect to be re-applied and visibly cited on any
+    relevant turn. Session de-dupe only suppresses lower-signal repeats such as
+    pattern slices or other non-hard recall items.
     """
     if not session_id or not items:
         return items
@@ -376,6 +378,9 @@ def _filter_seen_recall_items(
     out: list[InjectItem] = []
     local_seen: set[str] = set()
     for item in items:
+        if item.kind == "hard":
+            out.append(item)
+            continue
         key = _inject_item_key(item)
         if key and (key in seen or key in local_seen):
             continue
