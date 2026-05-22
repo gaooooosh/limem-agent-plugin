@@ -16,6 +16,8 @@ v3 设计要点（principal-centric）：
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -26,6 +28,10 @@ from ..entity_index import EntityIndex
 from ..principals import ensure_default_principals, normalize_project_deictics
 from ..redact import contains_secret
 from ..tag_text import encode_tags
+
+_WRITE_LEDGER_WAIT_SECONDS = 2.0
+_WRITE_LEDGER_POLL_SECONDS = 0.05
+_WRITE_LEDGER_STALE_SECONDS = 600
 
 
 def build_natural_detail(
@@ -62,6 +68,67 @@ def build_natural_detail(
 
     body = f"具体发生的内容是：{content}" if content else "具体发生的内容暂未提供。"
     return f"现在的情况是：{'，'.join(context_parts)}。这是一条 {type_desc} 类型的 LiMem 记忆。{body}"
+
+
+def memory_write_key(
+    *,
+    text: str,
+    scope: str,
+    mem_type: str,
+    project_id: str,
+) -> str:
+    """Stable client-side identity for one long-term memory write.
+
+    Deliberately excludes source/session/principal_ids/importance. Those fields
+    vary by frontend path and caused duplicate ingests for the same memory.
+    """
+    payload = {
+        "version": 1,
+        "scope": (scope or "").strip(),
+        "mem_type": (mem_type or "rule").strip(),
+        "project_id": (project_id or "").strip(),
+        "text": " ".join((text or "").split()),
+    }
+    body = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "mw_" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:32]
+
+
+def _remember_result_from_committed(
+    record: Any,
+    *,
+    fallback_scope: str,
+    fallback_summary: str,
+    fallback_principal_ids: list[str] | None = None,
+    fallback_canonicals: list[str] | None = None,
+) -> dict[str, Any]:
+    raw = record.raw_metadata or {}
+    return {
+        "event_id": record.event_id,
+        "scope": record.scope or fallback_scope,
+        "summary": record.summary or fallback_summary,
+        "principal_ids": list(raw.get("principal_ids") or fallback_principal_ids or []),
+        "observer_principal_id": raw.get("observer_principal_id", ""),
+        "subject_principal_ids": list(raw.get("subject_principal_ids") or []),
+        "canonicals": list(raw.get("canonicals") or fallback_canonicals or []),
+        "entities_registered": [],
+        "patterns_indexed": len(raw.get("principal_ids") or fallback_principal_ids or []),
+        "deduped": True,
+        "write_key": record.write_key,
+    }
+
+
+def _wait_for_committed_memory_write(idx: EntityIndex, write_key: str) -> Any | None:
+    deadline = time.time() + _WRITE_LEDGER_WAIT_SECONDS
+    while time.time() < deadline:
+        record = idx.lookup_memory_write(write_key)
+        if record is None:
+            return None
+        if record.status == "committed" and record.event_id:
+            return record
+        if record.status == "uncertain":
+            return record
+        time.sleep(_WRITE_LEDGER_POLL_SECONDS)
+    return idx.lookup_memory_write(write_key)
 
 
 def _infer_subject_principal_ids(
@@ -171,6 +238,57 @@ def remember_impl(
                 detail = normalize_project_deictics(detail, project_id=effective_proj_id)
 
     canonicals = [e["canonical"] for e in entities or [] if e.get("canonical")]
+    write_key = memory_write_key(
+        text=text,
+        scope=scope,
+        mem_type=mem_type,
+        project_id=project_id,
+    )
+    ledger_meta: dict[str, Any] = {
+        "canonicals": canonicals,
+        "original_text": text,
+        "source": source,
+    }
+    owns_write, ledger_record = idx.begin_memory_write(
+        write_key=write_key,
+        scope=scope,
+        mem_type=mem_type,
+        project_id=project_id,
+        source=source,
+        raw_metadata=ledger_meta,
+    )
+    if not owns_write:
+        if ledger_record.status == "committed" and ledger_record.event_id:
+            return _remember_result_from_committed(
+                ledger_record,
+                fallback_scope=scope,
+                fallback_summary=text[:200],
+                fallback_canonicals=canonicals,
+            )
+        if ledger_record.status == "pending":
+            waited = _wait_for_committed_memory_write(idx, write_key)
+            if waited and waited.status == "committed" and waited.event_id:
+                return _remember_result_from_committed(
+                    waited,
+                    fallback_scope=scope,
+                    fallback_summary=text[:200],
+                    fallback_canonicals=canonicals,
+                )
+            if (
+                waited
+                and waited.status == "pending"
+                and int(time.time()) - waited.updated_ts > _WRITE_LEDGER_STALE_SECONDS
+            ):
+                idx.mark_memory_write_uncertain(
+                    write_key=write_key,
+                    error="pending memory write is stale",
+                    raw_metadata=waited.raw_metadata,
+                )
+        raise LimemError(
+            0,
+            "memory write already pending or uncertain locally; not issuing duplicate ingest",
+            {"write_key": write_key, "status": ledger_record.status},
+        )
 
     client = LimemClient(creds=creds)
     try:
@@ -250,8 +368,34 @@ def remember_impl(
             timestamp=ts,
         ),
     }
-    ingest_res = client.ingest(data, timestamp=ts)
+    try:
+        ingest_res = client.ingest(data, timestamp=ts)
+    except Exception as e:
+        idx.mark_memory_write_uncertain(
+            write_key=write_key,
+            error=str(e),
+            raw_metadata=ledger_meta,
+        )
+        raise
     event_id = ingest_res.event_id
+    event_meta = {
+        "canonicals": canonicals,
+        "original_text": text,
+        "observer_principal_id": observer_principal_id,
+        "subject_principal_ids": subject_principal_ids,
+        "principal_ids": principal_ids,
+        "mentions": [
+            {
+                "canonical": e.get("canonical"),
+                "role": e.get("role", "neutral"),
+                "aliases": list(e.get("aliases") or []),
+                "description": e.get("description") or "",
+            }
+            for e in entities or []
+            if e.get("canonical")
+        ],
+        "write_key": write_key,
+    }
 
     idx.upsert_event_metadata(
         {
@@ -264,24 +408,14 @@ def remember_impl(
             "source": source,
             "ts": ts,
             "summary": ingest_res.summary or text[:200],
-            "raw_metadata": {
-                "canonicals": canonicals,
-                "original_text": text,
-                "observer_principal_id": observer_principal_id,
-                "subject_principal_ids": subject_principal_ids,
-                "principal_ids": principal_ids,
-                "mentions": [
-                    {
-                        "canonical": e.get("canonical"),
-                        "role": e.get("role", "neutral"),
-                        "aliases": list(e.get("aliases") or []),
-                        "description": e.get("description") or "",
-                    }
-                    for e in entities or []
-                    if e.get("canonical")
-                ],
-            },
+            "raw_metadata": event_meta,
         }
+    )
+    idx.mark_memory_write_committed(
+        write_key=write_key,
+        event_id=event_id,
+        summary=ingest_res.summary or text[:200],
+        raw_metadata=event_meta,
     )
 
     try:
@@ -300,6 +434,8 @@ def remember_impl(
         # 旧字段保留兼容 RPC 调用方；v3 语义已无 entity 注册行为
         "entities_registered": [],
         "patterns_indexed": len(principal_ids),
+        "deduped": False,
+        "write_key": write_key,
     }
 
 

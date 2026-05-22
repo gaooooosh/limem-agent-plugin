@@ -243,6 +243,7 @@ def test_learner_correction_suggestion_has_review_context() -> None:
             "project_id": "github.com/example/repo",
             "scope": "project:github.com/example/repo",
             "prompt": "不要用 npm run dev，应该 docker rebuild",
+            "prev_assistant_head": "我会运行 npm run dev 来验证",
             "session_id": "session-alpha",
             "tool": "codex",
             "evidence_id": "abcdef123456",
@@ -252,6 +253,7 @@ def test_learner_correction_suggestion_has_review_context() -> None:
             "project_id": "github.com/example/repo",
             "scope": "project:github.com/example/repo",
             "prompt": "别用 npm run dev，应该 docker rebuild",
+            "prev_assistant_head": "我准备继续 npm run dev",
             "session_id": "session-alpha",
             "tool": "codex",
             "evidence_id": "abcdef123457",
@@ -265,9 +267,13 @@ def test_learner_correction_suggestion_has_review_context() -> None:
     assert len(out) == 1
     suggestion = out[0]
     assert suggestion["candidate_text"].startswith("在 repo 中")
+    assert "agent 曾表示" in suggestion["candidate_text"]
+    assert "npm run dev" in suggestion["candidate_text"]
     assert "rationale" in suggestion
     assert suggestion["evidence"]
     assert "abcdef123456" in suggestion["evidence"][0]
+    assert "agent=" in suggestion["evidence"][0]
+    assert "user=" in suggestion["evidence"][0]
     # Evidence remains review context, not part of the text that will be remembered.
     assert "abcdef123456" not in suggestion["candidate_text"]
 

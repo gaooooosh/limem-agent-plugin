@@ -14,7 +14,9 @@ v3 重写要点（principal-centric）：
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -59,6 +61,10 @@ from .scope import detect_project_id, project_scope
 _CODEX_SESSION_PROMPT_CHARS = 4000
 _CODEX_SESSION_PACKET_CHARS = 12000
 _CODEX_SESSION_EVIDENCE_LIMIT = 20
+_CODEX_PACKET_CONTEXT_CHARS = 700
+_CODEX_PACKET_USER_CHARS = 1800
+_CODEX_PACKET_ASSISTANT_CHARS = 4200
+_CODEX_PACKET_OTHER_CHARS = 2200
 
 # ---------- 日志 ----------
 
@@ -320,6 +326,53 @@ def _append_codex_user_prompt_observation(
         },
         runtime=runtime,
     )
+
+
+def _append_codex_assistant_response_observation(
+    *,
+    session_id: str,
+    response: str,
+    runtime: RuntimeConfig,
+    source: str,
+) -> bool:
+    safe_response, redacted = _safe_redact(response, runtime.redact_patterns)
+    if not safe_response.strip():
+        return False
+    content_hash = hashlib.sha1(safe_response.encode("utf-8")).hexdigest()[:12]
+    if _codex_session_has_assistant_hash(session_id, content_hash):
+        return False
+    _append_codex_session_observation(
+        session_id=session_id,
+        kind="assistant_response",
+        payload={
+            "role": "assistant",
+            "content": safe_response,
+            "source": source,
+            "content_hash": content_hash,
+            "redacted": redacted,
+        },
+        runtime=runtime,
+    )
+    return True
+
+
+def _codex_session_has_assistant_hash(session_id: str, content_hash: str) -> bool:
+    if not session_id or not content_hash:
+        return False
+    try:
+        p = _codex_session_buffer_path(session_id)
+        for line in p.read_text().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("kind") != "assistant_response":
+                continue
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if payload.get("content_hash") == content_hash:
+                return True
+    except Exception:
+        return False
+    return False
 
 
 def _via_keywords(prompt: str, *, limit: int = 2) -> list[str]:
@@ -1062,6 +1115,18 @@ def _hook_stop_codex(
     tool: str, payload: dict[str, Any], creds: Credentials, runtime: RuntimeConfig
 ) -> None:
     sid = payload.get("session_id") or payload.get("sessionId") or "unknown"
+    assistant_response = _assistant_response_from_payload(payload)
+    assistant_source = "stop_payload"
+    if not assistant_response and sid != "unknown":
+        assistant_response = _read_codex_last_assistant_response(sid, runtime)
+        assistant_source = "codex_rollout"
+    if assistant_response:
+        _append_codex_assistant_response_observation(
+            session_id=sid,
+            response=assistant_response,
+            runtime=runtime,
+            source=assistant_source,
+        )
     _append_codex_session_observation(
         session_id=sid,
         kind="stop",
@@ -1098,8 +1163,145 @@ def _hook_stop_codex(
             _log("stop_flush_error", tool, msg=str(e), buffer=str(p))
 
 
+def _assistant_response_from_payload(payload: dict[str, Any]) -> str:
+    for key in (
+        "assistant_response",
+        "assistantResponse",
+        "response",
+        "message",
+        "content",
+        "text",
+    ):
+        value = payload.get(key)
+        text = _extract_text_from_unknown(value)
+        if text:
+            return text
+    return ""
+
+
+def _read_codex_last_assistant_response(session_id: str, runtime: RuntimeConfig) -> str:
+    try:
+        path = _find_codex_rollout_path(session_id)
+        if not path:
+            return ""
+        return _read_last_assistant_from_codex_rollout(path, runtime)
+    except Exception as e:  # noqa: BLE001
+        _log("codex_assistant_capture_failed", "codex", session_id=session_id, err=str(e)[:120])
+        return ""
+
+
+def _find_codex_rollout_path(session_id: str) -> Path | None:
+    if not session_id:
+        return None
+    base = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+    candidates = list((base / "sessions").glob(f"**/rollout-*{session_id}.jsonl"))
+    if not candidates:
+        candidates = list((base / "archived_sessions").glob(f"rollout-*{session_id}.jsonl"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    return candidates[0]
+
+
+def _read_last_assistant_from_codex_rollout(path: Path, runtime: RuntimeConfig) -> str:
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return ""
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        text = _assistant_text_from_codex_rollout_row(row)
+        if not text:
+            continue
+        safe, _redacted = _safe_redact(text, runtime.redact_patterns)
+        return safe
+    return ""
+
+
+def _assistant_text_from_codex_rollout_row(row: dict[str, Any]) -> str:
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    typ = row.get("type") or payload.get("type") or ""
+    if typ == "event_msg" and payload.get("type") == "agent_message":
+        return _extract_text_from_unknown(payload.get("message"))
+    if typ == "response_item":
+        if payload.get("role") == "assistant":
+            return _extract_text_from_unknown(payload.get("content"))
+        if payload.get("type") == "message" and payload.get("role") == "assistant":
+            return _extract_text_from_unknown(payload.get("content"))
+    return ""
+
+
+def _extract_text_from_unknown(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key in ("text", "message", "content", "output_text"):
+            text = _extract_text_from_unknown(value.get(key))
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+    if isinstance(value, list):
+        parts = [_extract_text_from_unknown(v) for v in value]
+        return "\n".join(part for part in parts if part).strip()
+    return ""
+
+
 def _markdown_escape(text: str) -> str:
     return (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _neutral_pack_text(text: str, budget: int) -> tuple[str, dict[str, Any]]:
+    body = _markdown_escape(text)
+    if budget <= 0:
+        return "", {
+            "truncated": bool(body),
+            "original_chars": len(body),
+            "kept_head_chars": 0,
+            "kept_tail_chars": 0,
+        }
+    if len(body) <= budget:
+        return body, {
+            "truncated": False,
+            "original_chars": len(body),
+            "kept_head_chars": len(body),
+            "kept_tail_chars": 0,
+        }
+    head_budget = budget // 2
+    tail_budget = budget - head_budget
+    packed = (
+        body[:head_budget].rstrip()
+        + "\n\n[... neutral truncation: middle omitted ...]\n\n"
+        + body[-tail_budget:].lstrip()
+    )
+    return packed, {
+        "truncated": True,
+        "original_chars": len(body),
+        "kept_head_chars": head_budget,
+        "kept_tail_chars": tail_budget,
+    }
+
+
+def _packet_budget_for_kind(kind: str) -> int:
+    if kind == "user_prompt":
+        return _CODEX_PACKET_USER_CHARS
+    if kind == "assistant_response":
+        return _CODEX_PACKET_ASSISTANT_CHARS
+    return _CODEX_PACKET_OTHER_CHARS
+
+
+def _event_raw_ref(ev: dict[str, Any], kind: str, ordinal: int) -> str:
+    payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+    ref = str(payload.get("content_hash") or payload.get("raw_ref") or "")
+    if ref:
+        return f"{kind}:{ref}"
+    ts = str(ev.get("ts") or "unknown")
+    return f"{kind}:{ordinal}:{ts}"
 
 
 def _build_codex_evidence_packet(
@@ -1109,15 +1311,18 @@ def _build_codex_evidence_packet(
     tool: str,
     source: str,
 ) -> str:
-    lines = [
-        "# Agent Observation Packet",
-        "",
-        "## Context",
-    ]
+    lines = ["# Agent Observation Packet", "", "## Context"]
+    truncations: list[dict[str, Any]] = []
+    raw_refs: list[str] = []
     if project_id:
         lines.append(f"- Project: {project_id}")
     lines.append(f"- Tool: {tool}")
     lines.append(f"- Source: {source}")
+    lines.append("- Packing: neutral head/tail budget; no semantic summary")
+    context_text, context_meta = _neutral_pack_text("\n".join(lines), _CODEX_PACKET_CONTEXT_CHARS)
+    lines = context_text.splitlines()
+    if context_meta["truncated"]:
+        truncations.append({"ref": "context", **context_meta})
     lines.extend(["", "## Evidence Timeline"])
 
     evidence_count = 0
@@ -1125,24 +1330,54 @@ def _build_codex_evidence_packet(
         kind = ev.get("kind") or "event"
         payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
         if kind == "user_prompt":
-            content = _markdown_escape(str(payload.get("content") or ""))
+            content, meta = _neutral_pack_text(
+                str(payload.get("content") or ""), _packet_budget_for_kind(kind)
+            )
             if not content:
                 continue
             evidence_count += 1
+            ref = _event_raw_ref(ev, kind, evidence_count)
+            raw_refs.append(ref)
+            if meta["truncated"]:
+                truncations.append({"ref": ref, **meta})
             lines.extend(
                 [
                     "",
                     f"### {evidence_count}. User Message",
+                    f"Ref: {ref}",
+                    "",
+                    content,
+                ]
+            )
+        elif kind == "assistant_response":
+            content, meta = _neutral_pack_text(
+                str(payload.get("content") or ""), _packet_budget_for_kind(kind)
+            )
+            if not content:
+                continue
+            evidence_count += 1
+            ref = _event_raw_ref(ev, kind, evidence_count)
+            raw_refs.append(ref)
+            if meta["truncated"]:
+                truncations.append({"ref": ref, **meta})
+            lines.extend(
+                [
+                    "",
+                    f"### {evidence_count}. Assistant Response",
+                    f"Ref: {ref}",
                     "",
                     content,
                 ]
             )
         elif kind == "stop":
             evidence_count += 1
+            ref = _event_raw_ref(ev, kind, evidence_count)
+            raw_refs.append(ref)
             lines.extend(
                 [
                     "",
                     f"### {evidence_count}. Stop Hook",
+                    f"Ref: {ref}",
                     "",
                     "Codex emitted a Stop hook for this session.",
                 ]
@@ -1152,6 +1387,21 @@ def _build_codex_evidence_packet(
 
     if evidence_count == 0:
         lines.extend(["", "No conversation evidence was captured before this stop event."])
+    lines.extend(["", "## Truncation"])
+    if truncations:
+        lines.append(
+            "Some evidence was neutrally truncated by fixed budget. If evidence is insufficient, return no-memory."
+        )
+        for item in truncations:
+            lines.append(
+                "- {ref}: original={original_chars}, kept_head={kept_head_chars}, "
+                "kept_tail={kept_tail_chars}".format(**item)
+            )
+    else:
+        lines.append("None")
+    if raw_refs:
+        lines.extend(["", "## Raw References"])
+        lines.extend(f"- {ref}" for ref in raw_refs[:_CODEX_SESSION_EVIDENCE_LIMIT])
 
     packet = "\n".join(lines).strip()
     if len(packet) > _CODEX_SESSION_PACKET_CHARS:
@@ -1193,6 +1443,9 @@ def _flush_codex_session(buf: Path, creds: Credentials, tool: str) -> None:
             "turn_count": len(events),
             "first_event_ts": events[0].get("ts"),
             "last_event_ts": events[-1].get("ts"),
+            "packet_format": "turn_observation_neutral_pack_v1",
+            "packet_budget_chars": _CODEX_SESSION_PACKET_CHARS,
+            "evidence_limit": _CODEX_SESSION_EVIDENCE_LIMIT,
         },
     }
     try:

@@ -32,7 +32,8 @@ from .config import PATTERNS_DB_PATH
 # v1：trigger 短语 FTS（已下线）
 # v2：mention 粒度 entities + entities_fts（已下线）
 # v3：principals 承载 pattern markdown；mention 仅作为 event tag
-SCHEMA_VERSION = 3
+# v4：增加本地 memory_write_ledger，约束客户端长期记忆写入幂等
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS _schema_meta (
@@ -82,6 +83,22 @@ CREATE TABLE IF NOT EXISTS short_id_map (
   created_ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_short_id_event ON short_id_map(event_id);
+
+CREATE TABLE IF NOT EXISTS memory_write_ledger (
+  write_key    TEXT PRIMARY KEY,
+  status       TEXT NOT NULL,
+  event_id     TEXT,
+  summary      TEXT,
+  scope        TEXT,
+  mem_type     TEXT,
+  project_id   TEXT,
+  source       TEXT,
+  created_ts   INTEGER NOT NULL,
+  updated_ts   INTEGER NOT NULL,
+  raw_metadata TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memory_write_status ON memory_write_ledger(status);
+CREATE INDEX IF NOT EXISTS idx_memory_write_event ON memory_write_ledger(event_id);
 """
 
 
@@ -116,6 +133,21 @@ class EventMetadata:
     source: str
     ts: int
     summary: str
+    raw_metadata: dict[str, Any]
+
+
+@dataclass
+class MemoryWriteRecord:
+    write_key: str
+    status: str
+    event_id: str
+    summary: str
+    scope: str
+    mem_type: str
+    project_id: str
+    source: str
+    created_ts: int
+    updated_ts: int
     raw_metadata: dict[str, Any]
 
 
@@ -447,6 +479,99 @@ class EntityIndex:
             ).fetchone()
         return row["event_id"] if row else None
 
+    # ---------- memory write ledger ----------
+
+    def begin_memory_write(
+        self,
+        *,
+        write_key: str,
+        scope: str,
+        mem_type: str,
+        project_id: str,
+        source: str,
+        raw_metadata: dict[str, Any] | None = None,
+    ) -> tuple[bool, MemoryWriteRecord]:
+        """Atomically reserve a long-term-memory write key.
+
+        Returns ``(True, record)`` only for the process that inserted the
+        pending row. Existing rows mean another local path already owns or has
+        completed this write.
+        """
+        now = int(time.time())
+        meta_json = json.dumps(raw_metadata or {}, ensure_ascii=False)
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO memory_write_ledger
+                  (write_key, status, event_id, summary, scope, mem_type,
+                   project_id, source, created_ts, updated_ts, raw_metadata)
+                VALUES (?, 'pending', '', '', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (write_key, scope, mem_type, project_id, source, now, now, meta_json),
+            )
+            row = conn.execute(
+                "SELECT * FROM memory_write_ledger WHERE write_key=?", (write_key,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError(f"failed to reserve memory write key: {write_key}")
+        return cur.rowcount == 1, _row_to_memory_write(row)
+
+    def lookup_memory_write(self, write_key: str) -> MemoryWriteRecord | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM memory_write_ledger WHERE write_key=?", (write_key,)
+            ).fetchone()
+        return _row_to_memory_write(row) if row else None
+
+    def mark_memory_write_committed(
+        self,
+        *,
+        write_key: str,
+        event_id: str,
+        summary: str,
+        raw_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE memory_write_ledger
+                SET status='committed',
+                    event_id=?,
+                    summary=?,
+                    updated_ts=?,
+                    raw_metadata=?
+                WHERE write_key=?
+                """,
+                (
+                    event_id,
+                    summary,
+                    int(time.time()),
+                    json.dumps(raw_metadata or {}, ensure_ascii=False),
+                    write_key,
+                ),
+            )
+
+    def mark_memory_write_uncertain(
+        self,
+        *,
+        write_key: str,
+        error: str,
+        raw_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        meta = dict(raw_metadata or {})
+        meta["last_error"] = error[:300]
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE memory_write_ledger
+                SET status='uncertain',
+                    updated_ts=?,
+                    raw_metadata=?
+                WHERE write_key=?
+                """,
+                (int(time.time()), json.dumps(meta, ensure_ascii=False), write_key),
+            )
+
     # ---------- 杂项 ----------
 
     def iter_all_events(self, *, include_tombstoned: bool = False) -> Iterator[EventMetadata]:
@@ -474,6 +599,12 @@ class EntityIndex:
                 "SELECT count(*) AS c FROM event_metadata WHERE tombstone=1"
             ).fetchone()["c"]
             try:
+                writes = conn.execute(
+                    "SELECT count(*) AS c FROM memory_write_ledger"
+                ).fetchone()["c"]
+            except sqlite3.OperationalError:
+                writes = 0
+            try:
                 short = conn.execute("SELECT count(*) AS c FROM short_id_map").fetchone()["c"]
             except sqlite3.OperationalError:
                 short = 0
@@ -486,6 +617,7 @@ class EntityIndex:
             "events_active": ev_total,
             "events_tombstoned": ev_tomb,
             "short_ids": short,
+            "memory_writes": writes,
         }
 
 
@@ -535,5 +667,25 @@ def _row_to_meta(row: sqlite3.Row) -> EventMetadata:
         source=row["source"] or "",
         ts=row["ts"] or 0,
         summary=row["summary"] or "",
+        raw_metadata=raw if isinstance(raw, dict) else {},
+    )
+
+
+def _row_to_memory_write(row: sqlite3.Row) -> MemoryWriteRecord:
+    try:
+        raw = json.loads(row["raw_metadata"] or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return MemoryWriteRecord(
+        write_key=row["write_key"] or "",
+        status=row["status"] or "",
+        event_id=row["event_id"] or "",
+        summary=row["summary"] or "",
+        scope=row["scope"] or "",
+        mem_type=row["mem_type"] or "",
+        project_id=row["project_id"] or "",
+        source=row["source"] or "",
+        created_ts=int(row["created_ts"] or 0),
+        updated_ts=int(row["updated_ts"] or 0),
         raw_metadata=raw if isinstance(raw, dict) else {},
     )

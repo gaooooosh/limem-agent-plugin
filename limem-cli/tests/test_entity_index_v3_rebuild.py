@@ -1,4 +1,4 @@
-"""schema 不匹配时 EntityIndex 应该 unlink 重建（v3 行为）。"""
+"""schema 不匹配时 EntityIndex 应该 unlink 重建（v4 行为）。"""
 
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ def test_v2_db_is_rebuilt_to_v3(tmp_path) -> None:
     conn = sqlite3.connect(str(db_path))
     try:
         version = conn.execute("SELECT max(version) FROM _schema_meta").fetchone()[0]
-        assert version == SCHEMA_VERSION == 3
+        assert version == SCHEMA_VERSION == 4
         tables = {
             r[0]
             for r in conn.execute(
@@ -104,6 +104,7 @@ def test_v2_db_is_rebuilt_to_v3(tmp_path) -> None:
         assert "principals" in tables
         assert "event_metadata" in tables
         assert "short_id_map" in tables
+        assert "memory_write_ledger" in tables
         # 旧 entities 表不应再存在
         assert "entities" not in tables
     finally:
@@ -148,7 +149,7 @@ def test_v1_or_unknown_version_also_rebuilds(tmp_path) -> None:
         assert "patterns" not in tables
         assert "principals" in tables
         version = conn.execute("SELECT max(version) FROM _schema_meta").fetchone()[0]
-        assert version == 3
+        assert version == 4
     finally:
         conn.close()
 

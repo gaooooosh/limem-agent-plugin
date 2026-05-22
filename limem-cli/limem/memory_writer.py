@@ -101,20 +101,27 @@ def remember(
     ents = [e.to_dict() for e in entities or []]
 
     if prefer_daemon:
-        rpc_result = daemon_client.write_memory(
-            {
-                "text": text,
-                "scope": scope,
-                "mem_type": mem_type,
-                "importance": importance,
-                "project_id": project_id,
-                "entities": ents or None,
-                "source": source,
-                "session_id": session_id,
-                "detail": detail,
-                "skip_redact": skip_redact,
-            }
-        )
+        try:
+            rpc_result = daemon_client.write_memory(
+                {
+                    "text": text,
+                    "scope": scope,
+                    "mem_type": mem_type,
+                    "importance": importance,
+                    "project_id": project_id,
+                    "entities": ents or None,
+                    "source": source,
+                    "session_id": session_id,
+                    "detail": detail,
+                    "skip_redact": skip_redact,
+                }
+            )
+        except daemon_client.DaemonCallUncertain as e:
+            raise LimemError(
+                0,
+                "daemon write_memory result is uncertain; not falling back to local ingest "
+                "because the daemon may have already accepted the write",
+            ) from e
         if rpc_result is not None:
             return RememberResult(
                 event_id=rpc_result.get("event_id", ""),

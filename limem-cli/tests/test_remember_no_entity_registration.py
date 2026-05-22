@@ -205,3 +205,167 @@ def test_ten_consecutive_remembers_do_not_inflate_entities(monkeypatch, tmp_path
     assert len(fake.ingest_calls) == 10
     assert fake.entity_create_calls == []
     assert fake.entity_patch_calls == []
+
+
+def test_memory_writer_falls_back_only_when_daemon_did_not_accept(monkeypatch, tmp_path) -> None:
+    from limem import daemon_client
+    from limem import memory_writer as mw
+
+    fake = _FakeClient()
+    _patch(monkeypatch, fake)
+    idx = EntityIndex(db_path=tmp_path / "patterns.sqlite")
+
+    monkeypatch.setattr(daemon_client, "write_memory", lambda _params: None)
+
+    res = mw.remember(
+        text="fallback write",
+        scope="project:foo/bar",
+        mem_type="rule",
+        project_id="foo/bar",
+        creds=_FakeCreds(),
+        idx=idx,
+        skip_redact=True,
+    )
+
+    assert res.event_id == "evt_00000001"
+    assert len(fake.ingest_calls) == 1
+
+
+def test_memory_writer_does_not_fallback_when_daemon_result_is_uncertain(monkeypatch, tmp_path) -> None:
+    from limem import daemon_client
+    from limem import memory_writer as mw
+    from limem.client import LimemError
+
+    fake = _FakeClient()
+    _patch(monkeypatch, fake)
+    idx = EntityIndex(db_path=tmp_path / "patterns.sqlite")
+
+    def uncertain(_params):
+        raise daemon_client.DaemonCallUncertain("timed out after send")
+
+    monkeypatch.setattr(daemon_client, "write_memory", uncertain)
+
+    try:
+        mw.remember(
+            text="do not duplicate",
+            scope="project:foo/bar",
+            mem_type="rule",
+            project_id="foo/bar",
+            creds=_FakeCreds(),
+            idx=idx,
+            skip_redact=True,
+        )
+    except LimemError as e:
+        assert "not falling back to local ingest" in str(e)
+    else:
+        raise AssertionError("expected uncertain daemon write to stop without fallback")
+
+    assert fake.ingest_calls == []
+
+
+def test_remember_impl_dedupes_same_memory_write_key(monkeypatch, tmp_path) -> None:
+    fake = _FakeClient()
+    _patch(monkeypatch, fake)
+    idx = EntityIndex(db_path=tmp_path / "patterns.sqlite")
+
+    first = remember_impl(
+        text="禁止重复发同一条记忆。",
+        scope="project:foo/bar",
+        mem_type="feedback",
+        importance=0.85,
+        project_id="foo/bar",
+        source="mcp:limem_write",
+        entities=[{"canonical": "重复写入", "role": "forbidden"}],
+        creds=_FakeCreds(),
+        idx=idx,
+        skip_redact=True,
+    )
+    second = remember_impl(
+        text="禁止重复发同一条记忆。",
+        scope="project:foo/bar",
+        mem_type="feedback",
+        importance=0.85,
+        project_id="foo/bar",
+        source="daemon:passive_learning",
+        entities=[{"canonical": "重复写入", "role": "forbidden"}],
+        creds=_FakeCreds(),
+        idx=idx,
+        skip_redact=True,
+    )
+
+    assert len(fake.ingest_calls) == 1
+    assert second["deduped"] is True
+    assert second["event_id"] == first["event_id"]
+    assert second["write_key"] == first["write_key"]
+
+
+def test_remember_impl_does_not_dedupe_different_memory_text(monkeypatch, tmp_path) -> None:
+    fake = _FakeClient()
+    _patch(monkeypatch, fake)
+    idx = EntityIndex(db_path=tmp_path / "patterns.sqlite")
+
+    remember_impl(
+        text="第一条记忆。",
+        scope="project:foo/bar",
+        mem_type="rule",
+        project_id="foo/bar",
+        creds=_FakeCreds(),
+        idx=idx,
+        skip_redact=True,
+    )
+    remember_impl(
+        text="第二条记忆。",
+        scope="project:foo/bar",
+        mem_type="rule",
+        project_id="foo/bar",
+        creds=_FakeCreds(),
+        idx=idx,
+        skip_redact=True,
+    )
+
+    assert len(fake.ingest_calls) == 2
+
+
+def test_remember_impl_blocks_duplicate_when_first_write_is_uncertain(monkeypatch, tmp_path) -> None:
+    from limem.client import LimemError
+
+    class FailingClient(_FakeClient):
+        def ingest(self, data, *, timestamp=None):  # noqa: ARG002
+            self.ingest_calls.append(data)
+            raise LimemError(0, "network timeout")
+
+    fake = FailingClient()
+    _patch(monkeypatch, fake)
+    idx = EntityIndex(db_path=tmp_path / "patterns.sqlite")
+
+    try:
+        remember_impl(
+            text="这条写入结果未知。",
+            scope="project:foo/bar",
+            mem_type="rule",
+            project_id="foo/bar",
+            creds=_FakeCreds(),
+            idx=idx,
+            skip_redact=True,
+        )
+    except LimemError:
+        pass
+    else:
+        raise AssertionError("expected first ingest to fail")
+
+    try:
+        remember_impl(
+            text="这条写入结果未知。",
+            scope="project:foo/bar",
+            mem_type="rule",
+            project_id="foo/bar",
+            creds=_FakeCreds(),
+            idx=idx,
+            skip_redact=True,
+        )
+    except LimemError as e:
+        assert "not issuing duplicate ingest" in str(e)
+    else:
+        raise AssertionError("expected duplicate uncertain write to be blocked")
+
+    assert len(fake.ingest_calls) == 1

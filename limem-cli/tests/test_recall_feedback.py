@@ -1287,7 +1287,15 @@ def test_build_codex_evidence_packet_keeps_raw_timeline() -> None:
                     "content": "不要替后端 LLM 总结，只提交观察材料。",
                 },
             },
-            {"ts": 1700000001, "kind": "stop", "payload": {"hook": "Stop"}},
+            {
+                "ts": 1700000001,
+                "kind": "assistant_response",
+                "payload": {
+                    "role": "assistant",
+                    "content": "我会保留原始证据，不做额外总结。",
+                },
+            },
+            {"ts": 1700000002, "kind": "stop", "payload": {"hook": "Stop"}},
         ],
         project_id="github.com/gaooooosh/limem-agent-plugin",
         tool="codex",
@@ -1297,12 +1305,116 @@ def test_build_codex_evidence_packet_keeps_raw_timeline() -> None:
     assert packet.startswith("# Agent Observation Packet")
     assert "## Evidence Timeline" in packet
     assert "### 1. User Message" in packet
+    assert "Ref: user_prompt:1:1700000000" in packet
     assert "不要替后端 LLM 总结，只提交观察材料。" in packet
-    assert "### 2. Stop Hook" in packet
+    assert "### 2. Assistant Response" in packet
+    assert "我会保留原始证据，不做额外总结。" in packet
+    assert "### 3. Stop Hook" in packet
+    assert "## Truncation" in packet
+    assert "None" in packet
+    assert "## Raw References" in packet
     assert "User Intent" not in packet
     assert "Key Points" not in packet
     assert "first_turn_ts" not in packet
     assert "session_id" not in packet
+
+
+def test_build_codex_evidence_packet_neutrally_truncates_long_assistant() -> None:
+    from limem import hooks as hmod
+
+    long_text = "A" * 3000 + "MIDDLE_SHOULD_BE_OMITTED" + "Z" * 3000
+    packet = hmod._build_codex_evidence_packet(
+        [
+            {
+                "ts": 1700000000,
+                "kind": "assistant_response",
+                "payload": {
+                    "role": "assistant",
+                    "content": long_text,
+                    "content_hash": "hash123",
+                },
+            },
+        ],
+        project_id="github.com/gaooooosh/limem-agent-plugin",
+        tool="codex",
+        source="codex:stop_flush",
+    )
+
+    assert "### 1. Assistant Response" in packet
+    assert "Ref: assistant_response:hash123" in packet
+    assert "[... neutral truncation: middle omitted ...]" in packet
+    assert "MIDDLE_SHOULD_BE_OMITTED" not in packet
+    assert "## Truncation" in packet
+    assert "assistant_response:hash123" in packet
+    assert "original=6024" in packet
+
+
+def test_read_codex_last_assistant_response_from_rollout(monkeypatch, tmp_path) -> None:
+    from limem import hooks as hmod
+    from limem.config import RuntimeConfig
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    sess_dir = tmp_path / "sessions" / "2026" / "05" / "22"
+    sess_dir.mkdir(parents=True)
+    rollout = sess_dir / "rollout-2026-05-22T11-30-06-sess-abc.jsonl"
+    rows = [
+        {
+            "type": "event_msg",
+            "payload": {"type": "agent_message", "message": "第一条回复"},
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "最终回复"}],
+            },
+        },
+    ]
+    rollout.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows))
+
+    out = hmod._read_codex_last_assistant_response("sess-abc", RuntimeConfig())
+
+    assert out == "最终回复"
+
+
+def test_hook_stop_codex_appends_assistant_response_from_rollout(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials, RuntimeConfig
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setattr(hmod, "SESSIONS_DIR", tmp_path / "limem-sessions")
+    monkeypatch.setattr(hmod, "_stop_recall_message", lambda _sid: "")
+    monkeypatch.setattr(hmod, "_flush_codex_session", lambda *_, **__: None)
+
+    sess_dir = tmp_path / "codex-home" / "sessions" / "2026" / "05" / "22"
+    sess_dir.mkdir(parents=True)
+    rollout = sess_dir / "rollout-2026-05-22T11-30-06-sess-stop.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "agent final answer"},
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    hmod._hook_stop_codex(
+        "codex",
+        {"session_id": "sess-stop"},
+        Credentials(api_key="", db_id="", user_id=""),
+        RuntimeConfig(codex_stop_idle_seconds=999999),
+    )
+    capsys.readouterr()
+
+    buf = tmp_path / "limem-sessions" / "sess-stop.ndjson"
+    rows = [json.loads(line) for line in buf.read_text().splitlines()]
+    assert rows[0]["kind"] == "assistant_response"
+    assert rows[0]["payload"]["content"] == "agent final answer"
+    assert rows[1]["kind"] == "stop"
 
 
 def test_flush_codex_session_ingests_markdown_evidence_packet(monkeypatch, tmp_path) -> None:
@@ -1360,6 +1472,8 @@ def test_flush_codex_session_ingests_markdown_evidence_packet(monkeypatch, tmp_p
     assert "first_turn_ts" not in data["detail"]
     assert data["metadata"]["turn_count"] == 2
     assert data["metadata"]["first_event_ts"] == 1700000000
+    assert data["metadata"]["packet_format"] == "turn_observation_neutral_pack_v1"
+    assert data["metadata"]["packet_budget_chars"] == 12000
     assert not buf.exists()
 
 

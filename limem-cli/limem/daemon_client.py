@@ -29,6 +29,10 @@ class DaemonUnavailable(Exception):
     pass
 
 
+class DaemonCallUncertain(Exception):
+    """Raised when a side-effecting daemon request may already be in progress."""
+
+
 def _read_cache() -> dict[str, Any] | None:
     try:
         return json.loads(STATUSLINE_CACHE_PATH.read_text())
@@ -47,6 +51,7 @@ def call(
     if not LIMEMD_SOCK_PATH.exists():
         raise DaemonUnavailable("socket not present")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    request_sent = False
     try:
         s.settimeout(connect_timeout_ms / 1000.0)
         s.connect(str(LIMEMD_SOCK_PATH))
@@ -56,6 +61,7 @@ def call(
             + "\n"
         ).encode("utf-8")
         s.sendall(body)
+        request_sent = True
         # 读直到换行
         buf = bytearray()
         while True:
@@ -67,13 +73,15 @@ def call(
                 break
         line = bytes(buf).split(b"\n", 1)[0]
         if not line:
-            raise DaemonUnavailable("empty response")
+            raise DaemonCallUncertain("empty response after request was sent")
         resp = json.loads(line)
         if "error" in resp:
             err = resp["error"]
             raise RPCError(int(err.get("code", -1)), err.get("message", ""), err.get("data"))
         return resp.get("result")
     except (TimeoutError, FileNotFoundError, ConnectionRefusedError, OSError) as e:
+        if request_sent:
+            raise DaemonCallUncertain(str(e)) from e
         raise DaemonUnavailable(str(e)) from e
     finally:
         try:
@@ -142,7 +150,7 @@ def safe_call(method: str, params: dict[str, Any] | None = None) -> dict[str, An
     """便利包装：失败返回 None，永不抛 DaemonUnavailable。"""
     try:
         return call(method, params)
-    except DaemonUnavailable:
+    except (DaemonUnavailable, DaemonCallUncertain):
         return None
     except RPCError:
         return None
@@ -190,8 +198,16 @@ def get_pause() -> dict[str, Any] | None:
 
 
 def write_memory(params: dict[str, Any]) -> dict[str, Any] | None:
-    """daemon 不可达时返回 None；调用方走 fallback。"""
-    return safe_call("write_memory", params)
+    """Write through daemon when possible.
+
+    Returns None only when the daemon was unavailable before the request could
+    be accepted. If the request was sent but the result is unknown, raise
+    DaemonCallUncertain so callers do not issue a duplicate local ingest.
+    """
+    try:
+        return call("write_memory", params)
+    except DaemonUnavailable:
+        return None
 
 
 def forget_memory(event_id: str) -> dict[str, Any] | None:

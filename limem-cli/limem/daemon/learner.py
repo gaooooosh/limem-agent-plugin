@@ -95,7 +95,13 @@ def format_evidence(event: dict[str, Any]) -> str:
     """
     tool = event.get("tool") or "agent"
     prompt = _clean_inline(event.get("prompt", ""), limit=160)
-    return f"{_format_ts(int(event.get('ts', 0) or 0))} [{tool}] #{_evidence_ref(event)}: {prompt}"
+    assistant = _clean_inline(event.get("prev_assistant_head", ""), limit=160)
+    if assistant:
+        return (
+            f"{_format_ts(int(event.get('ts', 0) or 0))} [{tool}] "
+            f"#{_evidence_ref(event)}: agent={assistant} | user={prompt}"
+        )
+    return f"{_format_ts(int(event.get('ts', 0) or 0))} [{tool}] #{_evidence_ref(event)}: user={prompt}"
 
 
 def build_candidate_text(
@@ -112,9 +118,12 @@ def build_candidate_text(
     locus = f"在 {project_label} 中" if project_label else "在当前会话中"
     sample = cluster[-1] if cluster else {}
     text = _clean_inline(sample.get("prompt", ""), limit=180)
+    assistant = _clean_inline(sample.get("prev_assistant_head", ""), limit=160)
     if not text:
         return f"{locus}，遵循用户最近反复纠正的工作方式。"
 
+    if assistant:
+        return f"{locus}，用户纠正过 agent 的回复或做法：agent 曾表示“{assistant}”；用户随后纠正为“{text}”。"
     if _NEGATIVE_HINT.search(text) and _PREFER_HINT.search(text):
         return f"{locus}，按用户纠正执行：{text}"
     if _NEGATIVE_HINT.search(text):
