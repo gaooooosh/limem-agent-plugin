@@ -163,3 +163,31 @@ For Codex, keep hook `systemMessage` for hosts that support it, but also inject 
 - Related Files: limem-cli/limem/hooks.py
 
 ---
+## [ERR-20260522-002] limem_write_feedback_timeout
+
+**Logged**: 2026-05-22T10:49:02+08:00
+**Priority**: medium
+**Status**: pending
+**Area**: integration
+
+### Summary
+Persisting user feedback about LiMem citation styling timed out through `limem_write`.
+
+### Error
+```text
+LiMem 0: network error: The read operation timed out
+```
+
+### Context
+- User said the visible memory citation looked ugly and exposed too much internal log content.
+- Attempted to persist the feedback with `mem_type=feedback`.
+- Local implementation continued despite the backend timeout.
+
+### Suggested Fix
+Retry persistence when backend connectivity is healthy; keep local tests covering the citation UI style.
+
+### Metadata
+- Reproducible: unknown
+- Related Files: limem-cli/limem/hooks.py
+
+---

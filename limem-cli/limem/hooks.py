@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import traceback
@@ -111,7 +112,7 @@ def _codex_visible_recall_context(recall_notice: str) -> str:
         return ""
     return (
         "<limem_visible_notice>\n"
-        "在本轮最终回复末尾单独追加下面这一行 LiMem 引用提示，原样输出：\n"
+        "在本轮最终回复末尾单独追加下面这段 LiMem 引用提示，原样输出：\n"
         f"{notice}\n"
         "</limem_visible_notice>"
     )
@@ -888,10 +889,10 @@ def _format_stop_recall_systemmessage(record: dict[str, Any]) -> str:
     """
     items = record.get("items") or []
     if not items:
-        return "📚 LiMem · 本次未召回记忆"
+        return "> 📚 LiMem\n> 本次未引用记忆"
 
     def _item_label(it: dict[str, Any]) -> str:
-        summary = " ".join(str(it.get("summary_head") or "").split())
+        summary = _clean_recall_summary(str(it.get("summary_head") or ""))
         if not summary and str(it.get("src") or "") == "pattern":
             summary = " · ".join(
                 part
@@ -903,26 +904,31 @@ def _format_stop_recall_systemmessage(record: dict[str, Any]) -> str:
             )
         if len(summary) > 96:
             summary = summary[:95] + "…"
-        return recall_item_label(
-            RecalledItem(
-                short_id=str(it.get("short_id") or ""),
-                event_id=str(it.get("event_id") or ""),
-                src=str(it.get("src") or ""),
-                mem_type=str(it.get("mem_type") or ""),
-                scope=str(it.get("scope") or ""),
-                summary_head=summary,
-                canonical=str(it.get("canonical") or ""),
-                heading=str(it.get("heading") or ""),
-            ),
-            max_chars=120,
-        ) or "已匹配记忆"
+        item = RecalledItem(
+            short_id=str(it.get("short_id") or ""),
+            event_id=str(it.get("event_id") or ""),
+            src=str(it.get("src") or ""),
+            mem_type=str(it.get("mem_type") or ""),
+            scope=str(it.get("scope") or ""),
+            summary_head=summary,
+            canonical=str(it.get("canonical") or ""),
+            heading=str(it.get("heading") or ""),
+        )
+        return recall_item_label(item, max_chars=120) or "已匹配记忆"
 
     n = len(items)
     head_items = items[:4]
-    detail = "；".join(_item_label(it) for it in head_items)
+    detail = "\n".join(f"> - {_item_label(it)}" for it in head_items)
     extra = n - len(head_items)
-    suffix = f"；另 {extra} 条" if extra > 0 else ""
-    return f"📚 LiMem · 本次引用 {n} 条记忆：{detail}{suffix}"
+    suffix = f"\n> - 另 {extra} 条" if extra > 0 else ""
+    return f"> 📚 LiMem\n> 本次引用 {n} 条记忆\n{detail}{suffix}"
+
+
+def _clean_recall_summary(text: str) -> str:
+    """Strip metadata-ish tails from summaries before showing them to users."""
+    summary = " ".join((text or "").split())
+    summary = re.sub(r"[（(]\s*实体[:：].*$", "", summary).strip()
+    return summary.rstrip("；;，,")
 
 
 def _format_prompt_recall_systemmessage(record: dict[str, Any]) -> str:
@@ -932,10 +938,7 @@ def _format_prompt_recall_systemmessage(record: dict[str, Any]) -> str:
     surface top-level hook ``systemMessage`` can show it as a separate hook/tool
     style notice while the model only receives the actual memory context.
     """
-    base = _format_stop_recall_systemmessage(record).replace("📚 LiMem · ", "", 1)
-    ts = int(record.get("ts") or time.time())
-    recalled_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-    return f"📚 LiMem · UserPromptSubmit {recalled_at} · {base}"
+    return _format_stop_recall_systemmessage(record)
 
 
 def _emit_stop_systemmessage(text: str) -> None:

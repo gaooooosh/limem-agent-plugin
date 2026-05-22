@@ -978,12 +978,12 @@ def test_format_stop_recall_systemmessage_with_short_ids() -> None:
         ]
     }
     out = hmod._format_stop_recall_systemmessage(record)
-    assert "📚 LiMem · 本次引用 3 条记忆" in out
-    assert "规则 #aaa111aaa111 不要运行 npm dev" in out
-    assert "语义 #bbb222bbb222 Docker rebuild 流程" in out
+    assert out.startswith("> 📚 LiMem\n> 本次引用 3 条记忆")
+    assert "> - 规则 #aaa111aaa111 不要运行 npm dev" in out
+    assert "> - 语义 #bbb222bbb222 Docker rebuild 流程" in out
     assert "#aaa111aaa111" in out
     assert "#bbb222bbb222" in out
-    assert "规则 #ccc333ccc333 第三条" in out
+    assert "> - 规则 #ccc333ccc333 第三条" in out
     assert "另 1 条" not in out
 
 
@@ -1001,6 +1001,25 @@ def test_format_stop_recall_systemmessage_includes_longer_summary() -> None:
     assert "规则 #7db02aec7003" in out
     assert "提交和推送代码之前都要先更新版本号" in out
     assert "版本元数据同步" in out
+
+
+def test_format_stop_recall_systemmessage_strips_metadata_tail() -> None:
+    from limem import hooks as hmod
+
+    out = hmod._format_stop_recall_systemmessage(
+        {
+            "items": [
+                {
+                    "short_id": "7db02aec7003",
+                    "src": "hard",
+                    "summary_head": "提交前更新版本号。（实体：版本号、提交和推送）",
+                }
+            ]
+        }
+    )
+
+    assert "提交前更新版本号。" in out
+    assert "实体" not in out
 
 
 def test_format_stop_recall_systemmessage_pattern_only() -> None:
@@ -1022,11 +1041,11 @@ def test_format_stop_recall_systemmessage_pattern_only() -> None:
 def test_format_stop_recall_systemmessage_empty() -> None:
     from limem import hooks as hmod
 
-    assert hmod._format_stop_recall_systemmessage({"items": []}) == "📚 LiMem · 本次未召回记忆"
-    assert hmod._format_stop_recall_systemmessage({}) == "📚 LiMem · 本次未召回记忆"
+    assert hmod._format_stop_recall_systemmessage({"items": []}) == "> 📚 LiMem\n> 本次未引用记忆"
+    assert hmod._format_stop_recall_systemmessage({}) == "> 📚 LiMem\n> 本次未引用记忆"
 
 
-def test_format_prompt_recall_systemmessage_includes_timing_and_summary() -> None:
+def test_format_prompt_recall_systemmessage_excludes_hook_logs() -> None:
     from limem import hooks as hmod
 
     out = hmod._format_prompt_recall_systemmessage(
@@ -1041,7 +1060,9 @@ def test_format_prompt_recall_systemmessage_includes_timing_and_summary() -> Non
             ],
         }
     )
-    assert out.startswith("📚 LiMem · UserPromptSubmit 2023-")
+    assert out.startswith("> 📚 LiMem\n")
+    assert "UserPromptSubmit" not in out
+    assert "2023-" not in out
     assert "本次引用 1 条记忆" in out
     assert "规则 #aaa111aaa111 不要运行 npm dev" in out
 
@@ -1066,11 +1087,11 @@ def test_emit_inject_can_emit_independent_system_message(capsys) -> None:
 def test_codex_visible_recall_context_instructs_final_response() -> None:
     from limem import hooks as hmod
 
-    out = hmod._codex_visible_recall_context("📚 LiMem · 本次引用 1 条记忆")
+    out = hmod._codex_visible_recall_context("> 📚 LiMem\n> 本次引用 1 条记忆")
 
     assert "<limem_visible_notice>" in out
     assert "最终回复末尾" in out
-    assert "📚 LiMem · 本次引用 1 条记忆" in out
+    assert "> 📚 LiMem\n> 本次引用 1 条记忆" in out
 
 
 def test_emit_stop_systemmessage_writes_json(capsys) -> None:
