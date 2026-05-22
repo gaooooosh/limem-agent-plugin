@@ -135,3 +135,31 @@ Diagnose the LiMem service ingest/write path before assuming feedback persistenc
 - Related Files: limem-cli/limem/hooks.py
 
 ---
+## [ERR-20260522-001] codex_desktop_hidden_hook_systemmessage
+
+**Logged**: 2026-05-22T10:19:43+08:00
+**Priority**: high
+**Status**: pending
+**Area**: integration
+
+### Summary
+Codex desktop can execute LiMem hooks and inject memory while still hiding hook `systemMessage` notices from the user.
+
+### Error
+```text
+UserPromptSubmit stdout contained {"systemMessage": "..."} and recent_recalls recorded memory hits, but the Codex desktop UI showed no citation notice.
+```
+
+### Context
+- The user's current Codex desktop session recalled project memories and wrote `recall_emitted` records with short IDs.
+- The prior implementation assumed top-level hook `systemMessage` and Stop-hook stderr would be user-visible.
+- Local evidence showed Codex desktop did not surface prompt-hook stdout JSON or Stop-hook stderr as a reliable visible channel.
+
+### Suggested Fix
+For Codex, keep hook `systemMessage` for hosts that support it, but also inject a small `additionalContext` fallback instructing the assistant to print the LiMem citation line in the final response. Keep Stop-hook recall notice ahead of passive session flushing so backend timeouts cannot block it.
+
+### Metadata
+- Reproducible: yes
+- Related Files: limem-cli/limem/hooks.py
+
+---

@@ -36,8 +36,8 @@ from .daemon.eventbus import emit_event
 from .daemon.state import (
     RecalledItem,
     is_degraded_banner_emitted_on_disk,
-    recall_item_label,
     read_pause_from_disk,
+    recall_item_label,
 )
 from .daemon.writer import build_natural_detail
 from .entity_index import EntityIndex, PrincipalRow
@@ -97,6 +97,24 @@ def _emit_inject(
             "additionalContext": text,
         }
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+
+
+def _codex_visible_recall_context(recall_notice: str) -> str:
+    """Fallback for Codex desktop, which may hide hook systemMessage output.
+
+    Codex still passes UserPromptSubmit additionalContext to the model. When the
+    desktop host does not render hook notices, this instruction makes the memory
+    citation visible in the assistant's final response instead.
+    """
+    notice = (recall_notice or "").strip()
+    if not notice:
+        return ""
+    return (
+        "<limem_visible_notice>\n"
+        "在本轮最终回复末尾单独追加下面这一行 LiMem 引用提示，原样输出：\n"
+        f"{notice}\n"
+        "</limem_visible_notice>"
+    )
 
 
 def _report_recall_safe(
@@ -690,6 +708,10 @@ def _hook_user_prompt_submit(
         runtime,
         extra_payload=extra_payload or None,
     )
+    if tool == "codex" and recall_payload:
+        visible_notice = _codex_visible_recall_context(recall_notice)
+        if visible_notice:
+            text = "\n\n".join(part for part in (text, visible_notice) if part)
     _emit_inject("UserPromptSubmit", text, system_message=recall_notice)
 
 
@@ -864,6 +886,18 @@ def _format_stop_recall_systemmessage(record: dict[str, Any]) -> str:
         return "📚 LiMem · 本次未召回记忆"
 
     def _item_label(it: dict[str, Any]) -> str:
+        summary = " ".join(str(it.get("summary_head") or "").split())
+        if not summary and str(it.get("src") or "") == "pattern":
+            summary = " · ".join(
+                part
+                for part in (
+                    str(it.get("canonical") or "").strip(),
+                    str(it.get("heading") or "").strip(),
+                )
+                if part
+            )
+        if len(summary) > 96:
+            summary = summary[:95] + "…"
         return recall_item_label(
             RecalledItem(
                 short_id=str(it.get("short_id") or ""),
@@ -871,14 +905,15 @@ def _format_stop_recall_systemmessage(record: dict[str, Any]) -> str:
                 src=str(it.get("src") or ""),
                 mem_type=str(it.get("mem_type") or ""),
                 scope=str(it.get("scope") or ""),
-                summary_head=str(it.get("summary_head") or ""),
+                summary_head=summary,
                 canonical=str(it.get("canonical") or ""),
                 heading=str(it.get("heading") or ""),
-            )
+            ),
+            max_chars=120,
         ) or "已匹配记忆"
 
     n = len(items)
-    head_items = items[:2]
+    head_items = items[:4]
     detail = "；".join(_item_label(it) for it in head_items)
     extra = n - len(head_items)
     suffix = f"；另 {extra} 条" if extra > 0 else ""
@@ -1026,20 +1061,9 @@ def _hook_stop_codex(
         runtime=runtime,
     )
 
-    now = int(time.time())
-    threshold = now - runtime.codex_stop_idle_seconds
-    for p in SESSIONS_DIR.glob("*.ndjson"):
-        try:
-            mtime = p.stat().st_mtime
-        except FileNotFoundError:
-            continue
-        if mtime >= threshold:
-            continue
-        _flush_codex_session(p, creds, tool)
-
-    # 每轮 Codex Stop 也尝试给出「本次使用了哪些记忆」提示，与 Claude Code 端体验一致：
-    # - stdout 输出 systemMessage JSON（与 Claude Code 协议同形态；Codex 若不识别则被忽略，无副作用）
-    # - stderr 输出一行 UTF-8 fallback（多数 CLI 会把 stderr 显示给用户，作为 stdout 不被识别时的兜底）
+    # Emit the visible recall notice before passive session flushing. The flush
+    # path can hit backend/network timeouts; recall visibility must stay on the
+    # fast Stop-hook path.
     try:
         text = _stop_recall_message(sid if sid != "unknown" else "")
     except Exception:
@@ -1050,6 +1074,20 @@ def _hook_stop_codex(
             sys.stderr.write(text.strip() + "\n")
         except Exception:
             pass
+
+    now = int(time.time())
+    threshold = now - runtime.codex_stop_idle_seconds
+    for p in SESSIONS_DIR.glob("*.ndjson"):
+        try:
+            mtime = p.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if mtime >= threshold:
+            continue
+        try:
+            _flush_codex_session(p, creds, tool)
+        except Exception as e:  # noqa: BLE001
+            _log("stop_flush_error", tool, msg=str(e), buffer=str(p))
 
 
 def _markdown_escape(text: str) -> str:

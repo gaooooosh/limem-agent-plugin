@@ -982,7 +982,24 @@ def test_format_stop_recall_systemmessage_with_short_ids() -> None:
     assert "语义 #bbb222bbb222 Docker rebuild 流程" in out
     assert "#aaa111aaa111" in out
     assert "#bbb222bbb222" in out
-    assert "另 1 条" in out  # head 2, total 3 → 溢出 1
+    assert "规则 #ccc333ccc333 第三条" in out
+    assert "另 1 条" not in out
+
+
+def test_format_stop_recall_systemmessage_includes_longer_summary() -> None:
+    from limem import hooks as hmod
+
+    summary = (
+        "以后在 limem-agent-plugin 项目里，提交和推送代码之前都要先更新版本号，"
+        "并保持版本元数据同步。"
+    )
+    out = hmod._format_stop_recall_systemmessage(
+        {"items": [{"short_id": "7db02aec7003", "src": "hard", "summary_head": summary}]}
+    )
+
+    assert "规则 #7db02aec7003" in out
+    assert "提交和推送代码之前都要先更新版本号" in out
+    assert "版本元数据同步" in out
 
 
 def test_format_stop_recall_systemmessage_pattern_only() -> None:
@@ -1043,6 +1060,16 @@ def test_emit_inject_can_emit_independent_system_message(capsys) -> None:
     assert data["suppressOutput"] is False
     assert data["hookSpecificOutput"]["additionalContext"] == "<limem_memory>ctx</limem_memory>"
     assert "本次引用" not in data["hookSpecificOutput"]["additionalContext"]
+
+
+def test_codex_visible_recall_context_instructs_final_response() -> None:
+    from limem import hooks as hmod
+
+    out = hmod._codex_visible_recall_context("📚 LiMem · 本次引用 1 条记忆")
+
+    assert "<limem_visible_notice>" in out
+    assert "最终回复末尾" in out
+    assert "📚 LiMem · 本次引用 1 条记忆" in out
 
 
 def test_emit_stop_systemmessage_writes_json(capsys) -> None:
@@ -1177,6 +1204,52 @@ def test_hook_stop_codex_stderr_keeps_readable_chinese(monkeypatch, capsys, tmp_
     assert "部署后运行 docker:rebuild" in captured.err
     assert "规则 #abcd00001111" in captured.err
     assert "#abcd00001111" in data["systemMessage"]
+
+
+def test_hook_stop_codex_emits_notice_before_flush(monkeypatch, capsys, tmp_path) -> None:
+    """Flush failures/timeouts must not prevent the Stop recall notice."""
+    from limem import hooks as hmod
+
+    old = tmp_path / "old.ndjson"
+    old.write_text('{"ts": 1, "kind": "user_prompt", "payload": {"content": "x"}}\n')
+    monkeypatch.setattr(hmod, "SESSIONS_DIR", tmp_path)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("flush failed")
+
+    monkeypatch.setattr(hmod, "_flush_codex_session", _boom)
+    monkeypatch.setattr(
+        hmod.daemon_client,
+        "consume_pending_recall",
+        lambda *_, **__: {
+            "items": [
+                {
+                    "short_id": "abcd00001111",
+                    "src": "hard",
+                    "summary_head": "部署后运行 docker:rebuild",
+                }
+            ]
+        },
+    )
+
+    class _NotPaused:
+        def is_active(self):
+            return False
+
+    monkeypatch.setattr(hmod, "read_pause_from_disk", lambda: _NotPaused())
+
+    from limem.config import Credentials, RuntimeConfig
+
+    hmod._hook_stop_codex(
+        "codex",
+        {"session_id": "sess-z"},
+        Credentials(api_key="k", db_id="db", user_id="u"),
+        RuntimeConfig(codex_stop_idle_seconds=0),
+    )
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert "本次引用 1 条记忆" in data["systemMessage"]
+    assert "部署后运行 docker:rebuild" in captured.err
 
 
 def test_build_codex_evidence_packet_keeps_raw_timeline() -> None:
