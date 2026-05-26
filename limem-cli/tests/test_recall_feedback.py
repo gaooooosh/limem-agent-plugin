@@ -1472,6 +1472,10 @@ def test_flush_codex_session_ingests_markdown_evidence_packet(monkeypatch, tmp_p
     assert "first_turn_ts" not in data["detail"]
     assert data["metadata"]["turn_count"] == 2
     assert data["metadata"]["first_event_ts"] == 1700000000
+    assert data["idempotency_key"].startswith("codex-stop-flush:")
+    assert data["metadata"]["idempotency_key"] == data["idempotency_key"]
+    assert data["metadata"]["event_start_index"] == 0
+    assert data["metadata"]["event_end_index"] == 2
     assert data["metadata"]["packet_format"] == "turn_observation_neutral_pack_v1"
     assert data["metadata"]["packet_budget_chars"] == 12000
     assert not buf.exists()
@@ -1544,6 +1548,179 @@ def test_flush_codex_session_ensures_default_principals_before_ingest(monkeypatc
         "include_project": True,
         "client_type": "_Client",
     }
+
+
+def test_flush_codex_session_only_ingests_new_events_after_prior_flush(
+    monkeypatch, tmp_path
+) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials
+
+    captured: list[dict[str, Any]] = []
+
+    class _Result:
+        event_id = "evt_1"
+        summary = "ok"
+
+    class _Client:
+        def __init__(self, **_kw):
+            pass
+
+        def ingest(self, data, *, timestamp=None):  # noqa: ARG002
+            captured.append(data)
+            return _Result()
+
+    monkeypatch.setattr(hmod, "LimemClient", _Client)
+    monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda **_kw: None)
+    monkeypatch.setattr(hmod.session_mute, "clear", lambda _sid: None)
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "github.com/gaooooosh/limem-agent-plugin")
+    monkeypatch.setattr(hmod, "project_scope", lambda: "project:github.com/gaooooosh/limem-agent-plugin")
+
+    buf = tmp_path / "sess-incremental.ndjson"
+    first_rows = [
+        {
+            "ts": 1700000000,
+            "kind": "user_prompt",
+            "payload": {"role": "user", "content": "first prompt"},
+        },
+        {"ts": 1700000001, "kind": "stop", "payload": {"hook": "Stop"}},
+    ]
+    buf.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in first_rows))
+
+    state = {
+        "session_id": "sess-incremental",
+        "first_event_ts": 1700000000,
+        "submitted_line_count": 2,
+        "last_idempotency_key": "codex-stop-flush:old",
+        "status": "uncertain",
+        "updated_ts": 1700000002,
+    }
+    (tmp_path / "sess-incremental.ndjson.flush.json").write_text(
+        json.dumps(state, ensure_ascii=False)
+    )
+    next_rows = [
+        *first_rows,
+        {
+            "ts": 1700000003,
+            "kind": "user_prompt",
+            "payload": {"role": "user", "content": "second prompt"},
+        },
+        {"ts": 1700000004, "kind": "stop", "payload": {"hook": "Stop"}},
+    ]
+    buf.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in next_rows))
+
+    hmod._flush_codex_session(
+        buf,
+        Credentials(api_key="k", db_id="db", user_id="u"),
+        "codex",
+    )
+
+    assert len(captured) == 1
+    data = captured[0]
+    assert "second prompt" in data["detail"]
+    assert "first prompt" not in data["detail"]
+    assert data["metadata"]["turn_count"] == 2
+    assert data["metadata"]["event_start_index"] == 2
+    assert data["metadata"]["event_end_index"] == 4
+    assert data["idempotency_key"].startswith("codex-stop-flush:")
+    assert not buf.exists()
+
+
+def test_flush_codex_session_records_uncertain_state_to_avoid_duplicate_retry(
+    monkeypatch, tmp_path
+) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials
+
+    class _Client:
+        def __init__(self, **_kw):
+            pass
+
+        def ingest(self, data, *, timestamp=None):  # noqa: ARG002
+            raise RuntimeError("timeout after submit")
+
+    monkeypatch.setattr(hmod, "LimemClient", _Client)
+    monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda **_kw: None)
+    monkeypatch.setattr(hmod.session_mute, "clear", lambda _sid: None)
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "github.com/gaooooosh/limem-agent-plugin")
+    monkeypatch.setattr(hmod, "project_scope", lambda: "project:github.com/gaooooosh/limem-agent-plugin")
+
+    buf = tmp_path / "sess-uncertain.ndjson"
+    buf.write_text(
+        json.dumps(
+            {
+                "ts": 1700000000,
+                "kind": "user_prompt",
+                "payload": {"role": "user", "content": "maybe submitted"},
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    hmod._flush_codex_session(
+        buf,
+        Credentials(api_key="k", db_id="db", user_id="u"),
+        "codex",
+    )
+
+    state_path = tmp_path / "sess-uncertain.ndjson.flush.json"
+    state = json.loads(state_path.read_text())
+    assert state["submitted_line_count"] == 1
+    assert state["status"] == "uncertain"
+    assert state["last_idempotency_key"].startswith("codex-stop-flush:")
+
+
+def test_flush_codex_session_keeps_uncertain_buffer_without_new_events(
+    monkeypatch, tmp_path
+) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials
+
+    ingest_calls = 0
+
+    class _Client:
+        def __init__(self, **_kw):
+            pass
+
+        def ingest(self, data, *, timestamp=None):  # noqa: ARG002
+            nonlocal ingest_calls
+            ingest_calls += 1
+            raise AssertionError("duplicate ingest should be skipped")
+
+    monkeypatch.setattr(hmod, "LimemClient", _Client)
+    monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda **_kw: None)
+    monkeypatch.setattr(hmod.session_mute, "clear", lambda _sid: None)
+
+    buf = tmp_path / "sess-uncertain-repeat.ndjson"
+    row = {
+        "ts": 1700000000,
+        "kind": "user_prompt",
+        "payload": {"role": "user", "content": "already submitted maybe"},
+    }
+    buf.write_text(json.dumps(row, ensure_ascii=False))
+    (tmp_path / "sess-uncertain-repeat.ndjson.flush.json").write_text(
+        json.dumps(
+            {
+                "session_id": "sess-uncertain-repeat",
+                "first_event_ts": 1700000000,
+                "submitted_line_count": 1,
+                "last_idempotency_key": "codex-stop-flush:old",
+                "status": "uncertain",
+                "updated_ts": 1700000002,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    hmod._flush_codex_session(
+        buf,
+        Credentials(api_key="k", db_id="db", user_id="u"),
+        "codex",
+    )
+
+    assert ingest_calls == 0
+    assert buf.exists()
+    assert (tmp_path / "sess-uncertain-repeat.ndjson.flush.json").exists()
 
 
 def test_hook_report_recall_safe_completes_under_50ms(monkeypatch) -> None:

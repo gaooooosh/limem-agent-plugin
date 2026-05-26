@@ -282,6 +282,107 @@ def _codex_session_buffer_path(session_id: str) -> Path:
     return SESSIONS_DIR / f"{safe or 'unknown'}.ndjson"
 
 
+def _codex_session_flush_state_path(buf: Path) -> Path:
+    return buf.with_suffix(buf.suffix + ".flush.json")
+
+
+def _codex_event_fingerprint(ev: dict[str, Any]) -> dict[str, Any]:
+    payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+    payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        "ts": ev.get("ts"),
+        "kind": ev.get("kind") or "event",
+        "payload_hash": hashlib.sha256(payload_text.encode("utf-8")).hexdigest()[:16],
+    }
+
+
+def _codex_flush_first_event_ts(events: list[dict[str, Any]]) -> Any:
+    return events[0].get("ts") if events else None
+
+
+def _read_codex_flush_submitted_count(buf: Path, events: list[dict[str, Any]]) -> int:
+    state_path = _codex_session_flush_state_path(buf)
+    try:
+        state = json.loads(state_path.read_text() or "{}")
+    except Exception:
+        return 0
+    if not isinstance(state, dict):
+        return 0
+    if state.get("first_event_ts") != _codex_flush_first_event_ts(events):
+        return 0
+    try:
+        count = int(state.get("submitted_line_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+    if count < 0 or count > len(events):
+        return 0
+    return count
+
+
+def _codex_flush_state_status(buf: Path) -> str:
+    try:
+        state = json.loads(_codex_session_flush_state_path(buf).read_text() or "{}")
+    except Exception:
+        return ""
+    if not isinstance(state, dict):
+        return ""
+    return str(state.get("status") or "")
+
+
+def _write_codex_flush_state(
+    buf: Path,
+    *,
+    session_id: str,
+    submitted_line_count: int,
+    events: list[dict[str, Any]],
+    idempotency_key: str,
+    status: str,
+    error: str = "",
+) -> None:
+    state_path = _codex_session_flush_state_path(buf)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "session_id": session_id,
+        "first_event_ts": _codex_flush_first_event_ts(events),
+        "submitted_line_count": submitted_line_count,
+        "last_idempotency_key": idempotency_key,
+        "status": status,
+        "updated_ts": int(time.time()),
+    }
+    if error:
+        state["last_error"] = error[:240]
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+
+def _cleanup_codex_flush_files(buf: Path, submitted_line_count: int) -> None:
+    try:
+        current_count = sum(1 for line in buf.read_text().splitlines() if line.strip())
+    except FileNotFoundError:
+        current_count = 0
+    if current_count <= submitted_line_count:
+        buf.unlink(missing_ok=True)
+        _codex_session_flush_state_path(buf).unlink(missing_ok=True)
+
+
+def _codex_flush_idempotency_key(
+    *,
+    session_id: str,
+    project_id: str,
+    source: str,
+    events: list[dict[str, Any]],
+) -> str:
+    body = {
+        "session_id": session_id,
+        "project_id": project_id,
+        "source": source,
+        "events": [_codex_event_fingerprint(ev) for ev in events],
+    }
+    digest = hashlib.sha256(
+        json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"codex-stop-flush:{digest}"
+
+
 def _append_codex_session_observation(
     *,
     session_id: str,
@@ -1414,21 +1515,35 @@ def _flush_codex_session(buf: Path, creds: Credentials, tool: str) -> None:
         lines = buf.read_text().splitlines()
     except FileNotFoundError:
         return
+    lines = [line for line in lines if line.strip()]
     if not lines:
         buf.unlink(missing_ok=True)
+        _codex_session_flush_state_path(buf).unlink(missing_ok=True)
         return
-    events = [json.loads(line) for line in lines if line.strip()]
+    events = [json.loads(line) for line in lines]
     sid = buf.stem
+    submitted_line_count = _read_codex_flush_submitted_count(buf, events)
+    if submitted_line_count >= len(events):
+        if _codex_flush_state_status(buf) == "committed":
+            _cleanup_codex_flush_files(buf, submitted_line_count)
+        return
+    flush_events = events[submitted_line_count:]
     ts = int(time.time())
     scope = project_scope()
     project_id = detect_project_id()
     source = f"{tool}:stop_flush"
     text = "Codex conversation evidence packet"
     detail = _build_codex_evidence_packet(
-        events,
+        flush_events,
         project_id=project_id,
         tool=tool,
         source=source,
+    )
+    idempotency_key = _codex_flush_idempotency_key(
+        session_id=sid,
+        project_id=project_id,
+        source=source,
+        events=flush_events,
     )
     summary_payload = {
         "limem_scope": scope,
@@ -1436,13 +1551,18 @@ def _flush_codex_session(buf: Path, creds: Credentials, tool: str) -> None:
         "project_id": project_id,
         "session_id": sid,
         "source": source,
+        "idempotency_key": idempotency_key,
         "importance": 0.3,
         "text": text,
         "detail": detail,
         "metadata": {
-            "turn_count": len(events),
-            "first_event_ts": events[0].get("ts"),
-            "last_event_ts": events[-1].get("ts"),
+            "turn_count": len(flush_events),
+            "first_event_ts": flush_events[0].get("ts"),
+            "last_event_ts": flush_events[-1].get("ts"),
+            "event_start_index": submitted_line_count,
+            "event_end_index": len(events),
+            "buffer_line_count": len(events),
+            "idempotency_key": idempotency_key,
             "packet_format": "turn_observation_neutral_pack_v1",
             "packet_budget_chars": _CODEX_SESSION_PACKET_CHARS,
             "evidence_limit": _CODEX_SESSION_EVIDENCE_LIMIT,
@@ -1464,14 +1584,47 @@ def _flush_codex_session(buf: Path, creds: Credentials, tool: str) -> None:
         except Exception:
             pass
         client.ingest(summary_payload, timestamp=ts)
+        _write_codex_flush_state(
+            buf,
+            session_id=sid,
+            submitted_line_count=len(events),
+            events=events,
+            idempotency_key=idempotency_key,
+            status="committed",
+        )
         daemon_client.set_connectivity(status=200, ok=True)
-        _log("stop_flush", tool, buffer=str(buf), turns=len(events))
+        _log(
+            "stop_flush",
+            tool,
+            buffer=str(buf),
+            turns=len(flush_events),
+            submitted_line_count=len(events),
+            idempotency_key=idempotency_key,
+        )
         session_mute.clear(sid)
-        buf.unlink(missing_ok=True)
+        _cleanup_codex_flush_files(buf, len(events))
     except LimemError as e:
+        _write_codex_flush_state(
+            buf,
+            session_id=sid,
+            submitted_line_count=len(events),
+            events=events,
+            idempotency_key=idempotency_key,
+            status="uncertain",
+            error=str(e),
+        )
         daemon_client.set_connectivity(status=e.status, reason=str(e.message)[:60])
         _log("stop_flush_error", tool, msg=str(e), buffer=str(buf))
     except Exception as e:  # noqa: BLE001
+        _write_codex_flush_state(
+            buf,
+            session_id=sid,
+            submitted_line_count=len(events),
+            events=events,
+            idempotency_key=idempotency_key,
+            status="uncertain",
+            error=str(e),
+        )
         daemon_client.set_connectivity(status=0, reason="network")
         _log("stop_flush_error", tool, msg=str(e), buffer=str(buf))
 
