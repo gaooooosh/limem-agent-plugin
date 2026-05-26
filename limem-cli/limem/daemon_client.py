@@ -20,6 +20,7 @@ from .config import (
     LIMEMD_FORK_LOCK_PATH,
     LIMEMD_SOCK_PATH,
     PENDING_RECALLS_PATH,
+    RuntimeConfig,
     STATUSLINE_CACHE_PATH,
 )
 from .daemon.lock import FileLock
@@ -205,7 +206,13 @@ def write_memory(params: dict[str, Any]) -> dict[str, Any] | None:
     DaemonCallUncertain so callers do not issue a duplicate local ingest.
     """
     try:
-        return call("write_memory", params)
+        runtime = RuntimeConfig.load()
+        return call(
+            "write_memory",
+            params,
+            connect_timeout_ms=runtime.daemon_connect_timeout_ms,
+            call_timeout_ms=runtime.daemon_write_timeout_ms,
+        )
     except DaemonUnavailable:
         return None
 

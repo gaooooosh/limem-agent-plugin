@@ -139,6 +139,7 @@ class RuntimeConfig:
     # daemon / IPC
     daemon_connect_timeout_ms: int = 25
     daemon_call_timeout_ms: int = 200
+    daemon_write_timeout_ms: int = 5000
     daemon_idle_close_seconds: int = 60
     daemon_rss_soft_limit_mb: int = 70
     statusline_cache_refresh_seconds: int = 5

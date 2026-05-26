@@ -231,6 +231,41 @@ def test_memory_writer_falls_back_only_when_daemon_did_not_accept(monkeypatch, t
     assert len(fake.ingest_calls) == 1
 
 
+def test_daemon_write_memory_uses_longer_timeout(monkeypatch) -> None:
+    from limem import daemon_client
+    from limem.config import RuntimeConfig
+
+    calls = []
+
+    def fake_call(method, params=None, *, connect_timeout_ms=25, call_timeout_ms=200):
+        calls.append(
+            {
+                "method": method,
+                "params": params,
+                "connect_timeout_ms": connect_timeout_ms,
+                "call_timeout_ms": call_timeout_ms,
+            }
+        )
+        return {"event_id": "evt_1"}
+
+    monkeypatch.setattr(
+        RuntimeConfig,
+        "load",
+        lambda: RuntimeConfig(daemon_connect_timeout_ms=31, daemon_write_timeout_ms=7000),
+    )
+    monkeypatch.setattr(daemon_client, "call", fake_call)
+
+    assert daemon_client.write_memory({"text": "feedback"}) == {"event_id": "evt_1"}
+    assert calls == [
+        {
+            "method": "write_memory",
+            "params": {"text": "feedback"},
+            "connect_timeout_ms": 31,
+            "call_timeout_ms": 7000,
+        }
+    ]
+
+
 def test_memory_writer_does_not_fallback_when_daemon_result_is_uncertain(monkeypatch, tmp_path) -> None:
     from limem import daemon_client
     from limem import memory_writer as mw
