@@ -78,10 +78,16 @@ class Daemon:
         self._buf_max = 5000
         self._correction_buf: deque[dict[str, Any]] = deque(maxlen=self._buf_max)
         self._post_tool_buf: deque[dict[str, Any]] = deque(maxlen=self._buf_max)
+        self._assistant_evidence_by_session: dict[str, dict[str, Any]] = {}
         # PreToolUse → PostToolUse 配对的临时 holding 池；键 = (session_id, file_path)，A1.2 真消费用。
         # 仅 daemon 内存，不写 events.ndjson（守 feedback #b94b0fa：不扩 event schema）。
         self._pending_intents: dict[tuple[str, str], dict[str, Any]] = {}
-        # A3：session_end 出现时唤醒 learner_loop 提前 tick；不做 session-only flush 以保 24h/7d 跨会话窗口。
+        # passive learner 只在 learnable event 流 idle 后处理冻结批次，避免周期性重复扫同一窗口。
+        self._passive_dirty = False
+        self._last_learnable_event_ts = 0
+        self._last_processed_correction_ts = 0
+        self._last_processed_post_tool_ts = 0
+        self._active_passive_batch_hashes: set[str] = set()
         self._learner_wakeup = asyncio.Event()
         self._shutdown = asyncio.Event()
 
@@ -498,6 +504,12 @@ class Daemon:
             # F2 correction 采集；prev_assistant_head 由 hooks.py UserPromptSubmit 可选填充（A4）。
             from .learner import score_correction
             prev = payload.get("prev_assistant_head") or None
+            if not prev:
+                prev = Daemon._consume_assistant_evidence(
+                    self,
+                    row.get("session_id", ""),
+                    row.get("ts", 0),
+                )
             ok, conf = score_correction(prompt, prev_assistant=prev)
             if ok and conf >= self.runtime.is_correction_confidence_threshold:
                 # deque(maxlen=...) 自动丢最旧；无需 len 守门，避免丢最新事件
@@ -514,6 +526,9 @@ class Daemon:
                         "evidence_id": evidence_id,
                     }
                 )
+                Daemon._mark_passive_dirty(self, row.get("ts", 0))
+        elif kind == "assistant_evidence":
+            Daemon._remember_assistant_evidence(self, row)
         elif kind == "pre_tool_use":
             # A1.2：仅 Edit/Write/NotebookEdit 进配对池（Bash 等不参与，亦不携带 intent_summary）
             tool_name = (payload.get("tool") or "").strip()
@@ -545,9 +560,55 @@ class Daemon:
                     buf_item["intent_summary"] = intent["intent_summary"]
                     buf_item["pair_age_seconds"] = pair_age
             self._post_tool_buf.append(buf_item)
+            if buf_item.get("accepted") and (buf_item.get("diff_summary") or buf_item.get("intent_summary")):
+                Daemon._mark_passive_dirty(self, row.get("ts", 0))
         elif kind == "session_end":
-            # A3：仅唤醒 learner，让 learner_loop 提前 tick；不做 session-only flush（保 24h/7d 跨会话窗口）。
             self._learner_wakeup.set()
+
+    def _mark_passive_dirty(self, ts: int | None = None) -> None:
+        try:
+            self._passive_dirty = True
+            self._last_learnable_event_ts = max(
+                int(getattr(self, "_last_learnable_event_ts", 0) or 0),
+                int(ts or time.time()),
+            )
+            self._learner_wakeup.set()
+        except Exception:
+            pass
+
+    def _remember_assistant_evidence(self, row: dict[str, Any]) -> None:
+        session_id = str(row.get("session_id") or "")
+        if not session_id:
+            return
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        content = " ".join(str(payload.get("content") or "").split())
+        if not content:
+            return
+        store = getattr(self, "_assistant_evidence_by_session", None)
+        if store is None:
+            return
+        store[session_id] = {
+            "ts": int(row.get("ts", 0) or 0),
+            "content": content,
+            "content_hash": str(payload.get("content_hash") or ""),
+            "source": str(payload.get("source") or ""),
+        }
+        if len(store) > 200:
+            for sid, _ev in sorted(store.items(), key=lambda kv: kv[1].get("ts", 0))[: len(store) - 200]:
+                store.pop(sid, None)
+
+    def _consume_assistant_evidence(self, session_id: str, prompt_ts: int | None) -> str:
+        store = getattr(self, "_assistant_evidence_by_session", None)
+        if not store or not session_id:
+            return ""
+        ev = store.pop(session_id, None)
+        if not ev:
+            return ""
+        ev_ts = int(ev.get("ts", 0) or 0)
+        cur_ts = int(prompt_ts or 0)
+        if cur_ts and ev_ts and cur_ts - ev_ts > 3600:
+            return ""
+        return str(ev.get("content") or "")
 
     def _evict_old_intents(self, *, now: int) -> None:
         """清理过期的 pre_tool_use 配对项；上限 200 条防止无界增长。"""
@@ -562,47 +623,127 @@ class Daemon:
                 self._pending_intents.pop(k, None)
 
     async def learner_loop(self) -> None:
-        period = self.runtime.learner_period_seconds
+        period = min(
+            max(1, int(self.runtime.learner_period_seconds)),
+            max(1, int(self.runtime.passive_learning_idle_seconds)),
+        )
         while not self._shutdown.is_set():
             try:
-                await self._run_learner_once()
+                await self._run_learner_if_idle()
             except Exception as e:  # noqa: BLE001
                 _log("learner_error", err=str(e))
-            # 等周期或 session_end / 显式 wakeup 触发（A3）；任何一个先到即进入下一轮 tick。
             try:
                 await asyncio.wait_for(self._learner_wakeup.wait(), timeout=period)
                 self._learner_wakeup.clear()
             except asyncio.TimeoutError:
                 pass
 
+    async def _run_learner_if_idle(self) -> None:
+        if not self.runtime.passive_learning_enabled:
+            return
+        if not getattr(self, "_passive_dirty", False):
+            return
+        last_ts = int(getattr(self, "_last_learnable_event_ts", 0) or 0)
+        if last_ts and int(time.time()) - last_ts < int(self.runtime.passive_learning_idle_seconds):
+            return
+        await self._run_learner_once()
+
     async def _run_learner_once(self) -> None:
+        min_events = max(1, int(getattr(self.runtime, "passive_learning_min_events", 1) or 1))
+        correction_events = [
+            e for e in list(self._correction_buf)
+            if int(e.get("ts", 0) or 0) > int(getattr(self, "_last_processed_correction_ts", 0) or 0)
+        ]
+        post_tool_events = [
+            e for e in list(self._post_tool_buf)
+            if int(e.get("ts", 0) or 0) > int(getattr(self, "_last_processed_post_tool_ts", 0) or 0)
+        ]
+        correction_ready = len(correction_events) >= max(2, min_events)
+        post_tool_ready = len(post_tool_events) >= max(
+            1,
+            int(getattr(self.runtime, "ngram_min_occurrences", 1) or 1),
+        )
+        if not correction_ready and not post_tool_ready:
+            return
+        analyzer_correction_events = correction_events if correction_ready else []
+        analyzer_post_tool_events = post_tool_events if post_tool_ready else []
+        batch_hash = self._passive_batch_hash(correction_events, post_tool_events)
+        if batch_hash in getattr(self, "_active_passive_batch_hashes", set()):
+            self._passive_dirty = False
+            return
         # F2
         new = run_correction_analyzer(
-            self._correction_buf,
+            analyzer_correction_events,
             window_seconds=self.runtime.learner_correction_window_hours * 3600,
             jaccard_threshold=self.runtime.learner_jaccard_threshold,
         )
         # F3
         new += run_ngram_analyzer(
-            self._post_tool_buf,
+            analyzer_post_tool_events,
             window_seconds=self.runtime.ngram_window_days * 86400,
             min_occurrences=self.runtime.ngram_min_occurrences,
             min_accept_rate=self.runtime.ngram_min_accept_rate,
         )
+        for s in new:
+            meta = dict(s.get("metadata") or {})
+            meta["passive_batch_hash"] = batch_hash
+            s["metadata"] = meta
         existing = load_suggestions()
         merged = merge_suggestions(existing, new) if new else existing
-        if not merged:
-            return
-        learned = await self._submit_passive_suggestions(merged)
-        if not new and not learned:
-            return
-        merged = archive_old(merged, max_active=self.runtime.suggestions_max_active)
-        save_suggestions(merged)
-        self.state.suggestion_count = len([s for s in merged if s.get("status") == "pending"])
+        learned = 0
+        if merged and self.runtime.passive_learning_auto_submit:
+            learned = await self._submit_passive_suggestions(merged, batch_hash=batch_hash)
+        if merged:
+            merged = archive_old(merged, max_active=self.runtime.suggestions_max_active)
+            save_suggestions(merged)
+            self.state.suggestion_count = len([s for s in merged if s.get("status") == "pending"])
+        if analyzer_correction_events:
+            self._last_processed_correction_ts = max(int(e.get("ts", 0) or 0) for e in correction_events)
+        if analyzer_post_tool_events:
+            self._last_processed_post_tool_ts = max(int(e.get("ts", 0) or 0) for e in post_tool_events)
+        self._active_passive_batch_hashes.add(batch_hash)
+        self._passive_dirty = False
         if learned:
             self.state.active_memories += learned
 
-    async def _submit_passive_suggestions(self, items: list[dict[str, Any]]) -> int:
+    def _passive_batch_hash(
+        self,
+        correction_events: list[dict[str, Any]],
+        post_tool_events: list[dict[str, Any]],
+    ) -> str:
+        body = {
+            "correction": [
+                {
+                    "ts": e.get("ts", 0),
+                    "session_id": e.get("session_id", ""),
+                    "evidence_id": e.get("evidence_id", ""),
+                    "prompt": e.get("prompt", ""),
+                    "prev": e.get("prev_assistant_head", ""),
+                }
+                for e in correction_events
+            ],
+            "post_tool": [
+                {
+                    "ts": e.get("ts", 0),
+                    "session_id": e.get("session_id", ""),
+                    "evidence_id": e.get("evidence_id", ""),
+                    "diff": e.get("diff_summary", ""),
+                    "intent": e.get("intent_summary", ""),
+                }
+                for e in post_tool_events
+            ],
+        }
+        digest = hashlib.sha1(
+            json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        return f"plb_{digest}"
+
+    async def _submit_passive_suggestions(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        batch_hash: str = "",
+    ) -> int:
         """Submit pending passive-learning candidates to LiMem service as event memories.
 
         The daemon keeps suggestions.json as an audit/retry ledger. The source of truth for
@@ -615,6 +756,9 @@ class Daemon:
         loop = asyncio.get_event_loop()
         for suggestion in items:
             if suggestion.get("status") != "pending":
+                continue
+            meta = suggestion.get("metadata") if isinstance(suggestion.get("metadata"), dict) else {}
+            if batch_hash and meta.get("passive_batch_hash") != batch_hash:
                 continue
             try:
                 result = await loop.run_in_executor(

@@ -457,6 +457,70 @@ def _append_codex_assistant_response_observation(
     return True
 
 
+def _emit_assistant_evidence_safe(
+    *,
+    tool: str,
+    session_id: str,
+    response: str,
+    runtime: RuntimeConfig,
+    source: str,
+) -> None:
+    text = _clean_assistant_evidence(response, runtime)
+    if not text:
+        return
+    content_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+    try:
+        emit_event(
+            "assistant_evidence",
+            tool=tool,
+            session_id=session_id,
+            project_id=detect_project_id(),
+            scope=project_scope(),
+            payload={
+                "content": text,
+                "content_hash": content_hash,
+                "source": source,
+            },
+            redacted=False,
+        )
+    except Exception:
+        pass
+
+
+def _clean_assistant_evidence(response: str, runtime: RuntimeConfig) -> str:
+    text = _strip_limem_notice(response or "")
+    safe, _redacted = _safe_redact(
+        text[: runtime.passive_learning_assistant_evidence_chars],
+        runtime.redact_patterns,
+    )
+    return " ".join(safe.split())
+
+
+def _strip_limem_notice(text: str) -> str:
+    body = text or ""
+    body = re.sub(
+        r"<limem_visible_notice>.*?</limem_visible_notice>",
+        "",
+        body,
+        flags=re.DOTALL,
+    )
+    body = re.sub(
+        r"<limem_memory\b[^>]*>.*?</limem_memory>",
+        "",
+        body,
+        flags=re.DOTALL,
+    )
+    lines = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("> 📚 LiMem") or stripped.startswith("> - "):
+            continue
+        if stripped.startswith("> 本次引用") or stripped.startswith("> 本次未引用"):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def _codex_session_has_assistant_hash(session_id: str, content_hash: str) -> bool:
     if not session_id or not content_hash:
         return False
@@ -666,7 +730,7 @@ def _hook_user_prompt_submit(
     session_id = payload.get("session_id") or payload.get("sessionId") or ""
     project_id = detect_project_id()
     scope = f"project:{project_id}" if project_id else "global"
-    if tool == "codex" and prompt:
+    if tool == "codex" and prompt and runtime.codex_session_observation_enabled:
         _append_codex_user_prompt_observation(
             session_id=session_id,
             prompt=prompt,
@@ -1216,24 +1280,39 @@ def _hook_stop_codex(
     tool: str, payload: dict[str, Any], creds: Credentials, runtime: RuntimeConfig
 ) -> None:
     sid = payload.get("session_id") or payload.get("sessionId") or "unknown"
-    assistant_response = _assistant_response_from_payload(payload)
-    assistant_source = "stop_payload"
-    if not assistant_response and sid != "unknown":
-        assistant_response = _read_codex_last_assistant_response(sid, runtime)
-        assistant_source = "codex_rollout"
-    if assistant_response:
-        _append_codex_assistant_response_observation(
+    if runtime.codex_session_observation_enabled:
+        assistant_response = _assistant_response_from_payload(payload)
+        assistant_source = "stop_payload"
+        if not assistant_response and sid != "unknown":
+            assistant_response = _read_codex_last_assistant_response(sid, runtime)
+            assistant_source = "codex_rollout"
+        if assistant_response:
+            _append_codex_assistant_response_observation(
+                session_id=sid,
+                response=assistant_response,
+                runtime=runtime,
+                source=assistant_source,
+            )
+        _append_codex_session_observation(
             session_id=sid,
-            response=assistant_response,
+            kind="stop",
+            payload={"hook": "Stop"},
             runtime=runtime,
-            source=assistant_source,
         )
-    _append_codex_session_observation(
-        session_id=sid,
-        kind="stop",
-        payload={"hook": "Stop"},
-        runtime=runtime,
-    )
+    else:
+        assistant_response = _assistant_response_from_payload(payload)
+        assistant_source = "stop_payload"
+        if not assistant_response and sid != "unknown":
+            assistant_response = _read_codex_last_assistant_response(sid, runtime)
+            assistant_source = "codex_rollout"
+        if assistant_response and sid != "unknown":
+            _emit_assistant_evidence_safe(
+                tool=tool,
+                session_id=sid,
+                response=assistant_response,
+                runtime=runtime,
+                source=assistant_source,
+            )
 
     # Emit the visible recall notice before passive session flushing. The flush
     # path can hit backend/network timeouts; recall visibility must stay on the
@@ -1249,19 +1328,27 @@ def _hook_stop_codex(
         except Exception:
             pass
 
-    now = int(time.time())
-    threshold = now - runtime.codex_stop_idle_seconds
-    for p in SESSIONS_DIR.glob("*.ndjson"):
-        try:
-            mtime = p.stat().st_mtime
-        except FileNotFoundError:
-            continue
-        if mtime >= threshold:
-            continue
-        try:
-            _flush_codex_session(p, creds, tool)
-        except Exception as e:  # noqa: BLE001
-            _log("stop_flush_error", tool, msg=str(e), buffer=str(p))
+    if runtime.codex_session_observation_enabled:
+        now = int(time.time())
+        threshold = now - runtime.codex_stop_idle_seconds
+        for p in SESSIONS_DIR.glob("*.ndjson"):
+            try:
+                mtime = p.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if mtime >= threshold:
+                continue
+            try:
+                _flush_codex_session(p, creds, tool)
+            except Exception as e:  # noqa: BLE001
+                _log("stop_flush_error", tool, msg=str(e), buffer=str(p))
+    else:
+        _log(
+            "stop_flush_skipped",
+            tool,
+            session_id=sid,
+            reason="codex_session_observation_disabled",
+        )
 
 
 def _assistant_response_from_payload(payload: dict[str, Any]) -> str:

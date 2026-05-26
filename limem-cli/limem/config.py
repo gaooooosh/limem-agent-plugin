@@ -126,6 +126,15 @@ class RuntimeConfig:
     hard_min_importance: float = 0.7
     cache_query_ttl_seconds: int = 300
     cache_query_max_entries: int = 200
+    # Codex Stop hook 曾默认把整段 user/assistant 观察包送入 /ingest。
+    # 这会让后端从 agent 自己的回答中抽取事件，形成自回归记忆污染；默认关闭。
+    codex_session_observation_enabled: bool = False
+    # 被动学习：只在本地可学习事件流 idle 后触发一次，避免周期性重复处理同一窗口。
+    passive_learning_enabled: bool = True
+    passive_learning_idle_seconds: int = 180
+    passive_learning_auto_submit: bool = True
+    passive_learning_min_events: int = 2
+    passive_learning_assistant_evidence_chars: int = 500
     codex_stop_idle_seconds: int = 30
     # daemon / IPC
     daemon_connect_timeout_ms: int = 25

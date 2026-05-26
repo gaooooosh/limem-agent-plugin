@@ -1,6 +1,6 @@
 {
   "name": "limem",
-  "version": "0.3.16",
+  "version": "0.3.19",
   "description": "Principal-centric LiMem memory model: user / agent / project markdown profiles plus three-tier event recall (hard / pattern / soft) with server-side section scoring.",
   "author": "gaooooosh",
   "homepage": "https://limem.gaooooosh.art",

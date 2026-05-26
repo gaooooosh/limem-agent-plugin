@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from typing import Any
 
@@ -1266,12 +1267,86 @@ def test_hook_stop_codex_emits_notice_before_flush(monkeypatch, capsys, tmp_path
         "codex",
         {"session_id": "sess-z"},
         Credentials(api_key="k", db_id="db", user_id="u"),
-        RuntimeConfig(codex_stop_idle_seconds=0),
+        RuntimeConfig(
+            codex_session_observation_enabled=True,
+            codex_stop_idle_seconds=0,
+        ),
     )
     captured = capsys.readouterr()
     data = json.loads(captured.out)
     assert "本次引用 1 条记忆" in data["systemMessage"]
     assert "部署后运行 docker:rebuild" in captured.err
+
+
+def test_hook_stop_codex_skips_session_flush_by_default(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials, RuntimeConfig
+
+    flushed: list[str] = []
+    emitted: list[dict[str, Any]] = []
+    monkeypatch.setattr(hmod, "SESSIONS_DIR", tmp_path)
+    monkeypatch.setattr(hmod, "_stop_recall_message", lambda _sid: "")
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "project-x")
+    monkeypatch.setattr(hmod, "project_scope", lambda: "project:project-x")
+    monkeypatch.setattr(
+        hmod,
+        "emit_event",
+        lambda kind, **kw: emitted.append({"kind": kind, **kw}),
+    )
+    monkeypatch.setattr(
+        hmod,
+        "_flush_codex_session",
+        lambda p, *_args: flushed.append(str(p)),
+    )
+    old = tmp_path / "old-session.ndjson"
+    old.write_text('{"ts": 1, "kind": "user_prompt", "payload": {"content": "x"}}\n')
+    old_mtime = time.time() - 3600
+    os.utime(old, (old_mtime, old_mtime))
+
+    hmod._hook_stop_codex(
+        "codex",
+        {"session_id": "sess-default-off", "assistant_response": "assistant output"},
+        Credentials(api_key="k", db_id="db", user_id="u"),
+        RuntimeConfig(codex_stop_idle_seconds=0),
+    )
+
+    assert capsys.readouterr().out == ""
+    assert flushed == []
+    assert not (tmp_path / "sess-default-off.ndjson").exists()
+    assert old.exists()
+    assert [e["kind"] for e in emitted] == ["assistant_evidence"]
+    assert emitted[0]["payload"]["content"] == "assistant output"
+
+
+def test_hook_user_prompt_submit_skips_codex_session_buffer_by_default(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials, RuntimeConfig
+
+    monkeypatch.setattr(hmod, "SESSIONS_DIR", tmp_path)
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "project-x")
+    monkeypatch.setattr(hmod.daemon_client, "safe_call", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        hmod.daemon_client,
+        "get_connectivity",
+        lambda: {"state": "ok"},
+    )
+    monkeypatch.setattr(hmod, "_active_principals", lambda *_args, **_kw: [])
+    monkeypatch.setattr(hmod, "_emit_event_safe", lambda *_args, **_kw: None)
+    monkeypatch.setattr(hmod.daemon_client, "report_recall", lambda *_args, **_kw: None)
+
+    hmod._hook_user_prompt_submit(
+        "codex",
+        {"session_id": "sess-default-off", "prompt": "不要把这条写进 session buffer"},
+        Credentials(api_key="", db_id="", user_id="u"),
+        RuntimeConfig(),
+    )
+
+    capsys.readouterr()
+    assert not (tmp_path / "sess-default-off.ndjson").exists()
 
 
 def test_build_codex_evidence_packet_keeps_raw_timeline() -> None:
@@ -1406,7 +1481,10 @@ def test_hook_stop_codex_appends_assistant_response_from_rollout(
         "codex",
         {"session_id": "sess-stop"},
         Credentials(api_key="", db_id="", user_id=""),
-        RuntimeConfig(codex_stop_idle_seconds=999999),
+        RuntimeConfig(
+            codex_session_observation_enabled=True,
+            codex_stop_idle_seconds=999999,
+        ),
     )
     capsys.readouterr()
 
