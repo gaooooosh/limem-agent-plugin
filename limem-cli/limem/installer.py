@@ -293,9 +293,13 @@ def ensure_path_symlinks() -> list[str]:
     import sys as _sys
 
     notes: list[str] = []
-    existing = _sh.which("limem")
-    if existing:
-        notes.append(f"`limem` 已在 PATH: {existing}")
+    bin_names = ("limem", "limem-mcp", "limem-statusline", "limemd")
+    existing = {name: _sh.which(name) for name in bin_names}
+    if all(existing.values()):
+        notes.append(
+            "`limem` 命令组已在 PATH: "
+            + ", ".join(f"{name}={path}" for name, path in existing.items() if path)
+        )
         return notes
 
     USER_LOCAL_BIN.mkdir(parents=True, exist_ok=True)
@@ -305,13 +309,9 @@ def ensure_path_symlinks() -> list[str]:
         candidates.append(venv_bin)
     candidates.append(Path(_sys.executable).parent)
     for cand in candidates:
-        src_limem = cand / "limem"
-        src_mcp = cand / "limem-mcp"
-        if src_limem.exists() and src_mcp.exists():
-            for binname in ("limem", "limem-mcp", "limem-statusline", "limemd"):
+        if all((cand / binname).exists() for binname in bin_names):
+            for binname in bin_names:
                 src = cand / binname
-                if not src.exists():
-                    continue
                 (USER_LOCAL_BIN / binname).unlink(missing_ok=True)
                 (USER_LOCAL_BIN / binname).symlink_to(src)
             notes.append(f"symlinked binaries → {cand}")

@@ -1,7 +1,7 @@
 """limem CLI 入口。
 
 子命令：
-- ping / info / bootstrap / hook / remember / init / stats         （阶段 0 既有）
+- ping / info / bootstrap / update / doctor / hook / remember / init / stats
 - daemon {start|stop|status|tail|reset}                            （阶段 1）
 - statusline / sync-static / migrate {clean-static|undo-project-init} （阶段 2）
 - export                                                            （阶段 5）
@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -251,6 +252,98 @@ def _require_api_key(creds: Credentials) -> None:
         console.print(
             "[red]未配置凭证。先运行 `limem bootstrap --api-key <YOUR_TOKEN>`。[/red]"
         )
+        sys.exit(2)
+
+
+# ---------- update / doctor ----------
+
+
+@main.command()
+@click.option("--ref", default="main", help="git 分支或 tag（默认：main）")
+@click.option("--target", "--targets", "targets", default="", help="auto / claude-code / codex / both")
+@click.option("--no-init", is_flag=True, help="只更新 CLI，不刷新 hooks / MCP / skills")
+@click.option("--bootstrap", is_flag=True, help="更新后强制运行 limem bootstrap")
+@click.option("--no-bootstrap", is_flag=True, help="更新后跳过 limem bootstrap")
+@click.option("--dry-run", is_flag=True, help="只显示安装计划，不实际更新")
+@click.option("--verbose", "-v", is_flag=True, help="打印安装器调试输出")
+def update(
+    ref: str,
+    targets: str,
+    no_init: bool,
+    bootstrap: bool,
+    no_bootstrap: bool,
+    dry_run: bool,
+    verbose: bool,
+) -> None:
+    """从 GitHub 拉取最新安装器并更新 LiMem CLI / hooks / skills。"""
+    if bootstrap and no_bootstrap:
+        console.print("[red]--bootstrap 与 --no-bootstrap 不能同时使用[/red]")
+        sys.exit(2)
+
+    installer_url = (
+        "https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/"
+        f"{ref}/install.sh"
+    )
+    cmd = ["bash", "-c", "curl -fsSL \"$1\" | bash -s -- \"${@:2}\"", "limem-update", installer_url]
+    cmd.extend(["--ref", ref, "--update"])
+    if targets:
+        cmd.extend(["--targets", targets])
+    if no_init:
+        cmd.append("--no-init")
+    if bootstrap:
+        cmd.append("--bootstrap")
+    if no_bootstrap:
+        cmd.append("--no-bootstrap")
+    if dry_run:
+        cmd.append("--dry-run")
+    if verbose:
+        cmd.append("--verbose")
+
+    console.print(f"[bold]running installer[/bold]: {installer_url}")
+    try:
+        completed = subprocess.run(cmd, check=False)
+    except FileNotFoundError:
+        console.print("[red]找不到 bash 或 curl。请安装基础 shell 工具后重试。[/red]")
+        sys.exit(13)
+    sys.exit(completed.returncode)
+
+
+@main.command()
+@click.option("--fix", is_flag=True, help="自动修复 hooks / MCP / skills / PATH 链接，并尝试启动 daemon")
+@click.option("--no-backend", is_flag=True, help="跳过后端连通性检查")
+def doctor(fix: bool, no_backend: bool) -> None:
+    """自动诊断 LiMem 安装、配置、daemon、凭证与项目初始化状态。"""
+    from .doctor import run_doctor
+
+    report = run_doctor(fix=fix, backend=not no_backend)
+    t = Table(title="LiMem doctor")
+    t.add_column("check")
+    t.add_column("status")
+    t.add_column("detail")
+    t.add_column("fix")
+    colors = {
+        "ok": "green",
+        "fixed": "green",
+        "warn": "yellow",
+        "error": "red",
+        "skip": "dim",
+    }
+    for check in report.checks:
+        style = colors.get(check.status, "white")
+        t.add_row(
+            check.name,
+            f"[{style}]{check.status}[/{style}]",
+            check.detail,
+            check.fix,
+        )
+    console.print(t)
+    if report.fixes:
+        console.print("[bold]fixes applied[/bold]")
+        for note in report.fixes:
+            console.print(f"· {note}")
+    if report.has_errors:
+        sys.exit(1)
+    if report.has_warnings:
         sys.exit(2)
 
 

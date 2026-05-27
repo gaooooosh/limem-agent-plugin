@@ -10,6 +10,7 @@ def test_imports_all() -> None:
         client,
         config,
         daemon_client,
+        doctor,
         exporter,
         hooks,
         injector,
