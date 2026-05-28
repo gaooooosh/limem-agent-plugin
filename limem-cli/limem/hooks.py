@@ -66,6 +66,12 @@ _CODEX_PACKET_USER_CHARS = 1800
 _CODEX_PACKET_ASSISTANT_CHARS = 4200
 _CODEX_PACKET_OTHER_CHARS = 2200
 
+
+def _read_text_lossy(path: Path) -> str:
+    with path.open("rb") as f:
+        return f.read().decode("utf-8", errors="replace")
+
+
 # ---------- 日志 ----------
 
 
@@ -356,7 +362,16 @@ def _write_codex_flush_state(
 
 def _cleanup_codex_flush_files(buf: Path, submitted_line_count: int) -> None:
     try:
-        current_count = sum(1 for line in buf.read_text().splitlines() if line.strip())
+        current_count = 0
+        for line in _read_text_lossy(buf).splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                current_count += 1
     except FileNotFoundError:
         current_count = 0
     if current_count <= submitted_line_count:
@@ -526,7 +541,7 @@ def _codex_session_has_assistant_hash(session_id: str, content_hash: str) -> boo
         return False
     try:
         p = _codex_session_buffer_path(session_id)
-        for line in p.read_text().splitlines():
+        for line in _read_text_lossy(p).splitlines():
             if not line.strip():
                 continue
             row = json.loads(line)
@@ -1393,7 +1408,7 @@ def _find_codex_rollout_path(session_id: str) -> Path | None:
 
 def _read_last_assistant_from_codex_rollout(path: Path, runtime: RuntimeConfig) -> str:
     try:
-        lines = path.read_text().splitlines()
+        lines = _read_text_lossy(path).splitlines()
     except FileNotFoundError:
         return ""
     for line in reversed(lines):
@@ -1599,7 +1614,7 @@ def _build_codex_evidence_packet(
 
 def _flush_codex_session(buf: Path, creds: Credentials, tool: str) -> None:
     try:
-        lines = buf.read_text().splitlines()
+        lines = _read_text_lossy(buf).splitlines()
     except FileNotFoundError:
         return
     lines = [line for line in lines if line.strip()]
@@ -1607,7 +1622,17 @@ def _flush_codex_session(buf: Path, creds: Credentials, tool: str) -> None:
         buf.unlink(missing_ok=True)
         _codex_session_flush_state_path(buf).unlink(missing_ok=True)
         return
-    events = [json.loads(line) for line in lines]
+    events: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            events.append(row)
+    if not events:
+        _log("stop_flush_skipped", tool, reason="no_valid_events", buffer=str(buf))
+        return
     sid = buf.stem
     submitted_line_count = _read_codex_flush_submitted_count(buf, events)
     if submitted_line_count >= len(events):

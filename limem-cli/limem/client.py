@@ -29,6 +29,7 @@ Entity / Pattern（v3 Principal-Centric Model，2026-05-19）
 from __future__ import annotations
 
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -157,6 +158,38 @@ class LimemError(RuntimeError):
         self.body = body
 
 
+def sanitize_ingest_payload(value: Any) -> Any:
+    """Return JSON-safe text for backend ingest.
+
+    Some hook inputs come from local transcript buffers and can contain NULs or
+    other non-text control bytes after recovery from damaged files. JSON can
+    represent those characters, but the backend ingest pipeline may later decode
+    the embedded content as UTF-8 bytes. Keep normal whitespace and printable
+    text, replace other control characters with U+FFFD.
+    """
+    if isinstance(value, str):
+        cleaned: list[str] = []
+        for ch in value:
+            if ch in "\n\r\t":
+                cleaned.append(ch)
+                continue
+            if unicodedata.category(ch) == "Cc":
+                cleaned.append("\ufffd")
+                continue
+            cleaned.append(ch)
+        return "".join(cleaned)
+    if isinstance(value, dict):
+        return {
+            sanitize_ingest_payload(k): sanitize_ingest_payload(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitize_ingest_payload(v) for v in value]
+    if isinstance(value, tuple):
+        return [sanitize_ingest_payload(v) for v in value]
+    return value
+
+
 class LimemClient:
     """同步 httpx 客户端；hook 脚本短期进程使用。
 
@@ -269,7 +302,10 @@ class LimemClient:
     ) -> IngestResult:
         """data 内自由放置 metadata，后端 LLM 会读 data['detail'] 或 data['text']。"""
         db = self._require_db(db_id)
-        body = {"data": data, "timestamp": timestamp if timestamp is not None else int(time.time())}
+        body = {
+            "data": sanitize_ingest_payload(data),
+            "timestamp": timestamp if timestamp is not None else int(time.time()),
+        }
         r = self._request("POST", f"/db/{db}/ingest", json_body=body, timeout=self.ingest_timeout)
         return IngestResult(
             event_id=r["event_id"],

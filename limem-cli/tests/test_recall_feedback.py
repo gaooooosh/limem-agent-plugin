@@ -1337,6 +1337,11 @@ def test_hook_user_prompt_submit_skips_codex_session_buffer_by_default(
     monkeypatch.setattr(hmod, "_active_principals", lambda *_args, **_kw: [])
     monkeypatch.setattr(hmod, "_emit_event_safe", lambda *_args, **_kw: None)
     monkeypatch.setattr(hmod.daemon_client, "report_recall", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        hmod,
+        "EntityIndex",
+        lambda: type("_Idx", (), {"list_hard_recall": lambda *_args, **_kw: []})(),
+    )
 
     hmod._hook_user_prompt_submit(
         "codex",
@@ -1517,6 +1522,8 @@ def test_flush_codex_session_ingests_markdown_evidence_packet(monkeypatch, tmp_p
     monkeypatch.setattr(hmod, "LimemClient", _Client)
     monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda **_kw: None)
     monkeypatch.setattr(hmod.session_mute, "clear", lambda _sid: None)
+    monkeypatch.setattr(hmod, "ensure_default_principals", lambda *_args, **_kw: None)
+    monkeypatch.setattr(hmod, "EntityIndex", lambda: object())
     monkeypatch.setattr(hmod, "detect_project_id", lambda: "github.com/gaooooosh/limem-agent-plugin")
     monkeypatch.setattr(hmod, "project_scope", lambda: "project:github.com/gaooooosh/limem-agent-plugin")
 
@@ -1559,6 +1566,52 @@ def test_flush_codex_session_ingests_markdown_evidence_packet(monkeypatch, tmp_p
     assert not buf.exists()
 
 
+def test_flush_codex_session_skips_invalid_binary_lines(monkeypatch, tmp_path) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials
+
+    captured: dict[str, Any] = {}
+
+    class _Result:
+        event_id = "evt_1"
+        summary = "ok"
+
+    class _Client:
+        def __init__(self, **_kw):
+            pass
+
+        def ingest(self, data, *, timestamp=None):  # noqa: ARG002
+            captured["data"] = data
+            return _Result()
+
+    monkeypatch.setattr(hmod, "LimemClient", _Client)
+    monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda **_kw: None)
+    monkeypatch.setattr(hmod.session_mute, "clear", lambda _sid: None)
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "github.com/gaooooosh/limem-agent-plugin")
+    monkeypatch.setattr(hmod, "project_scope", lambda: "project:github.com/gaooooosh/limem-agent-plugin")
+
+    buf = tmp_path / "sess-binary.ndjson"
+    valid = json.dumps(
+        {
+            "ts": 1700000000,
+            "kind": "user_prompt",
+            "payload": {"role": "user", "content": "valid prompt"},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    buf.write_bytes(b"\x00\x00\x00\n" + valid + b"\n\xb3\x17j\x00")
+
+    hmod._flush_codex_session(
+        buf,
+        Credentials(api_key="k", db_id="db", user_id="u"),
+        "codex",
+    )
+
+    assert "valid prompt" in captured["data"]["detail"]
+    assert captured["data"]["metadata"]["turn_count"] == 1
+    assert not buf.exists()
+
+
 def test_flush_codex_session_ensures_default_principals_before_ingest(monkeypatch, tmp_path) -> None:
     from limem import hooks as hmod
     from limem.config import Credentials
@@ -1594,6 +1647,7 @@ def test_flush_codex_session_ensures_default_principals_before_ingest(monkeypatc
 
     monkeypatch.setattr(hmod, "LimemClient", _Client)
     monkeypatch.setattr(hmod, "ensure_default_principals", _ensure)
+    monkeypatch.setattr(hmod, "EntityIndex", lambda: object())
     monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda **_kw: None)
     monkeypatch.setattr(hmod.session_mute, "clear", lambda _sid: None)
     monkeypatch.setattr(hmod, "detect_project_id", lambda: "github.com/gaooooosh/limem-agent-plugin")
