@@ -116,10 +116,10 @@ class RuntimeConfig:
     pattern_min_tokens: int = 2
     pattern_top_entities: int = 5
     # 单个 principal /patterns/recall 的 HTTP 超时（毫秒），并发期间任何一个超时即跳过
-    patterns_recall_timeout_ms: int = 80
+    patterns_recall_timeout_ms: int = 300
     # 每个 principal 的 markdown 召回最多取前 N 个 H2 段（后端默认 3，此处缩小避免噪声）
     patterns_recall_top_k_sections: int = 2
-    hook_timeout_ms: int = 500
+    hook_timeout_ms: int = 1500
     bm25_query_top_k: int = 20
     hard_recall_top_k: int = 100
     # v2：UserPromptSubmit 内 hard 召回的最低 importance 阈值（避免低分项挤掉 pattern/soft）

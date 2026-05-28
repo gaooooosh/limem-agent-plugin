@@ -1101,7 +1101,7 @@ def test_emit_stop_systemmessage_writes_json(capsys) -> None:
     hmod._emit_stop_systemmessage("📚 LiMem · test")
     captured = capsys.readouterr()
     data = json.loads(captured.out)
-    assert data["decision"] == "allow"
+    assert "decision" not in data
     assert data["systemMessage"] == "📚 LiMem · test"
     assert data["suppressOutput"] is False
 
@@ -1352,6 +1352,139 @@ def test_hook_user_prompt_submit_skips_codex_session_buffer_by_default(
 
     capsys.readouterr()
     assert not (tmp_path / "sess-default-off.ndjson").exists()
+
+
+def test_user_prompt_submit_probes_recovery_from_network_degraded(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials, RuntimeConfig
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "project-x")
+    monkeypatch.setattr(hmod.daemon_client, "safe_call", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        hmod.daemon_client,
+        "get_connectivity",
+        lambda: {"state": "degraded", "reason": "network timeout"},
+    )
+    connectivity_updates: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        hmod.daemon_client,
+        "set_connectivity",
+        lambda **kw: connectivity_updates.append(kw),
+    )
+    monkeypatch.setattr(hmod.daemon_client, "bump_hit", lambda *_args, **_kw: None)
+    monkeypatch.setattr(hmod.daemon_client, "report_recall", lambda *_args, **_kw: None)
+    monkeypatch.setattr(hmod, "_active_principals", lambda *_args, **_kw: [])
+    monkeypatch.setattr(hmod, "_emit_event_safe", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        hmod,
+        "EntityIndex",
+        lambda: type("_Idx", (), {"list_hard_recall": lambda *_args, **_kw: []})(),
+    )
+
+    class _TaskRecall:
+        prompt_text = "## Relevant Memory\n- [Context] backend recovered"
+
+    class _Client:
+        def __init__(self, *_, **__):
+            pass
+
+        def db_health(self, **_kw):
+            return {"status": "ok"}
+
+        def recall_for_task(self, *_args, **_kw):
+            return _TaskRecall()
+
+    monkeypatch.setattr(hmod, "LimemClient", _Client)
+
+    hmod._hook_user_prompt_submit(
+        "claude-code",
+        {"session_id": "sess-recover", "prompt": "继续任务"},
+        Credentials(api_key="k", db_id="db", user_id="u"),
+        RuntimeConfig(hook_timeout_ms=200, patterns_recall_timeout_ms=20),
+    )
+
+    out = json.loads(capsys.readouterr().out)
+    assert "backend recovered" in out["hookSpecificOutput"]["additionalContext"]
+    assert "status=\"degraded\"" not in out.get("systemMessage", "")
+    assert {"status": 200, "ok": True} in connectivity_updates
+
+
+def test_user_prompt_submit_continues_when_entity_index_unavailable(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials, RuntimeConfig
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "project-x")
+    monkeypatch.setattr(hmod.daemon_client, "safe_call", lambda *_args, **_kw: None)
+    monkeypatch.setattr(hmod.daemon_client, "get_connectivity", lambda: None)
+    monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda *_args, **_kw: None)
+    monkeypatch.setattr(hmod.daemon_client, "bump_hit", lambda *_args, **_kw: None)
+    monkeypatch.setattr(hmod.daemon_client, "report_recall", lambda *_args, **_kw: None)
+    monkeypatch.setattr(hmod, "_emit_event_safe", lambda *_args, **_kw: None)
+
+    class _BrokenIndex:
+        def __init__(self):
+            raise OSError("readonly cache")
+
+    class _TaskRecall:
+        prompt_text = "## Relevant Memory\n- [Context] fallback task recall"
+
+    class _Client:
+        def __init__(self, *_, **__):
+            pass
+
+        def recall_for_task(self, *_args, **_kw):
+            return _TaskRecall()
+
+    monkeypatch.setattr(hmod, "EntityIndex", _BrokenIndex)
+    monkeypatch.setattr(hmod, "LimemClient", _Client)
+
+    hmod._hook_user_prompt_submit(
+        "claude-code",
+        {"session_id": "sess-no-index", "prompt": "继续任务"},
+        Credentials(api_key="k", db_id="db", user_id="u"),
+        RuntimeConfig(),
+    )
+
+    out = json.loads(capsys.readouterr().out)
+    assert "fallback task recall" in out["hookSpecificOutput"]["additionalContext"]
+    assert "本次引用 1 条记忆" in out["systemMessage"]
+
+
+def test_hook_main_swallows_internal_exception_without_schema_log_crash(
+    monkeypatch, capsys
+) -> None:
+    from limem import hooks as hmod
+
+    logged: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        hmod,
+        "_log",
+        lambda event_name, tool, **fields: logged.append(
+            {"event_name": event_name, "tool": tool, **fields}
+        ),
+    )
+    monkeypatch.setattr(
+        hmod,
+        "_hook_user_prompt_submit",
+        lambda *_args, **_kw: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(hmod.Credentials, "load", lambda: hmod.Credentials())
+    monkeypatch.setattr(hmod.RuntimeConfig, "load", lambda: hmod.RuntimeConfig())
+    monkeypatch.setattr(hmod.ProjectConfig, "discover", lambda: None)
+    monkeypatch.setattr("sys.stdin", type("_Stdin", (), {"read": lambda self: "{}"})())
+
+    assert hmod.main(["claude-code", "UserPromptSubmit"]) == 0
+    assert capsys.readouterr().out == ""
+    assert logged
+    assert logged[-1]["event_name"] == "hook_exception"
+    assert logged[-1]["hook_event"] == "UserPromptSubmit"
+    assert "boom" in logged[-1]["traceback"]
 
 
 def test_build_codex_evidence_packet_keeps_raw_timeline() -> None:

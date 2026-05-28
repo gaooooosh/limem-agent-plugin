@@ -277,8 +277,17 @@ class LimemClient:
     def me(self) -> dict[str, Any]:
         return self._request("GET", "/me")
 
-    def db_health(self, db_id: str | None = None) -> dict[str, Any]:
-        return self._request("GET", f"/db/{self._require_db(db_id)}/health")
+    def db_health(
+        self,
+        db_id: str | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/db/{self._require_db(db_id)}/health",
+            timeout=timeout,
+        )
 
     def db_stats(self, db_id: str | None = None) -> dict[str, Any]:
         return self._request("GET", f"/db/{self._require_db(db_id)}/stats")

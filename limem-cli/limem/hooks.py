@@ -65,6 +65,8 @@ _CODEX_PACKET_CONTEXT_CHARS = 700
 _CODEX_PACKET_USER_CHARS = 1800
 _CODEX_PACKET_ASSISTANT_CHARS = 4200
 _CODEX_PACKET_OTHER_CHARS = 2200
+_MIN_HOOK_TIMEOUT_S = 1.5
+_MIN_PATTERN_RECALL_TIMEOUT_S = 0.3
 
 
 def _read_text_lossy(path: Path) -> str:
@@ -272,6 +274,14 @@ def _allowed_scopes(project_id: str) -> list[str]:
     if project_id:
         out.append(f"project:{project_id}")
     return out
+
+
+def _open_entity_index(tool: str) -> EntityIndex | None:
+    try:
+        return EntityIndex()
+    except Exception as e:  # noqa: BLE001
+        _log("entity_index_unavailable", tool, err=str(e)[:160])
+        return None
 
 
 def _safe_redact(text: str, patterns: list[str]) -> tuple[str, bool]:
@@ -645,6 +655,40 @@ def _degraded_banner(reason: str) -> str:
     )
 
 
+def _hook_timeout_s(runtime: RuntimeConfig) -> float:
+    return max(_MIN_HOOK_TIMEOUT_S, runtime.hook_timeout_ms / 1000.0)
+
+
+def _pattern_recall_timeout_s(runtime: RuntimeConfig) -> float:
+    return max(_MIN_PATTERN_RECALL_TIMEOUT_S, runtime.patterns_recall_timeout_ms / 1000.0)
+
+
+def _probe_backend_recovery(creds: Credentials, runtime: RuntimeConfig) -> bool:
+    """Best-effort degraded-state recovery check for transient network failures."""
+    if not creds.api_key or not creds.db_id:
+        return False
+    timeout_s = _hook_timeout_s(runtime)
+    try:
+        LimemClient(creds=creds, timeout=timeout_s).db_health(timeout=timeout_s)
+    except Exception:
+        return False
+    try:
+        daemon_client.set_connectivity(status=200, ok=True)
+    except Exception:
+        pass
+    return True
+
+
+def _should_probe_degraded_reason(reason: str) -> bool:
+    reason_l = (reason or "").lower()
+    if not reason_l:
+        return True
+    return any(
+        token in reason_l
+        for token in ("network", "timeout", "timed out", "read operation", "connect")
+    )
+
+
 def _patterns_recall_for_principals(
     principals: list[PrincipalRow],
     prompt: str,
@@ -655,7 +699,7 @@ def _patterns_recall_for_principals(
     if not principals or not creds.api_key or not creds.db_id:
         return []
 
-    per_timeout_s = max(0.02, runtime.patterns_recall_timeout_ms / 1000.0)
+    per_timeout_s = _pattern_recall_timeout_s(runtime)
     client = LimemClient(creds=creds, timeout=per_timeout_s)
 
     def _fetch(p: PrincipalRow) -> tuple[PrincipalRow, Any]:
@@ -784,29 +828,34 @@ def _hook_user_prompt_submit(
     conn = daemon_client.get_connectivity()
     if conn and conn.get("state") == "degraded":
         reason = conn.get("reason") or "unknown"
-        if session_id and is_degraded_banner_emitted_on_disk(session_id):
-            sys.stdout.write("")
+        if _should_probe_degraded_reason(reason) and _probe_backend_recovery(creds, runtime):
+            conn = None
         else:
-            banner = _degraded_banner(reason)
-            if session_id:
-                _mark_degraded_emitted(session_id)
-            _emit_inject("UserPromptSubmit", "", system_message=banner)
-        _emit_event_safe(
-            "user_prompt_submit",
-            tool,
-            prompt,
-            session_id,
-            project_id,
-            scope,
-            runtime,
-            extra_payload=extra_payload or None,
-        )
-        return
+            if session_id and is_degraded_banner_emitted_on_disk(session_id):
+                sys.stdout.write("")
+            else:
+                banner = _degraded_banner(reason)
+                if session_id:
+                    _mark_degraded_emitted(session_id)
+                _emit_inject("UserPromptSubmit", "", system_message=banner)
+            _emit_event_safe(
+                "user_prompt_submit",
+                tool,
+                prompt,
+                session_id,
+                project_id,
+                scope,
+                runtime,
+                extra_payload=extra_payload or None,
+            )
+            return
 
-    idx = EntityIndex()
+    idx = _open_entity_index(tool)
     scopes = _allowed_scopes(project_id)
-    active_principals = _active_principals(
-        idx, creds, project_id, tool, lazy_ensure=True
+    active_principals = (
+        _active_principals(idx, creds, project_id, tool, lazy_ensure=True)
+        if idx is not None
+        else []
     )
     hard_metas = []
     pattern_slices: list[PatternRecallSlice] = []
@@ -814,6 +863,8 @@ def _hook_user_prompt_submit(
 
     def _do_hard() -> None:
         nonlocal hard_metas
+        if idx is None:
+            return
         hard_metas = idx.list_hard_recall(
             allowed_scopes=scopes,
             allowed_types=["rule", "feedback", "preference"],
@@ -832,13 +883,14 @@ def _hook_user_prompt_submit(
         nonlocal task_recall_text
         if not creds.api_key or not creds.db_id:
             return
-        client = LimemClient(creds=creds, timeout=runtime.hook_timeout_ms / 1000.0)
+        recall_timeout_s = _hook_timeout_s(runtime)
+        client = LimemClient(creds=creds, timeout=recall_timeout_s)
         try:
             task_recall = client.recall_for_task(
                 prompt,
                 limit=runtime.bm25_query_top_k,
                 include_debug=False,
-                timeout=runtime.hook_timeout_ms / 1000.0,
+                timeout=recall_timeout_s,
             )
             task_recall_text = task_recall.prompt_text
             daemon_client.set_connectivity(status=200, ok=True)
@@ -849,7 +901,7 @@ def _hook_user_prompt_submit(
             daemon_client.set_connectivity(status=0, reason="network")
             _log("task_recall_exc", tool, msg=str(e))
 
-    hook_t = runtime.hook_timeout_ms / 1000.0
+    hook_t = _hook_timeout_s(runtime)
     with ThreadPoolExecutor(max_workers=3) as pool:
         f_hard = pool.submit(_do_hard)
         f_pattern = pool.submit(_do_pattern)
@@ -860,10 +912,10 @@ def _hook_user_prompt_submit(
             except FutTimeout:
                 _log(f"{label}_timeout", tool)
 
-    items = (
-        hard_recall_to_items(hard_metas, idx=idx)
-        + pattern_recall_to_items(pattern_slices)
-    )
+    items = []
+    if idx is not None:
+        items.extend(hard_recall_to_items(hard_metas, idx=idx))
+    items.extend(pattern_recall_to_items(pattern_slices))
     items = _filter_seen_recall_items(items, session_id=session_id)
 
     muted = session_mute.get_muted(session_id) if session_id else set()
@@ -1067,7 +1119,10 @@ def _hook_session_start(
         sys.stdout.write("")
         return
 
-    idx = EntityIndex()
+    idx = _open_entity_index(tool)
+    if idx is None:
+        _emit_inject("SessionStart", "")
+        return
     scopes = _allowed_scopes(project_id)
     metas = idx.list_hard_recall(
         allowed_scopes=scopes,
@@ -1177,8 +1232,8 @@ def _format_prompt_recall_systemmessage(record: dict[str, Any]) -> str:
 def _emit_stop_systemmessage(text: str) -> None:
     """写一行 Claude Code Stop hook 协议要求的 JSON 到 stdout。
 
-    协议参考（已经 claude-code-guide 验证）：
-        {"decision": "allow", "systemMessage": "<text>", "suppressOutput": false}
+    Stop hook 只输出通用 top-level 字段；``decision`` 仅允许 approve/block，
+    不能使用 PreToolUse 风格的 allow。
     """
     if not text:
         # 无内容 → 不打扰，stdout 空字符串（Claude Code 不展示）
@@ -1187,7 +1242,6 @@ def _emit_stop_systemmessage(text: str) -> None:
     sys.stdout.write(
         json.dumps(
             {
-                "decision": "allow",
                 "systemMessage": text,
                 "suppressOutput": False,
             },
@@ -1867,7 +1921,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.event == "PostToolUse":
             _hook_post_tool_use(args.tool, payload, creds, runtime)
     except Exception:
-        _log("hook_exception", args.tool, event=args.event, traceback=traceback.format_exc())
+        _log("hook_exception", args.tool, hook_event=args.event, traceback=traceback.format_exc())
         return 0
     return 0
 
