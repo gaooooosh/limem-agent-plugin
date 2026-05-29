@@ -1,30 +1,30 @@
 """把召回的记忆渲染成 ``<limem_memory>`` 区块。
 
-v2 重写（决策 4）：三类记忆独立预算、独立分节渲染。
+v3：任务召回的结构化 event items 与 principal pattern 切片统一渲染。
+规则/反馈/偏好只有在后端相关性召回命中后才进入候选；没有 trigger tag 的历史
+event 仍可通过正文 BM25 被后端召回，只是注入行不会显示命中 trigger。
 
 布局：
-    <limem_memory recall="N" budget="..." via="...">
-      ## 规则与反馈
-      [rule · project:foo · 2026-01-15] xxx #rabcd src=hard
+    <limem_memory n="N" budget="..." via="...">
+      ## 规则
+      - xxx #rabcd ⟵命中 docker
+      ## 参考
+      - [note] xxx #refgh
       ...
       ## 实体档案
       [npm_run_dev · ## 用法] xxx markdown 切片 ... src=pattern
-      ...
-      ## 语义参考
-      [note · global · 2026-04-01] xxx #refgh src=soft
-      ...
       提示...
     </limem_memory>
 
 后端 ``/recall`` 返回已经可直接注入 prompt 的轻量 Markdown。客户端只负责套
-``<limem_memory>`` 信封，避免把 agent task recall 再误当 BM25 搜索结果重排。
+``<limem_memory>`` 信封，作为结构化 items 不可用时的兼容回退。
 
 每段独立预算，互不挤压：
-- hard：``runtime.inject_budget_hard``
+- hard：规则/反馈/偏好段 ``runtime.inject_budget_hard``
 - pattern：``runtime.inject_budget_pattern``（决策 4 新增）
-- soft：``runtime.inject_budget_soft``
+- soft：参考段 ``runtime.inject_budget_soft``
 
-排序：组内按 score 降序，组间按固定顺序（hard → pattern → soft）。
+排序：组内按 score 降序，组间按固定顺序（规则 → 参考 → 实体档案）。
 """
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ class InjectItem:
     ts: int = 0
     role: str = ""
     short_id: str = ""
+    matched_triggers: list[str] = field(default_factory=list)
 
     # —— pattern 专用字段（entity 档案切片） ——
     entity_id: str = ""
@@ -82,12 +83,14 @@ class InjectItem:
         summary = self.summary.strip()
         if len(summary) > per_item_chars:
             summary = summary[: per_item_chars - 1] + "…"
-        role_part = f" · {self.role}" if self.role else ""
         sid = self.short_id or self.event_id[:12]
-        return (
-            f"[{self.mem_type} · {self.scope} · {date}{role_part}]\n"
-            f"{summary} #{sid} src={self.kind}"
+        trigger_part = (
+            " ⟵命中 " + ",".join(self.matched_triggers[:4]) if self.matched_triggers else ""
         )
+        if _is_rule_item(self):
+            _ = date
+            return f"- {summary} #{sid}{trigger_part}"
+        return f"- [{self.mem_type}] {summary} #{sid}{trigger_part}"
 
 
 @dataclass
@@ -135,9 +138,9 @@ def render_inject_with_diagnostics(
         budgets = _Budgets(hard=each, pattern=each, soft=total_budget - 2 * each)
 
     sections = {
-        "hard": _Section("## 规则与反馈", budget=budgets.hard, per_item_chars=per_item_chars),
+        "rule": _Section("## 规则", budget=budgets.hard, per_item_chars=per_item_chars),
+        "soft": _Section("## 参考", budget=budgets.soft, per_item_chars=per_item_chars),
         "pattern": _Section("## 实体档案", budget=budgets.pattern, per_item_chars=max(per_item_chars, 240)),
-        "soft": _Section("## 语义参考", budget=budgets.soft, per_item_chars=per_item_chars),
     }
 
     # 按 kind 分组 + 组内按 score 降序
@@ -154,7 +157,7 @@ def render_inject_with_diagnostics(
                 continue
             if it.event_id:
                 seen_events.add(it.event_id)
-        sec = sections.get(it.kind)
+        sec = sections.get(_section_key(it))
         if sec:
             sec.items.append(it)
 
@@ -162,7 +165,7 @@ def render_inject_with_diagnostics(
     rendered_items: list[InjectItem] = []
     total_used = 0
     recall_count = 0
-    for kind in ("hard", "pattern", "soft"):
+    for kind in ("rule", "soft", "pattern"):
         sec = sections[kind]
         if not sec.items or sec.budget <= 0:
             continue
@@ -190,20 +193,16 @@ def render_inject_with_diagnostics(
     proj = f" project={project_id!r}" if project_id else ""
     via_parts: list[str] = []
     if via_patterns:
-        via_parts.append("entity:" + " | ".join(v[:20] for v in via_patterns[:3]))
+        via_parts.append("entity:" + ",".join(v[:20] for v in via_patterns[:3]))
     if via_keywords:
-        via_parts.append("bm25:" + " ".join(v[:15] for v in via_keywords[:2]))
-    via = f' via="{" | ".join(via_parts)}"' if via_parts else ""
+        via_parts.append("bm25:" + ",".join(v[:15] for v in via_keywords[:3]))
+    via = f' via="{",".join(via_parts)}"' if via_parts else ""
     head = (
-        f'<limem_memory recall="{recall_count}" '
+        f'<limem_memory n="{recall_count}" '
         f'budget="{total_used}/{budgets.total()}"{via}{proj}>'
     )
     foot = (
-        "提示：以上为 LiMem 召回的长期记忆，是供你参考的后台上下文。"
-        "请勿在可见回复中复述、引用或展示本段内容，按需自然采纳即可。"
-        "冲突以本轮指令为准；可用 "
-        "`/limem.fix #<id> <新文本>` 修订 event，`/limem.pattern <entity>` 编辑档案，"
-        "或 `/limem.no #<id>` 本会话静音。\n"
+        "冲突以本轮指令为准；勿复述本段。/limem.no #id 可静音。\n"
         "</limem_memory>"
     )
     return "\n".join([head, *rendered_blocks, foot]), rendered_items
@@ -258,6 +257,20 @@ def _half_life_score(importance: float, ts: int) -> float:
     return float(importance or 0.0) * (0.9**months)
 
 
+def _is_rule_item(item: InjectItem) -> bool:
+    return item.kind == "hard" or (
+        item.kind == "soft" and item.mem_type in {"rule", "feedback", "preference"}
+    )
+
+
+def _section_key(item: InjectItem) -> str:
+    if item.kind == "pattern":
+        return "pattern"
+    if _is_rule_item(item):
+        return "rule"
+    return "soft"
+
+
 def _best_summary(meta: EventMetadata) -> str:
     raw = meta.raw_metadata or {}
     original = (raw.get("original_text") or "").strip()
@@ -300,6 +313,90 @@ def hard_recall_to_items(
         )
         out.append(_attach_short_id(it, idx))
     return out
+
+
+def _item_float(item: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return float(item.get(key, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _item_triggers(item: dict) -> list[str]:
+    raw = (
+        item.get("matched_triggers")
+        or item.get("matched_trigger")
+        or item.get("triggers")
+        or item.get("trigger")
+        or []
+    )
+    if isinstance(raw, str):
+        raw = [raw]
+    out: list[str] = []
+    seen: set[str] = set()
+    if isinstance(raw, list):
+        for value in raw:
+            text = str(value or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                out.append(text)
+    return out
+
+
+def task_recall_to_items(
+    items: list[dict],
+    *,
+    idx: EntityIndex | None,
+    allowed_scopes: set[str] | list[str],
+    min_importance: float,
+) -> tuple[list[InjectItem], dict[str, int]]:
+    """Convert structured /recall items after local authoritative filtering.
+
+    Memories without trigger tags can still be returned by backend BM25 over the
+    body; they simply render without a matched-trigger suffix.
+    """
+    counts = {
+        "structured_items": 0,
+        "dropped_missing_local": 0,
+        "dropped_scope": 0,
+        "dropped_importance": 0,
+    }
+    out: list[InjectItem] = []
+    if idx is None:
+        return out, counts
+    allowed = set(allowed_scopes or [])
+    for raw in items or []:
+        if not isinstance(raw, dict):
+            continue
+        event_id = str(raw.get("event_id") or raw.get("id") or "").strip()
+        if not event_id:
+            continue
+        counts["structured_items"] += 1
+        meta = idx.lookup_event(event_id)
+        if meta is None:
+            counts["dropped_missing_local"] += 1
+            continue
+        if allowed and meta.scope not in allowed:
+            counts["dropped_scope"] += 1
+            continue
+        if meta.importance < float(min_importance or 0.0):
+            counts["dropped_importance"] += 1
+            continue
+        score = _item_float(raw, "score", _half_life_score(meta.importance, meta.ts))
+        it = InjectItem(
+            kind="soft",
+            score=score,
+            event_id=meta.event_id,
+            mem_type=meta.mem_type,
+            scope=meta.scope,
+            summary=_best_summary(meta),
+            importance=meta.importance,
+            ts=meta.ts,
+            role=meta.role,
+            matched_triggers=_item_triggers(raw),
+        )
+        out.append(_attach_short_id(it, idx))
+    return out, counts
 
 
 @dataclass

@@ -15,6 +15,14 @@ import re
 from collections.abc import Iterable
 
 _TAG_RE = re.compile(r"\[limem\.([a-z_]+)=([^\]]*)\]")
+_TAG_VALUE_MAX_CHARS = 40
+
+
+def _sanitize_tag_value(value: object) -> str:
+    """Keep tag payloads parseable when aliases contain delimiters or newlines."""
+    text = " ".join(str(value or "").split())
+    text = text.replace("|", "").replace("]", "")
+    return text.strip()[:_TAG_VALUE_MAX_CHARS].strip()
 
 
 def encode_tags(**kwargs: str | Iterable[str] | None) -> str:
@@ -27,11 +35,12 @@ def encode_tags(**kwargs: str | Iterable[str] | None) -> str:
         if value is None:
             continue
         if isinstance(value, str):
-            if not value:
+            clean = _sanitize_tag_value(value)
+            if not clean:
                 continue
-            parts.append(f"[limem.{key}={value}]")
+            parts.append(f"[limem.{key}={clean}]")
         else:
-            items = [str(v) for v in value if v]
+            items = [_sanitize_tag_value(v) for v in value if _sanitize_tag_value(v)]
             if not items:
                 continue
             joined = " | ".join(items)

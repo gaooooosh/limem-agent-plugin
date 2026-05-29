@@ -117,13 +117,15 @@ LiMem backend
 Long-term memory graph and search service
 ```
 
-召回分三层：
+召回按当前上下文相关性触发：
 
-1. 本地强规则召回：高优先级规则、反馈和偏好。
+1. 任务召回：把当前真实任务交给 LiMem 后端，结构化 event items 会再经过本地 SQLite 镜像做 scope、tombstone、importance 过滤后注入。
 2. Principal pattern 召回：匹配 user、agent、project 等 Markdown 档案切片。
-3. 任务召回：把当前真实任务交给 LiMem 后端，返回可注入 prompt 的相关记忆。
+3. 兼容回退：后端尚未返回结构化 items、或本地镜像缺失导致结构化结果无法权威过滤时，回退注入后端 `prompt_text`。
 
 每条被召回的记忆会带短 ID，方便后续修订、静音或审计。
+
+LiMem 不再保证某条规则"每轮必出现"。需要始终生效的硬约束，例如始终中文回复、禁止自动 commit、必须先征求确认等，应写入 `CLAUDE.md`、`AGENTS.md` 或全局系统指令。已有这类 LiMem 记忆需要迁移，否则行为会随相关性召回而改变。新写入记忆会把 canonical 与 aliases 编码为 `[limem.trigger=...]` 供后端命中；没有 trigger 的历史记忆仍可靠正文 BM25 相关性召回，只是注入时不会显示"命中 trigger"。
 
 ## 安全与隐私
 

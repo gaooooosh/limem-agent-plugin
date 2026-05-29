@@ -21,6 +21,7 @@ from limem.injector import (
     render_backend_recall,
     render_inject,
     render_inject_with_diagnostics,
+    task_recall_to_items,
 )
 
 # ---------- injector ----------
@@ -51,8 +52,8 @@ def test_render_inject_with_diagnostics_returns_rendered_items() -> None:
     )
     assert text != ""
     assert len(rendered) == 2
-    # recall="N" 的 N == rendered 数
-    assert 'recall="2"' in text
+    # n="N" 的 N == rendered 数
+    assert 'n="2"' in text
 
 
 def test_render_inject_drops_items_when_budget_too_small() -> None:
@@ -68,7 +69,7 @@ def test_render_inject_drops_items_when_budget_too_small() -> None:
     # 第一条至少进得去，第二条被丢
     assert len(rendered) == 1
     assert rendered[0].event_id == "evt_a"
-    assert 'recall="1"' in text
+    assert 'n="1"' in text
     assert "#aaaaaaaaaaaa" in text
     assert "#bbbbbbbbbbbb" not in text
 
@@ -117,6 +118,96 @@ def test_render_backend_recall_wraps_prompt_text() -> None:
 
 def test_render_backend_recall_empty_returns_empty_string() -> None:
     assert render_backend_recall("  ") == ""
+
+
+def test_task_recall_to_items_filters_with_drop_counts(tmp_path) -> None:
+    from limem.entity_index import EntityIndex
+
+    idx = EntityIndex(db_path=tmp_path / "idx.sqlite")
+    for event_id, scope, importance, summary in [
+        ("evt_keep", "project:p", 0.9, "保留规则"),
+        ("evt_low", "project:p", 0.1, "低重要性"),
+        ("evt_scope", "global", 0.9, "错 scope"),
+        ("evt_tomb", "project:p", 0.9, "已删除"),
+    ]:
+        idx.upsert_event_metadata(
+            {
+                "event_id": event_id,
+                "scope": scope,
+                "mem_type": "rule",
+                "project_id": "p",
+                "importance": importance,
+                "role": "",
+                "source": "test",
+                "ts": 1700000000,
+                "summary": summary,
+            }
+        )
+    idx.tombstone_event("evt_tomb")
+
+    items, counts = task_recall_to_items(
+        [
+            {"event_id": "evt_keep", "score": 0.42, "matched_triggers": ["docker"]},
+            {"event_id": "evt_low", "score": 0.9},
+            {"event_id": "evt_scope", "score": 0.8},
+            {"event_id": "evt_tomb", "score": 0.7},
+            {"event_id": "evt_missing", "score": 0.6},
+            {"text": "散项无 event_id"},
+        ],
+        idx=idx,
+        allowed_scopes={"project:p"},
+        min_importance=0.5,
+    )
+
+    assert [it.event_id for it in items] == ["evt_keep"]
+    assert items[0].score == 0.42
+    assert items[0].matched_triggers == ["docker"]
+    assert counts == {
+        "structured_items": 5,
+        "dropped_missing_local": 2,
+        "dropped_scope": 1,
+        "dropped_importance": 1,
+    }
+
+
+def test_render_structured_rule_shows_matched_triggers() -> None:
+    item = InjectItem(
+        kind="soft",
+        score=0.9,
+        event_id="evt_a",
+        mem_type="rule",
+        scope="global",
+        summary="部署后重建容器",
+        short_id="abc123def456",
+        matched_triggers=["docker rebuild"],
+    )
+    text, rendered = render_inject_with_diagnostics(
+        [item],
+        budgets=Budgets(hard=400, pattern=0, soft=0),
+    )
+    assert rendered == [item]
+    assert "## 规则" in text
+    assert "- 部署后重建容器 #abc123def456 ⟵命中 docker rebuild" in text
+
+
+def test_render_structured_reference_uses_reference_section() -> None:
+    item = InjectItem(
+        kind="soft",
+        score=0.9,
+        event_id="evt_note",
+        mem_type="note",
+        scope="global",
+        summary="临时上下文",
+        short_id="note12345678",
+        matched_triggers=["context"],
+    )
+    text, rendered = render_inject_with_diagnostics(
+        [item],
+        budgets=Budgets(hard=0, pattern=0, soft=400),
+    )
+    assert rendered == [item]
+    assert "## 参考" in text
+    assert "- [note] 临时上下文 #note12345678 ⟵命中 context" in text
 
 
 # ---------- statusline ----------
@@ -686,7 +777,7 @@ def test_hook_filter_seen_recall_items_keeps_hard_but_drops_seen_patterns(monkey
     )
 
     items = [
-        InjectItem(kind="hard", score=1.0, event_id="e_seen", summary="old"),
+        InjectItem(kind="hard", score=1.0, event_id="e_seen", mem_type="rule", summary="old"),
         InjectItem(
             kind="pattern",
             score=1.0,
@@ -694,7 +785,7 @@ def test_hook_filter_seen_recall_items_keeps_hard_but_drops_seen_patterns(monkey
             heading="部署",
             pattern_content="old pattern",
         ),
-        InjectItem(kind="hard", score=1.0, event_id="e_new", summary="new"),
+        InjectItem(kind="hard", score=1.0, event_id="e_new", mem_type="rule", summary="new"),
     ]
 
     out = hmod._filter_seen_recall_items(items, session_id="sess-1")
@@ -1337,11 +1428,7 @@ def test_hook_user_prompt_submit_skips_codex_session_buffer_by_default(
     monkeypatch.setattr(hmod, "_active_principals", lambda *_args, **_kw: [])
     monkeypatch.setattr(hmod, "_emit_event_safe", lambda *_args, **_kw: None)
     monkeypatch.setattr(hmod.daemon_client, "report_recall", lambda *_args, **_kw: None)
-    monkeypatch.setattr(
-        hmod,
-        "EntityIndex",
-        lambda: type("_Idx", (), {"list_hard_recall": lambda *_args, **_kw: []})(),
-    )
+    monkeypatch.setattr(hmod, "EntityIndex", lambda: type("_Idx", (), {})())
 
     hmod._hook_user_prompt_submit(
         "codex",
@@ -1378,11 +1465,7 @@ def test_user_prompt_submit_probes_recovery_from_network_degraded(
     monkeypatch.setattr(hmod.daemon_client, "report_recall", lambda *_args, **_kw: None)
     monkeypatch.setattr(hmod, "_active_principals", lambda *_args, **_kw: [])
     monkeypatch.setattr(hmod, "_emit_event_safe", lambda *_args, **_kw: None)
-    monkeypatch.setattr(
-        hmod,
-        "EntityIndex",
-        lambda: type("_Idx", (), {"list_hard_recall": lambda *_args, **_kw: []})(),
-    )
+    monkeypatch.setattr(hmod, "EntityIndex", lambda: type("_Idx", (), {})())
 
     class _TaskRecall:
         prompt_text = "## Relevant Memory\n- [Context] backend recovered"

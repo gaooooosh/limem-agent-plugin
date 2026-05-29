@@ -120,6 +120,58 @@ def test_remember_writes_event_but_no_entity_registration(monkeypatch, tmp_path)
     assert meta.raw_metadata.get("observer_principal_id") == "principal_agent_codex"
     assert meta.raw_metadata.get("subject_principal_ids") == out["subject_principal_ids"]
     assert meta.raw_metadata.get("original_text", "").startswith("禁用 npm run dev")
+    assert meta.raw_metadata.get("triggers") == [
+        "npm run dev",
+        "npm dev",
+        "docker compose up --build",
+    ]
+
+    composed = fake.ingest_calls[0]["text"]
+    assert "[limem.trigger= npm run dev | npm dev | docker compose up --build ]" in composed
+
+
+def test_remember_trigger_falls_back_to_body_keywords_when_entities_empty(
+    monkeypatch, tmp_path
+) -> None:
+    fake = _FakeClient()
+    _patch(monkeypatch, fake)
+    idx = EntityIndex(db_path=tmp_path / "patterns.sqlite")
+
+    out = remember_impl(
+        text="部署后运行 docker rebuild 再检查 healthcheck",
+        scope="project:foo/bar",
+        mem_type="rule",
+        importance=0.9,
+        project_id="foo/bar",
+        entities=[],
+        creds=_FakeCreds(),
+        idx=idx,
+        skip_redact=True,
+    )
+
+    meta = idx.lookup_event(out["event_id"])
+    assert meta is not None
+    triggers = meta.raw_metadata.get("triggers")
+    assert triggers
+    assert len(triggers) <= 6
+    assert "docker" in triggers or "rebuild" in triggers
+    assert "[limem.trigger=" in fake.ingest_calls[0]["text"]
+
+
+def test_encode_tags_sanitizes_trigger_delimiters() -> None:
+    from limem.tag_text import encode_tags
+
+    text = encode_tags(
+        scope="project:foo\nbar",
+        canonical=["ok", "bad|value", "close]tag"],
+        trigger=["line\nbreak", "pipe|drop", "x" * 80],
+    )
+    assert "\n" not in text
+    assert "badvalue" in text
+    assert "closetag" in text
+    assert "pipe|" not in text
+    assert "]tag" not in text
+    assert "x" * 41 not in text
 
 
 def test_remember_ingest_detail_is_natural_context(monkeypatch, tmp_path) -> None:

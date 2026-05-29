@@ -59,9 +59,9 @@ def test_render_inject_via_and_short_id() -> None:
         ),
     ]
     text = render_inject(items, via_patterns=["npm dev"], via_keywords=["docker", "rebuild"])
-    assert 'via="entity:npm dev | bm25:docker rebuild"' in text
+    assert 'via="entity:npm dev,bm25:docker,rebuild"' in text
     assert "#abc123def456" in text
-    assert "src=hard" in text
+    assert "- 禁用 npm run dev，改 docker rebuild #abc123def456" in text
 
 
 def test_entity_index_short_id_roundtrip(tmp_path) -> None:

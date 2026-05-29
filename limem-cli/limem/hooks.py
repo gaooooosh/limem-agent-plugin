@@ -48,11 +48,11 @@ from .injector import (
     Budgets,
     InjectItem,
     PatternRecallSlice,
-    hard_recall_to_items,
     pattern_recall_to_items,
     render_backend_recall,
     render_inject,
     render_inject_with_diagnostics,
+    task_recall_to_items,
 )
 from .principals import ensure_default_principals
 from .redact import contains_secret
@@ -588,10 +588,10 @@ def _filter_seen_recall_items(
 ) -> list[InjectItem]:
     """Drop memories already injected earlier in this session.
 
-    Hard rules/feedback/preferences are intentionally not filtered. They are the
-    durable instructions users expect to be re-applied and visibly cited on any
-    relevant turn. Session de-dupe only suppresses lower-signal repeats such as
-    pattern slices or other non-hard recall items.
+    Rules/feedback/preferences are intentionally not filtered after they have
+    been selected by recall relevance. Session de-dupe only suppresses lower-
+    signal repeats such as pattern slices, facts, notes, decisions, or fallback
+    task recall text.
     """
     if not session_id or not items:
         return items
@@ -604,7 +604,7 @@ def _filter_seen_recall_items(
     out: list[InjectItem] = []
     local_seen: set[str] = set()
     for item in items:
-        if item.kind == "hard":
+        if item.mem_type in {"rule", "feedback", "preference"}:
             out.append(item)
             continue
         key = _inject_item_key(item)
@@ -720,6 +720,54 @@ def _patterns_recall_for_principals(
                 )
             )
     return slices
+
+
+def _structured_items(raw_items: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in raw_items or []:
+        if isinstance(item, dict) and item.get("event_id"):
+            out.append(item)
+    return out
+
+
+def _structured_task_recall(
+    query: str,
+    creds: Credentials,
+    runtime: RuntimeConfig,
+    idx: EntityIndex | None,
+    allowed_scopes: list[str],
+    *,
+    tool: str,
+) -> tuple[Any | None, list[InjectItem], dict[str, int], bool]:
+    """Run /recall and prefer structured items when local filtering is possible."""
+    counts = {
+        "structured_items": 0,
+        "dropped_missing_local": 0,
+        "dropped_scope": 0,
+        "dropped_importance": 0,
+    }
+    if not creds.api_key or not creds.db_id:
+        return None, [], counts, False
+    recall_timeout_s = _hook_timeout_s(runtime)
+    client = LimemClient(creds=creds, timeout=recall_timeout_s)
+    task_recall = client.recall_for_task(
+        query,
+        limit=runtime.bm25_query_top_k,
+        include_debug=False,
+        timeout=recall_timeout_s,
+    )
+    structured = _structured_items(getattr(task_recall, "items", []))
+    if not structured or idx is None:
+        return task_recall, [], counts, False
+    items, counts = task_recall_to_items(
+        structured,
+        idx=idx,
+        allowed_scopes=allowed_scopes,
+        min_importance=runtime.hard_min_importance,
+    )
+    fallback = bool(structured and not items and counts["dropped_missing_local"] == len(structured))
+    _ = tool
+    return task_recall, items, counts, not fallback
 
 
 def _active_principals(
@@ -839,19 +887,16 @@ def _hook_user_prompt_submit(
         if idx is not None
         else []
     )
-    hard_metas = []
     pattern_slices: list[PatternRecallSlice] = []
-    task_recall_text = ""
-
-    def _do_hard() -> None:
-        nonlocal hard_metas
-        if idx is None:
-            return
-        hard_metas = idx.list_hard_recall(
-            allowed_scopes=scopes,
-            allowed_types=["rule", "feedback", "preference"],
-            min_importance=runtime.hard_min_importance,
-        )
+    task_recall: Any | None = None
+    task_items: list[InjectItem] = []
+    task_counts = {
+        "structured_items": 0,
+        "dropped_missing_local": 0,
+        "dropped_scope": 0,
+        "dropped_importance": 0,
+    }
+    task_structured_ok = False
 
     def _do_pattern() -> None:
         nonlocal pattern_slices
@@ -862,20 +907,18 @@ def _hook_user_prompt_submit(
         )
 
     def _do_task_recall() -> None:
-        nonlocal task_recall_text
-        if not creds.api_key or not creds.db_id:
-            return
-        recall_timeout_s = _hook_timeout_s(runtime)
-        client = LimemClient(creds=creds, timeout=recall_timeout_s)
+        nonlocal task_recall, task_items, task_counts, task_structured_ok
         try:
-            task_recall = client.recall_for_task(
+            task_recall, task_items, task_counts, task_structured_ok = _structured_task_recall(
                 prompt,
-                limit=runtime.bm25_query_top_k,
-                include_debug=False,
-                timeout=recall_timeout_s,
+                creds,
+                runtime,
+                idx,
+                scopes,
+                tool=tool,
             )
-            task_recall_text = task_recall.prompt_text
-            daemon_client.set_connectivity(status=200, ok=True)
+            if task_recall is not None:
+                daemon_client.set_connectivity(status=200, ok=True)
         except LimemError as e:
             daemon_client.set_connectivity(status=e.status, reason=str(e.message)[:60])
             _log("task_recall_error", tool, status=e.status, msg=e.message)
@@ -884,19 +927,17 @@ def _hook_user_prompt_submit(
             _log("task_recall_exc", tool, msg=str(e))
 
     hook_t = _hook_timeout_s(runtime)
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        f_hard = pool.submit(_do_hard)
+    with ThreadPoolExecutor(max_workers=2) as pool:
         f_pattern = pool.submit(_do_pattern)
         f_task = pool.submit(_do_task_recall)
-        for fut, label in ((f_hard, "hard"), (f_pattern, "pattern"), (f_task, "task_recall")):
+        for fut, label in ((f_pattern, "pattern"), (f_task, "task_recall")):
             try:
                 fut.result(timeout=hook_t)
             except FutTimeout:
                 _log(f"{label}_timeout", tool)
 
     items = []
-    if idx is not None:
-        items.extend(hard_recall_to_items(hard_metas, idx=idx))
+    items.extend(task_items)
     items.extend(pattern_recall_to_items(pattern_slices))
     items = _filter_seen_recall_items(items, session_id=session_id)
 
@@ -919,8 +960,12 @@ def _hook_user_prompt_submit(
         via_patterns=via_patterns,
         via_keywords=via_keywords,
     )
-    task_recall_text = _filter_seen_task_recall(
-        task_recall_text, session_id=session_id
+    task_recall_text = str(getattr(task_recall, "prompt_text", "") or "")
+    use_backend_fallback = bool(task_recall_text and not task_structured_ok)
+    task_recall_text = (
+        _filter_seen_task_recall(task_recall_text, session_id=session_id)
+        if use_backend_fallback
+        else ""
     )
     backend_text = render_backend_recall(task_recall_text)
     if backend_text:
@@ -964,10 +1009,13 @@ def _hook_user_prompt_submit(
         project_id=project_id,
         scope=scope,
         prompt_head=prompt[:60],
-        hard_hits=len(hard_metas),
         principals=len(active_principals),
         pattern_slices=len(pattern_slices),
         task_recall_chars=len(task_recall_text),
+        structured_items=task_counts["structured_items"],
+        dropped_missing_local=task_counts["dropped_missing_local"],
+        dropped_scope=task_counts["dropped_scope"],
+        dropped_importance=task_counts["dropped_importance"],
         injected_chars=len(text),
         rendered=len(rendered_items),
     )
@@ -1104,40 +1152,65 @@ def _hook_session_start(
         _emit_inject("SessionStart", "")
         return
     scopes = _allowed_scopes(project_id)
-    metas = idx.list_hard_recall(
-        allowed_scopes=scopes,
-        allowed_types=["rule", "feedback", "preference"],
-        min_importance=runtime.hard_min_importance,
-    )
 
     # 注册 / 刷新默认 principals（user / agent / project）
     active_principals = _active_principals(
         idx, creds, project_id, tool, lazy_ensure=True
     )
     pattern_slices: list[PatternRecallSlice] = []
+    task_recall: Any | None = None
+    task_items: list[InjectItem] = []
+    task_counts = {
+        "structured_items": 0,
+        "dropped_missing_local": 0,
+        "dropped_scope": 0,
+        "dropped_importance": 0,
+    }
+    task_structured_ok = False
+    q = f"session start {project_id} {tool}".strip()
     if active_principals and creds.api_key and creds.db_id:
-        q = f"session start {project_id} {tool}".strip()
         try:
             pattern_slices = _patterns_recall_for_principals(
                 active_principals, q, creds, runtime
             )
         except Exception:
             pattern_slices = []
+    try:
+        task_recall, task_items, task_counts, task_structured_ok = _structured_task_recall(
+            q,
+            creds,
+            runtime,
+            idx,
+            scopes,
+            tool=tool,
+        )
+        if task_recall is not None:
+            daemon_client.set_connectivity(status=200, ok=True)
+    except Exception:
+        task_recall = None
 
-    items = hard_recall_to_items(metas, idx=idx) + pattern_recall_to_items(pattern_slices)
+    items = task_items + pattern_recall_to_items(pattern_slices)
     budgets = Budgets(
         hard=runtime.inject_budget_hard,
         pattern=runtime.inject_budget_pattern if pattern_slices else 0,
-        soft=0,
+        soft=runtime.inject_budget_soft,
     )
     text = render_inject(items, project_id=project_id, budgets=budgets)
-    if items:
+    task_recall_text = str(getattr(task_recall, "prompt_text", "") or "")
+    if task_recall_text and not task_structured_ok:
+        text = "\n\n".join(part for part in (text, render_backend_recall(task_recall_text)) if part)
+    if items or task_recall_text:
         daemon_client.bump_hit(session_id)
     _log(
         "session_start", tool,
         session_id=session_id, project_id=project_id, scope=scope,
-        hard_recall=len(metas), principals=len(active_principals),
-        pattern_slices=len(pattern_slices), injected_chars=len(text),
+        principals=len(active_principals),
+        pattern_slices=len(pattern_slices),
+        structured_items=task_counts["structured_items"],
+        dropped_missing_local=task_counts["dropped_missing_local"],
+        dropped_scope=task_counts["dropped_scope"],
+        dropped_importance=task_counts["dropped_importance"],
+        injected_chars=len(text),
     )
     emit_event(
         "session_start", tool=tool, session_id=session_id,

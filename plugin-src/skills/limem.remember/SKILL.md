@@ -31,6 +31,8 @@ arguments: [text]
 本 skill **不写** principal 的 markdown 档案。要附长文档（用法 / 反例 / 约定）请用
 `/limem.pattern project|user|agent`——这是 v3 的设计分工。
 
+LiMem 现在按上下文相关性召回，canonical / aliases 会作为 trigger 辅助命中；它不再适合保存"必须每轮生效"的无条件约束。始终生效的要求应写入 `CLAUDE.md`、`AGENTS.md` 或全局系统指令。
+
 ## 处理步骤（严格按顺序）
 
 ### Step 1 — 解析输入与 mention 抽取

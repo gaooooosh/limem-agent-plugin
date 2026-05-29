@@ -74,7 +74,7 @@ class TaskRecallResult:
         )
 
     def has_content(self) -> bool:
-        return bool(self.prompt_text.strip())
+        return bool(self.prompt_text.strip() or self.items)
 
 
 @dataclass

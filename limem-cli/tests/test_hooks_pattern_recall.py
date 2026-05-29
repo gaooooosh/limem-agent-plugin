@@ -1,4 +1,4 @@
-"""hooks: UserPromptSubmit 三路并发使用 principals 而非 entity FTS。"""
+"""hooks: task recall and principal pattern recall avoid hard-rule broadcasts."""
 
 from __future__ import annotations
 
@@ -356,6 +356,10 @@ def test_user_prompt_submit_auto_recall_keeps_seen_hard_items_and_task_recall(
 
     class _FakeTaskRecall:
         prompt_text = "## Relevant Memory\n- [Context] task recall 仍自动召回"
+        items = [
+            {"event_id": "e_seen", "score": 0.9, "matched_triggers": ["部署问题"]},
+            {"event_id": "e_new", "score": 0.8, "matched_triggers": ["部署问题"]},
+        ]
 
     class _FakeClient:
         def __init__(self, *_, **__):
@@ -379,12 +383,184 @@ def test_user_prompt_submit_auto_recall_keeps_seen_hard_items_and_task_recall(
     context = out["hookSpecificOutput"]["additionalContext"]
     assert "新的相关规则" in context
     assert "已召回过的规则" in context
-    assert "task recall 仍自动召回" in context
+    assert "task recall 仍自动召回" not in context
+    assert "⟵命中 部署问题" in context
     assert out["systemMessage"].startswith("> 📚 LiMem\n")
     assert "UserPromptSubmit" not in out["systemMessage"]
-    assert "本次引用 3 条记忆" in out["systemMessage"]
+    assert "本次引用 2 条记忆" in out["systemMessage"]
     # 召回提示只走对话外 systemMessage，不再注入对话内 additionalContext。
     assert "<limem_visible_notice>" not in context
     assert "UserPromptSubmit" not in context
     assert len(reports) == 1
-    assert [item["src"] for item in reports[0]["items"]] == ["hard", "hard", "task"]
+    assert [item["src"] for item in reports[0]["items"]] == ["bm25", "bm25"]
+
+
+def test_user_prompt_submit_mixed_structured_items_ignore_scatter(monkeypatch, tmp_path, capsys) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials, RuntimeConfig
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "proj/demo")
+    monkeypatch.setattr(hmod.daemon_client, "safe_call", lambda *_, **__: None)
+    monkeypatch.setattr(hmod.daemon_client, "get_connectivity", lambda: None)
+    monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda *_, **__: None)
+    monkeypatch.setattr(hmod.daemon_client, "bump_hit", lambda *_, **__: None)
+    monkeypatch.setattr(hmod.daemon_client, "seen_recall_keys", lambda session_id: set())
+    monkeypatch.setattr(hmod.daemon_client, "report_recall", lambda payload: None)
+    monkeypatch.setattr(hmod, "_emit_event_safe", lambda *_, **__: None)
+    monkeypatch.setattr(hmod, "_read_prev_assistant_head", lambda *_, **__: "")
+    monkeypatch.setattr(hmod, "_patterns_recall_for_principals", lambda *_, **__: [])
+    monkeypatch.setattr(hmod, "ensure_default_principals", lambda *_, **__: [])
+
+    idx = EntityIndex(db_path=tmp_path / "idx.sqlite")
+    idx.upsert_event_metadata(
+        {
+            "event_id": "evt_struct",
+            "scope": "project:proj/demo",
+            "mem_type": "rule",
+            "project_id": "proj/demo",
+            "importance": 1.0,
+            "role": "",
+            "source": "test",
+            "ts": 1700000000,
+            "summary": "结构化规则",
+        }
+    )
+    monkeypatch.setattr(hmod, "EntityIndex", lambda: idx)
+
+    class _FakeTaskRecall:
+        prompt_text = "## Relevant Memory\n- [Context] prompt_text 汇总不应重复"
+        items = [
+            {"text": "散项"},
+            {"event_id": "evt_struct", "score": 0.7, "matched_triggers": ["trigger"]},
+        ]
+
+    class _FakeClient:
+        def __init__(self, *_, **__):
+            pass
+
+        def recall_for_task(self, task, **kwargs):
+            return _FakeTaskRecall()
+
+    monkeypatch.setattr(hmod, "LimemClient", _FakeClient)
+
+    hmod._hook_user_prompt_submit(
+        "codex",
+        {"prompt": "trigger", "session_id": "sess-mixed"},
+        Credentials(api_key="k", db_id="db_1", user_id="u_42"),
+        RuntimeConfig(hook_timeout_ms=200, patterns_recall_timeout_ms=20),
+    )
+
+    context = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert "结构化规则" in context
+    assert "prompt_text 汇总不应重复" not in context
+
+
+def test_user_prompt_submit_missing_local_all_falls_back_to_prompt_text(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials, RuntimeConfig
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "proj/demo")
+    monkeypatch.setattr(hmod.daemon_client, "safe_call", lambda *_, **__: None)
+    monkeypatch.setattr(hmod.daemon_client, "get_connectivity", lambda: None)
+    monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda *_, **__: None)
+    monkeypatch.setattr(hmod.daemon_client, "bump_hit", lambda *_, **__: None)
+    monkeypatch.setattr(hmod.daemon_client, "seen_recall_keys", lambda session_id: set())
+    monkeypatch.setattr(hmod.daemon_client, "report_recall", lambda payload: None)
+    monkeypatch.setattr(hmod, "_emit_event_safe", lambda *_, **__: None)
+    monkeypatch.setattr(hmod, "_read_prev_assistant_head", lambda *_, **__: "")
+    monkeypatch.setattr(hmod, "_patterns_recall_for_principals", lambda *_, **__: [])
+    monkeypatch.setattr(hmod, "ensure_default_principals", lambda *_, **__: [])
+    monkeypatch.setattr(hmod, "EntityIndex", lambda: EntityIndex(db_path=tmp_path / "idx.sqlite"))
+
+    class _FakeTaskRecall:
+        prompt_text = "## Relevant Memory\n- [Context] fallback because local mirror missing"
+        items = [{"event_id": "evt_missing", "score": 0.7}]
+
+    class _FakeClient:
+        def __init__(self, *_, **__):
+            pass
+
+        def recall_for_task(self, task, **kwargs):
+            return _FakeTaskRecall()
+
+    monkeypatch.setattr(hmod, "LimemClient", _FakeClient)
+
+    hmod._hook_user_prompt_submit(
+        "codex",
+        {"prompt": "trigger", "session_id": "sess-missing"},
+        Credentials(api_key="k", db_id="db_1", user_id="u_42"),
+        RuntimeConfig(hook_timeout_ms=200, patterns_recall_timeout_ms=20),
+    )
+
+    context = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert '<limem_memory source="task">' in context
+    assert "fallback because local mirror missing" in context
+
+
+def test_session_start_uses_structured_task_recall_without_hard_broadcast(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    from limem import hooks as hmod
+    from limem.config import Credentials, RuntimeConfig
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(hmod, "detect_project_id", lambda: "proj/demo")
+    monkeypatch.setattr(hmod.daemon_client, "safe_call", lambda *_, **__: None)
+    monkeypatch.setattr(hmod.daemon_client, "set_connectivity", lambda *_, **__: None)
+    monkeypatch.setattr(hmod.daemon_client, "bump_hit", lambda *_, **__: None)
+    monkeypatch.setattr(hmod, "ensure_default_principals", lambda *_, **__: [])
+    monkeypatch.setattr(hmod, "_patterns_recall_for_principals", lambda *_, **__: [])
+
+    idx = EntityIndex(db_path=tmp_path / "idx.sqlite")
+    idx.upsert_event_metadata(
+        {
+            "event_id": "evt_session",
+            "scope": "project:proj/demo",
+            "mem_type": "preference",
+            "project_id": "proj/demo",
+            "importance": 0.9,
+            "role": "",
+            "source": "test",
+            "ts": 1700000000,
+            "summary": "SessionStart 相关偏好",
+        }
+    )
+
+    class _NoHardIndex:
+        def __new__(cls, *_, **__):
+            return idx
+
+    monkeypatch.setattr(hmod, "EntityIndex", _NoHardIndex)
+
+    calls: list[str] = []
+
+    class _FakeTaskRecall:
+        prompt_text = "## Relevant Memory\n- [Context] fallback 不应使用"
+        items = [{"event_id": "evt_session", "score": 0.9, "matched_triggers": ["session start"]}]
+
+    class _FakeClient:
+        def __init__(self, *_, **__):
+            pass
+
+        def recall_for_task(self, task, **kwargs):
+            calls.append(task)
+            return _FakeTaskRecall()
+
+    monkeypatch.setattr(hmod, "LimemClient", _FakeClient)
+
+    hmod._hook_session_start(
+        "codex",
+        {"session_id": "sess-start"},
+        Credentials(api_key="k", db_id="db_1", user_id="u_42"),
+        RuntimeConfig(hook_timeout_ms=200, patterns_recall_timeout_ms=20),
+    )
+
+    assert calls == ["session start proj/demo codex"]
+    out = json.loads(capsys.readouterr().out)
+    context = out["hookSpecificOutput"]["additionalContext"]
+    assert "SessionStart 相关偏好" in context
+    assert "fallback 不应使用" not in context

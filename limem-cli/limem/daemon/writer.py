@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -27,11 +28,64 @@ from ..config import Credentials, RuntimeConfig
 from ..entity_index import EntityIndex
 from ..principals import ensure_default_principals, normalize_project_deictics
 from ..redact import contains_secret
-from ..tag_text import encode_tags
+from ..tag_text import _sanitize_tag_value, encode_tags
 
 _WRITE_LEDGER_WAIT_SECONDS = 2.0
 _WRITE_LEDGER_POLL_SECONDS = 0.05
 _WRITE_LEDGER_STALE_SECONDS = 600
+_TRIGGER_FALLBACK_STOPWORDS = {
+    "always",
+    "from",
+    "into",
+    "this",
+    "that",
+    "the",
+    "and",
+    "or",
+    "with",
+    "以后",
+    "这个",
+    "项目",
+    "不要",
+    "禁止",
+    "必须",
+    "应该",
+    "记住",
+    "规则",
+}
+
+
+def _trigger_keywords_from_text(text: str, *, limit: int = 6) -> list[str]:
+    """Fallback triggers for writes that omit entities.
+
+    Old memories without trigger tags still rely on backend BM25 over the body.
+    For new entity-less writes, a small body-derived trigger list keeps them
+    eligible for structured recall without changing the public write schema.
+    """
+    out: list[str] = []
+    for token in re.findall(r"[一-鿿\w][一-鿿\w:/._-]{1,}", text or "", re.UNICODE):
+        clean = _sanitize_tag_value(token.lower())
+        if not clean or clean in _TRIGGER_FALLBACK_STOPWORDS or clean in out:
+            continue
+        out.append(clean)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _triggers_from_entities(entities: list[dict[str, Any]] | None, text: str) -> list[str]:
+    triggers: list[str] = []
+    seen: set[str] = set()
+    for entity in entities or []:
+        values = [entity.get("canonical"), *(entity.get("aliases") or [])]
+        for value in values:
+            clean = _sanitize_tag_value(value)
+            if clean and clean not in seen:
+                seen.add(clean)
+                triggers.append(clean)
+    if not triggers:
+        triggers = _trigger_keywords_from_text(text)
+    return triggers
 
 
 def build_natural_detail(
@@ -238,6 +292,7 @@ def remember_impl(
                 detail = normalize_project_deictics(detail, project_id=effective_proj_id)
 
     canonicals = [e["canonical"] for e in entities or [] if e.get("canonical")]
+    triggers = _triggers_from_entities(entities, text)
     write_key = memory_write_key(
         text=text,
         scope=scope,
@@ -344,6 +399,7 @@ def remember_impl(
         scope=scope,
         type=mem_type,
         canonical=canonicals or None,
+        trigger=triggers or None,
         principal=principal_ids or None,
     )
     composed_text = f"{tag_block} {text}".strip()
@@ -380,6 +436,7 @@ def remember_impl(
     event_id = ingest_res.event_id
     event_meta = {
         "canonicals": canonicals,
+        "triggers": triggers,
         "original_text": text,
         "observer_principal_id": observer_principal_id,
         "subject_principal_ids": subject_principal_ids,
