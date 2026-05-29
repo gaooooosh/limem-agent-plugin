@@ -1,98 +1,102 @@
 # LiMem Agent Plugin
 
-LiMem Agent Plugin 是 LiMem 长期记忆服务面向 **Claude Code** 与 **Codex CLI** 的 Agent 接入插件。
+LiMem Agent Plugin 把 LiMem 长期记忆接入 Claude Code 和 Codex。它提供 CLI、MCP server、hooks、slash skills、本地 daemon 和 SQLite 缓存，让 Agent 能在不同会话里记住项目规则、用户偏好、纠正反馈和服务上下文。
 
-它把一次性的 AI 编程会话升级为可持续协作关系：项目约定、用户偏好、反复纠正、团队规范、运维流程、服务上下文和 Agent 行为要求，都可以跨会话、跨项目地记住、召回、编辑、静音、归档、导出和治理。
+## 安装
 
-> 这个仓库本身不是一个独立记忆后端，而是依托 LiMem 服务运行的客户端插件与本地运行时。
+推荐只使用这一条命令安装和更新：
 
----
+```bash
+curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh | bash
+```
 
-## 项目定位
+这个命令会自动完成：
 
-大多数编码 Agent 在会话结束后都会遗忘关键上下文，而真实工程协作依赖大量稳定但分散的知识：
+- 检测 macOS、Linux 或 WSL 环境。
+- 检查 Python 3.10+。
+- 安装或更新 `limem` CLI。
+- 自动接入本机已有的 Claude Code 和/或 Codex 配置。
+- 安装 MCP server、hooks、statusline 和 slash skills。
+- 首次使用时引导配置 LiMem API Key 和数据库。
 
-- “这个项目不要启动本地 dev server，修改后直接重建 Docker。”
-- “评审 analytics 问题时必须验证写入路径、后端数据和页面渲染。”
-- “部署前先检查服务健康、容器状态和公开访问路径。”
-- “LiMem 服务日志不能耦合进算法模块。”
-- “用户偏好直接、可执行、有证据的工程反馈。”
+安装完成后，在需要启用项目记忆的仓库里执行：
 
-LiMem Agent Plugin 提供的是一个面向 Agent 的 LiMem 接入层。它通过 MCP、Hooks、Slash Skills、本地 Daemon 和 SQLite 镜像，把 LiMem 后端能力接入编码工具，同时保证凭证安全、召回可控、上下文不被无关信息污染。
+```bash
+limem init --project
+```
 
----
+如果需要重新配置 API Key 或数据库：
 
-## 核心特性
+```bash
+limem bootstrap
+```
+
+要求：Python 3.10+。支持 macOS、Linux 和 WSL；Windows 原生 shell 暂不支持。
+
+## 它解决什么问题
+
+编码 Agent 经常在新会话里丢失关键上下文，例如项目启动方式、review 标准、部署流程、用户表达偏好、反复纠正过的错误。LiMem Agent Plugin 把这些信息沉淀成可管理的长期记忆，并在合适的时机注入给 Agent。
+
+适合用来保存：
+
+- 仓库级工程规则和运行方式。
+- 用户偏好和沟通风格。
+- 代码评审、测试、部署和排障流程。
+- 服务边界、模块职责和团队规范。
+- Agent 反复犯错后的纠正反馈。
+
+## 核心能力
 
 | 能力 | 说明 |
 |---|---|
-| 长期记忆写入 | 持久化规则、反馈、偏好、事实、笔记、决策和操作经验。 |
-| 跨会话召回 | 在用户 prompt 进入 Agent 前自动召回当前项目相关记忆。 |
-| Claude Code + Codex 支持 | 同一套运行时同时支持 Claude Code 插件与 Codex MCP 集成。 |
-| MCP 工具集 | 暴露搜索、写入、列表、归档、修订、暂停、静音、统计、principal 和 pattern 管理能力。 |
-| Slash Skills | 内置 `/limem.*` 技能，方便 Agent 在对话中显式操作记忆。 |
-| Principal 档案 | 支持 `user`、`agent`、`project`、`team`、`service` 等主体的 Markdown 档案。 |
-| 三层召回 | 本地强规则召回、Principal Pattern 召回、LiMem 任务召回协同工作。 |
-| 被动学习 | 从重复纠正和被接受的工具行为中生成候选建议，用户审阅后再入库。 |
-| 本地 Daemon | 将慢任务、状态、队列、学习分析和连通性检查移出 prompt 同步路径。 |
-| 状态行与 TUI | 通过 statusline 和 `limem dash` 展示健康状态、召回次数、暂停状态和候选建议。 |
-| 安全边界 | 凭证隔离、敏感信息 redaction、hook 异常吞掉并记录，避免阻塞用户工作流。 |
+| 自动召回 | 在 Agent 收到用户 prompt 前召回当前任务相关记忆。 |
+| 显式写入 | 通过 CLI、MCP 或 slash skills 保存规则、反馈、事实、笔记和决策。 |
+| 项目隔离 | 区分全局用户偏好和项目级记忆，减少跨项目污染。 |
+| Principal 档案 | 为 `user`、`agent`、`project`、`team`、`service` 维护 Markdown 档案。 |
+| MCP 工具 | 为 Claude Code 和 Codex 暴露结构化记忆操作工具。 |
+| Slash Skills | 内置 `/limem.*` 技能，方便在对话中管理记忆。 |
+| 本地 daemon | 后台处理状态、队列、学习候选和连通性检查。 |
+| 安全边界 | 凭证独立保存，敏感信息写入前 redaction，hook 失败不阻塞工作流。 |
 
----
+## 常用命令
 
-## 设计特点
+```bash
+limem ping
+limem info
+limem stats
+limem remember "这个项目修改后必须重建 Docker，不要启动本地 dev server"
+limem recall "部署流程"
+limem list
+limem dash
+```
 
-### 1. 记忆有作用域，不制造全局噪声
+Principal 档案：
 
-LiMem 区分全局用户偏好和项目级规则。插件会识别当前仓库，并按 `global` 与 `project:<id>` 过滤召回结果，避免一个项目的规则污染另一个项目。
+```bash
+limem pattern get project
+limem pattern put project ./PROJECT_MEMORY.md
+limem entity list
+limem project list
+```
 
-### 2. 用户始终拥有控制权
+## Agent 中的用法
 
-记忆不是黑盒。用户可以写入、列表、搜索、修订、静音、暂停、归档和导出记忆。每条被召回的记忆都带有短 ID，方便在对话中快速 `/limem.fix` 或 `/limem.no`。
+安装后，Agent 可以使用 MCP 工具和 slash skills 管理 LiMem 记忆。常用技能包括：
 
-### 3. 面向编码 Agent 的低延迟设计
+| Skill | 作用 |
+|---|---|
+| `/limem.remember` | 保存规则、偏好、事实、决策、笔记或反馈。 |
+| `/limem.recall` | 手动搜索 LiMem 记忆。 |
+| `/limem.list` | 列出当前项目和全局规则。 |
+| `/limem.fix` | 按短 ID 修订一条记忆。 |
+| `/limem.no` | 当前会话临时静音某条记忆。 |
+| `/limem.forget` | 归档一条长期记忆。 |
+| `/limem.pause` | 暂停召回与采集。 |
+| `/limem.resume` | 恢复召回与采集。 |
+| `/limem.pattern` | 查看或更新 principal Markdown 档案。 |
+| `/limem.stats` | 查看本地缓存统计。 |
 
-Hook 路径保持轻量和可降级。重任务交给 `limemd` 后台处理；召回有独立预算和超时；本地 SQLite 镜像用于权威 scope/type 过滤，减少后端搜索噪声。
-
-### 4. 不污染 Agent 主上下文
-
-插件只把真正的召回结果和极简降级状态注入 Agent 上下文。建议、统计、日志、调试信息走 statusline、TUI、本地通知和本地文件，不把“我注意到……”这类内容塞进主对话。
-
-### 5. 与 LiMem 后端职责清晰
-
-插件侧负责本地安装、Agent 配置、召回注入、显式写入、被动学习候选和本地缓存；长期存储、搜索、图谱和多租户能力由 LiMem 后端提供。
-
----
-
-## 功能场景
-
-### 个人 AI 编程记忆
-
-- 记录个人编码偏好和命令习惯
-- 记住某个项目的特殊运行方式
-- 避免 Agent 反复犯同类错误
-- 跨会话保留调试、部署和验证经验
-- 在新会话中自动恢复关键上下文
-
-### 团队 Agent 治理
-
-- 沉淀仓库级工程规范
-- 统一 Review 和测试检查标准
-- 记录服务边界、模块职责和部署流程
-- 为不同团队、服务、项目维护独立档案
-- 让 Agent 遵守团队已有工作方式
-
-### LiMem 客户端接入层
-
-- 为开发者提供标准化 LiMem 安装入口
-- 将 LiMem 记忆能力接入 Claude Code 和 Codex
-- 通过 MCP 工具开放可编程操作面
-- 支持本地诊断、导出和基础审计
-- 让用户偏好、项目规范和服务知识沉淀到 LiMem
-
----
-
-## 架构概览
+## 工作方式
 
 ```text
 Claude Code / Codex
@@ -101,262 +105,34 @@ Claude Code / Codex
         v
 limem-cli runtime
         |
-        | local SQLite mirror, scope filtering, short IDs
+        | local SQLite cache, scope filtering, short IDs
         |
         +---- limemd daemon
-        |       | event bus, passive learning, statusline cache,
-        |       | suggestions queue, connectivity state
+        |       | status, passive learning, suggestions
         |
         v
 LiMem backend
         |
-        | /db/{db_id}/...
         v
 Long-term memory graph and search service
 ```
 
-关键边界：
+召回分三层：
 
-- `limem.client` 是唯一直接耦合 LiMem 后端 HTTP 契约的模块。Agent 自动召回使用 `POST /db/{db_id}/recall`，输入为当前真实任务，返回可直接注入 prompt 的轻量 Markdown；`POST /db/{db_id}/query` 保留为显式 BM25 事件搜索接口。
-- Hooks 失败必须吞掉并记录，不能阻塞用户 prompt。
-- 凭证只写入 `~/.config/limem/credentials.json`，权限为 `chmod 600`。
-- 项目配置写入 `.limem/local.json`，并加入 `.gitignore`。
-- 被动学习只生成候选建议，用户确认后才成为长期记忆。
+1. 本地强规则召回：高优先级规则、反馈和偏好。
+2. Principal pattern 召回：匹配 user、agent、project 等 Markdown 档案切片。
+3. 任务召回：把当前真实任务交给 LiMem 后端，返回可注入 prompt 的相关记忆。
 
----
-
-## 安装
-
-### 一行安装 / 更新
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh | bash
-```
-
-这一个命令同时负责首次安装和后续更新。脚本会自动完成：
-
-1. 检测 macOS / Linux / WSL。
-2. 验证 Python 3.10+。
-3. 读取当前已安装版本和远程目标版本。
-4. 未安装时自动安装；发现目标版本更新时自动升级；已是最新时只刷新 hooks、MCP、statusline 和 skills。
-5. 优先使用 `uv tool install`；没有 `uv` 时改用插件自管 venv，并在 venv 内执行 `pip install`。
-6. 自动检测本机已有的 `~/.claude` / `~/.codex`，接入 Claude Code 和/或 Codex。
-7. 首次使用或凭证缺失时进入 `limem bootstrap`，配置 LiMem API Key 与数据库；已有凭证时自动跳过。
-
-### 非交互安装
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh \
-  | bash -s -- --api-key sk-xxx
-```
-
-也可以使用环境变量：
-
-```bash
-LIMEM_API_KEY=sk-xxx \
-curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh | bash
-```
-
-### 安装参数
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh \
-  | bash -s -- --help
-```
-
-| 参数 | 说明 |
-|---|---|
-| `--api-key TOKEN` | 传给 `limem bootstrap`，跳过交互输入。 |
-| `--ref REF` | 安装指定分支或 tag，默认 `main`。 |
-| `--target TARGET` | 高级选项：安装目标 `auto`、`claude-code`、`codex`、`both`。默认 `auto`。 |
-| `--targets TARGETS` | 同 `--target`，也接受 `claude-code,codex`。 |
-| `--update` | 兼容旧用法：强制重装当前 ref，并刷新 hooks、MCP 和 skills。通常不需要手动传。 |
-| `--no-init` | 只安装 CLI，不 patch Claude Code / Codex 配置。 |
-| `--bootstrap` | 即使已有凭证也重新运行 `limem bootstrap`。 |
-| `--no-bootstrap` | 跳过 LiMem API Key 初始化。 |
-| `--dry-run` | 只检测环境、下载源码并显示当前版本与目标版本，不安装。 |
-| `--verbose` | 输出安装调试信息。 |
-
-### 更新
-
-```bash
-# 后续更新仍然执行同一个命令
-curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh | bash
-
-# 如果需要重新选择 LiMem db，再显式要求 bootstrap
-curl -fsSL https://raw.githubusercontent.com/gaooooosh/limem-agent-plugin/main/install.sh \
-  | bash -s -- --bootstrap
-```
-
----
-
-## 手动安装
-
-```bash
-git clone https://github.com/gaooooosh/limem-agent-plugin.git
-cd limem-agent-plugin
-uv tool install --force ./limem-cli
-limem bootstrap --api-key <YOUR_API_KEY>
-limem init
-```
-
-没有 `uv` 时也可以用 venv 手动安装：
-
-```bash
-python3 -m venv ~/.local/share/limem-agent-plugin/venv
-~/.local/share/limem-agent-plugin/venv/bin/python -m pip install ./limem-cli
-mkdir -p ~/.local/bin
-ln -sfn ~/.local/share/limem-agent-plugin/venv/bin/limem ~/.local/bin/limem
-ln -sfn ~/.local/share/limem-agent-plugin/venv/bin/limem-mcp ~/.local/bin/limem-mcp
-ln -sfn ~/.local/share/limem-agent-plugin/venv/bin/limemd ~/.local/bin/limemd
-ln -sfn ~/.local/share/limem-agent-plugin/venv/bin/limem-statusline ~/.local/bin/limem-statusline
-export PATH="$HOME/.local/bin:$PATH"
-limem bootstrap --api-key <YOUR_API_KEY>
-limem init
-```
-
-`limem init` 会同时刷新全局 hooks / MCP / skills，并在当前项目目录自动写入
-`.limem/local.json`，用于固定 project scope。只想初始化当前项目时可使用：
-
-```bash
-cd your-project
-limem init --project
-# 首次 init 会提示输入 project id；直接回车会自动生成。也可以用参数跳过提示：
-limem init --project --project-id github.com/owner/repo
-```
-
----
-
-## 平台支持
-
-| 平台 | 状态 |
-|---|---|
-| macOS Intel / Apple Silicon | 支持 |
-| Linux | 支持 |
-| WSL | 支持 |
-| Windows 原生 shell | 暂不支持，请使用 WSL |
-
-要求 Python 3.10+。
-
----
-
-## 常用命令
-
-```bash
-limem ping
-limem info
-limem stats
-limem remember "这个项目修改后总是重建 Docker，不要启动本地 dev server"
-limem export --format markdown
-```
-
-```bash
-limem pattern get project
-limem pattern put project ./PROJECT_MEMORY.md
-limem project list
-limem entity list
-limem daemon status
-limem dash
-```
-
----
-
-## Slash Skills
-
-插件内置一组可被 Agent 使用的 `/limem.*` 技能：
-
-| Skill | 作用 |
-|---|---|
-| `/limem.remember` | 保存规则、偏好、事实、决策、笔记或反馈。 |
-| `/limem.recall` | 手动搜索 LiMem 记忆。 |
-| `/limem.list` | 列出当前项目和全局的规则、反馈、偏好。 |
-| `/limem.fix` | 按短 ID 或 event ID 原地修订一条记忆。 |
-| `/limem.no` | 在当前会话临时静音某条召回记忆。 |
-| `/limem.forget` | 归档一条长期记忆。 |
-| `/limem.pause` | 暂停召回与采集。 |
-| `/limem.resume` | 恢复召回与采集。 |
-| `/limem.pattern` | 查看或更新 principal Markdown 档案。 |
-| `/limem.entity` | 管理 user、agent、project、team、service 等 principal。 |
-| `/limem.note` | 保存低优先级笔记。 |
-| `/limem.feedback` | 保存针对 Agent 行为的纠正反馈。 |
-| `/limem.stats` | 查看本地记忆缓存统计。 |
-
----
-
-## MCP 工具
-
-`limem-mcp` 通过 stdio 提供结构化 MCP server。
-
-| 领域 | 工具 |
-|---|---|
-| 查询 | `limem_search`, `limem_list` |
-| 写入 | `limem_write`, `limem_forget`, `limem_fix` |
-| 会话控制 | `limem_pause`, `limem_resume`, `limem_mute` |
-| 诊断 | `limem_ping`, `limem_stats` |
-| Principal 档案 | `limem_pattern_get`, `limem_pattern_put`, `limem_pattern_delete` |
-| Principal 管理 | `limem_principal_list`, `limem_principal_register`, `limem_principal_activate`, `limem_principal_deactivate` |
-| 项目管理 | `limem_project_list` |
-
-MCP 层复用 CLI、Hooks 和写入模块的业务逻辑，不重复拼接后端 HTTP 请求。
-
----
-
-## 召回模型
-
-LiMem Agent Plugin 使用三层召回：
-
-1. **Hard recall**：本地 SQLite 中的高优先级规则、反馈和偏好。
-2. **Pattern recall**：LiMem 后端对 principal Markdown 档案做 H2 section 匹配。
-3. **Task recall**：LiMem 后端 `/recall` 接收 Agent 当前真实任务，返回 Rule / Context / Event 等可直接注入 prompt 的轻量 Markdown。
-
-这些召回在 `UserPromptSubmit` 自动执行，不需要用户手动搜索。Hook 会按当前任务拉取相关记忆，并在同一 session 内跳过已经注入过的 event、pattern 切片和 task recall 文本，避免反复把同一条记忆塞进上下文。
-
-显式搜索仍通过 `/query` 执行 BM25 事件检索，例如 `/limem.recall` 和 `limem_search`。
-
-注入块保持紧凑，并带有来源、预算、项目标识和短 ID：
-
-```xml
-<limem_memory recall="2" via="project:docker | bm25:rebuild" budget="420/2000" project="github.com/org/repo">
-...
-</limem_memory>
-```
-
-每次提交提示词时，`UserPromptSubmit` hook 会通过独立 hook 提示显示本次召回摘要，不把提示混进 Agent 正文；回答结束时，Stop hook 也会尽量给用户显示本轮引用摘要，例如：
-
-```text
-📚 LiMem · 本次引用 2 条记忆：强规则:#aaa111aaa111 不要运行 npm dev；档案:project:demo · 部署
-```
-
-短 ID 可以继续用于 `/limem.no #<id>`、`/limem.fix #<id>` 或 `limem_recent_recalls` 审计。
-
----
-
-## 被动学习
-
-插件可以通过 hooks 收集重复纠正和被接受的工具行为，再由 `limemd` 聚合成候选建议。
-
-设计原则是“建议可见，但不自动污染长期记忆”：
-
-- Hook 只追加轻量事件。
-- Daemon 在后台聚合信号。
-- 候选写入本地 suggestions 队列。
-- 用户通过 `limem dash` 接受、编辑或丢弃。
-- 只有被确认的建议才会写入 LiMem。
-
----
+每条被召回的记忆会带短 ID，方便后续修订、静音或审计。
 
 ## 安全与隐私
 
-- API Key 只保存到 `~/.config/limem/credentials.json`。
-- 凭证文件使用 owner-only 权限。
-- Claude Code / Codex 配置中不写入任何密钥。
-- 写入记忆前会拦截 API key、private key、Bearer token 等敏感信息。
-- Hook 异常会记录日志并吞掉，不能影响用户 prompt。
-- 项目级本地配置默认加入 `.gitignore`。
-- 支持会话级静音和暂停，适合敏感任务。
-- 支持导出，便于审计、迁移和备份。
-
----
+- API Key 保存到 `~/.config/limem/credentials.json`，并使用 owner-only 权限。
+- Claude Code 和 Codex 配置中不写入密钥。
+- 写入记忆前会拦截常见 API key、private key、Bearer token 等敏感信息。
+- Hook 异常会记录日志并降级，不阻塞用户 prompt。
+- 项目级配置写入 `.limem/local.json`，并默认加入 `.gitignore`。
+- 支持会话级暂停和静音，适合临时敏感任务。
 
 ## 开发
 
@@ -376,7 +152,7 @@ ruff check .
 pytest
 ```
 
-调试 hooks：
+本地调试：
 
 ```bash
 echo '{"prompt":"记住这个项目规则"}' | limem hook claude-code UserPromptSubmit
@@ -385,8 +161,6 @@ limem daemon start --foreground
 limem daemon tail --from-start
 ```
 
----
-
 ## 仓库结构
 
 ```text
@@ -394,13 +168,6 @@ limem daemon tail --from-start
 ├── install.sh
 ├── limem-cli/
 │   ├── limem/
-│   │   ├── cli.py
-│   │   ├── client.py
-│   │   ├── hooks.py
-│   │   ├── mcp_server.py
-│   │   ├── memory_writer.py
-│   │   ├── entity_index.py
-│   │   └── daemon/
 │   └── tests/
 ├── plugin-src/
 │   ├── .claude-plugin/
@@ -410,16 +177,12 @@ limem daemon tail --from-start
 └── docs/
 ```
 
----
-
 ## 更多文档
 
 - CLI 详细说明：[limem-cli/README.md](limem-cli/README.md)
 - Agent 开发约定：[CLAUDE.md](CLAUDE.md)
 - 被动学习 PRD：[docs/prd-unobtrusive-memory.md](docs/prd-unobtrusive-memory.md)
 
----
-
 ## License
 
-MIT © 2026 gaooooosh
+MIT (c) 2026 gaooooosh
