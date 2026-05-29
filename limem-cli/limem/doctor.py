@@ -213,6 +213,100 @@ def _check_backend(report: DoctorReport) -> None:
         report.add("backend", "ok", f"{creds.base_url} db={creds.db_id}")
 
 
+def _check_write_health(report: DoctorReport) -> None:
+    """探测激活库写入是否健康。
+
+    对激活库发一次低价值探针 ingest：健康库会返回 ``ignored_`` 前缀的 event_id（不形成
+    真实记忆），损坏库则返回 400 invalid_payload（存储数据二进制污染，写入管线解码崩溃）。
+    若探针意外落库（event_id 非 ignored_ 前缀），best-effort 归档，避免污染。
+    """
+    creds = Credentials.load()
+    if not (creds.api_key and creds.db_id):
+        report.add("write", "skip", "credentials incomplete")
+        return
+    try:
+        from .client import LimemClient, LimemError
+
+        client = LimemClient(creds=creds, timeout=8.0, ingest_timeout=15.0)
+        res = client.ingest({"text": "limem doctor write-probe (safe to ignore)"})
+    except LimemError as e:
+        if e.is_payload_rejected:
+            report.add(
+                "write",
+                "error",
+                f"db={creds.db_id} 写入被拒：{e.message}",
+                "库存储数据损坏：修复后端数据或 `limem db use` 切换到正常库",
+            )
+        else:
+            report.add("write", "warn", f"LiMem {e.status}: {e.message}", "Check API key/db_id")
+        return
+    except Exception as e:  # noqa: BLE001
+        report.add("write", "warn", str(e), "Check network and LIMEM_BASE_URL")
+        return
+    if res.event_id and not res.event_id.startswith("ignored_"):
+        try:
+            client.graph_archive_event(res.event_id)
+        except Exception:  # noqa: BLE001
+            pass
+    report.add("write", "ok", f"db={creds.db_id} 写入正常")
+
+
+def _resolve_install_manager(target: Path) -> str:
+    """根据 limem 真实路径判断它由哪个包管理器安装。"""
+    s = str(target)
+    home = str(Path.home())
+    if f"{home}/.local/share/uv/tools/" in s:
+        return "uv"
+    if f"{home}/.local/share/pipx/venvs/" in s:
+        return "pipx"
+    if f"{home}/.local/share/limem-agent-plugin/venv" in s:
+        return "venv"
+    return "other"
+
+
+def _check_install_integrity(report: DoctorReport) -> None:
+    """检测 limem 命令是否被多个包管理器争抢。
+
+    install.sh 历史上曾用 pipx 安装，后迁移到 uv tool / 自管 venv；三者共用
+    ``~/.local/bin``。若多套安装并存，PATH 命中的可能是旧版本（旧端点），且
+    ``pipx upgrade-all`` 等操作会把命令链接抢回旧装。此处发现并提示清理。
+    """
+    home = Path.home()
+    candidates = {
+        "uv": home / ".local/share/uv/tools/limem-cli",
+        "pipx": home / ".local/share/pipx/venvs/limem-cli",
+        "venv": home / ".local/share/limem-agent-plugin/venv",
+    }
+    present = [name for name, p in candidates.items() if p.exists()]
+
+    active = _command_exists("limem")
+    active_real = active
+    owner = ""
+    if active:
+        try:
+            active_real = str(Path(active).resolve())
+        except OSError:
+            active_real = active
+        owner = _resolve_install_manager(Path(active_real))
+
+    if len(present) <= 1:
+        # 0 或 1 套已知安装：无争抢风险（0 可能是开发态 editable / 系统包）。
+        loc = present[0] if present else owner or "n/a"
+        report.add("install", "ok", f"single install ({loc}), limem -> {active_real or 'n/a'}")
+        return
+
+    others = [m for m in present if m != owner]
+    fix = "仅保留一套以免命令链接被争抢，移除多余安装"
+    if "pipx" in others:
+        fix += "（如 `pipx uninstall limem-cli`，或重跑 install.sh --update 自动清理）"
+    report.add(
+        "install",
+        "warn",
+        f"多个包管理器安装了 limem: {', '.join(present)}; 生效={owner or '未知'} ({active_real})",
+        fix,
+    )
+
+
 def _check_daemon(report: DoctorReport, *, fix: bool) -> None:
     try:
         from . import daemon_client as dc
@@ -572,11 +666,14 @@ def run_doctor(*, fix: bool = False, backend: bool = True) -> DoctorReport:
     report = DoctorReport()
     _check_python(report)
     _check_commands(report, fix=fix)
+    _check_install_integrity(report)
     _check_credentials(report)
     if backend:
         _check_backend(report)
+        _check_write_health(report)
     else:
         report.add("backend", "skip", "backend check disabled")
+        report.add("write", "skip", "backend check disabled")
     _check_daemon(report, fix=fix)
     _check_passive_config(report)
     _check_passive_events(report)

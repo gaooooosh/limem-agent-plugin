@@ -608,6 +608,47 @@ install_pkg_venv() {
 }
 
 # ============================================================
+# cleanup_conflicting_pipx
+# ============================================================
+#
+# 历史包袱：早期 install.sh 用 pipx 安装 limem-cli，后迁移到 uv tool / 自管 venv。
+# 三者共用 $USER_BIN_DIR（uv tool dir --bin 与 PIPX_BIN_DIR 都指向它），会争抢
+# limem / limem-mcp / limemd / limem-statusline 这四个同名命令链接。残留的 pipx 安装
+# 会让 PATH 命中旧版本（旧端点），且 `pipx upgrade-all` 可能把链接重新抢回旧装。
+# 统一安装后端后，在此移除 pipx 下的 limem-cli，保证 $USER_BIN_DIR 单一所有者。
+cleanup_conflicting_pipx() {
+  command -v pipx >/dev/null 2>&1 || return 0
+  pipx list 2>/dev/null | grep -q 'package limem-cli' || return 0
+
+  step "清理历史 pipx 安装（与 uv/venv 争抢 $USER_BIN_DIR）"
+
+  # 仅当生效的 limem 已不指向 pipx venv 时才卸载，避免误删正在使用的二进制。
+  local active pipx_venv
+  active="$(command -v limem 2>/dev/null || true)"
+  [[ -n "$active" ]] && active="$(readlink -f "$active" 2>/dev/null || echo "$active")"
+  pipx_venv="$HOME/.local/share/pipx/venvs/limem-cli"
+
+  case "$active" in
+    "$pipx_venv"/*)
+      warn "当前生效的 limem 仍来自 pipx（$active）；跳过自动卸载以免误删"
+      warn "请重新运行安装脚本并带 --update，让 uv/venv 接管命令链接后再清理"
+      return 0
+      ;;
+  esac
+
+  if pipx uninstall limem-cli >/dev/null 2>&1; then
+    ok "已移除 pipx 下的 limem-cli 残留，$USER_BIN_DIR 现由 ${INSTALL_BACKEND:-uv/venv} 独占"
+  else
+    warn "pipx uninstall limem-cli 失败，可手动执行：pipx uninstall limem-cli"
+  fi
+
+  # 卸载后二次确认 limem 仍可用（pipx 仅会回收指向自身 venv 的链接）。
+  if ! command -v limem >/dev/null 2>&1 && [[ -x "$USER_BIN_DIR/limem" ]]; then
+    export PATH="$USER_BIN_DIR:$PATH"
+  fi
+}
+
+# ============================================================
 # run_init
 # ============================================================
 
@@ -744,6 +785,7 @@ main() {
     select_install_backend
   fi
   install_pkg
+  cleanup_conflicting_pipx
   cleanup_workdir
   trap - EXIT
   run_init

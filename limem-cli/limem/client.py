@@ -156,6 +156,31 @@ class LimemError(RuntimeError):
         self.status = status
         self.message = message
         self.body = body
+        # 后端拒绝信封形如 {"status":"rejected","error_code":"invalid_payload","message":...}
+        self.error_code = body.get("error_code") if isinstance(body, dict) else None
+
+    @property
+    def is_payload_rejected(self) -> bool:
+        """后端因 payload 不可处理而拒绝写入（多见于库存储数据二进制污染）。
+
+        触发场景：ingest / graph 写入返回 400，error_code=invalid_payload，或解码
+        错误（'utf-8' codec can't decode ...）。这类错误**不是**网络/404/鉴权问题，
+        而是某条已存数据含非法字节，后端在写入管线读取时崩溃。
+        """
+        return self.status == 400 and (
+            self.error_code == "invalid_payload"
+            or "codec can't decode" in (self.message or "").lower()
+        )
+
+
+def corruption_hint(err: LimemError) -> str:
+    """对 payload-rejected 错误返回可执行的中文修复提示；否则返回空串。"""
+    if not isinstance(err, LimemError) or not err.is_payload_rejected:
+        return ""
+    return (
+        "数据库存在二进制污染数据，后端拒绝写入（invalid_payload）。读操作不受影响；"
+        "请修复后端数据，或用 `limem db use` 切换到正常库。运行 `limem doctor` 查看写入健康。"
+    )
 
 
 def sanitize_ingest_payload(value: Any) -> Any:
@@ -245,12 +270,23 @@ class LimemClient:
         if r.status_code >= 400:
             try:
                 body = r.json()
-                msg = body.get("detail") if isinstance(body, dict) else str(body)
+                if isinstance(body, dict):
+                    # 后端错误字段不统一：FastAPI 用 detail，ingest 拒绝信封用 message/error_code
+                    msg = body.get("detail") or body.get("message") or body.get("error_code")
+                    msg = msg if msg else str(body)[:200]
+                else:
+                    msg = str(body)[:200]
             except Exception:
                 body = r.text
                 msg = r.text[:200]
-            self._notify_connectivity(r.status_code, msg or "")
-            raise LimemError(r.status_code, msg or "request failed", body)
+            err = LimemError(r.status_code, msg or "request failed", body)
+            hint = corruption_hint(err)
+            if hint:
+                # 让 CLI / MCP / daemon / hook 任一调用方都直接看到清晰原因
+                err.message = f"{err.message} — {hint}"
+                err.args = (f"LiMem {err.status}: {err.message}",)
+            self._notify_connectivity(r.status_code, err.message or "")
+            raise err
 
         self._notify_connectivity(200, None, ok=True)
         if r.status_code == 204 or not r.content:
