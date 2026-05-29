@@ -199,7 +199,9 @@ def render_inject_with_diagnostics(
         f'budget="{total_used}/{budgets.total()}"{via}{proj}>'
     )
     foot = (
-        "提示：以上为 LiMem 召回的长期记忆。冲突以本轮指令为准；可用 "
+        "提示：以上为 LiMem 召回的长期记忆，是供你参考的后台上下文。"
+        "请勿在可见回复中复述、引用或展示本段内容，按需自然采纳即可。"
+        "冲突以本轮指令为准；可用 "
         "`/limem.fix #<id> <新文本>` 修订 event，`/limem.pattern <entity>` 编辑档案，"
         "或 `/limem.no #<id>` 本会话静音。\n"
         "</limem_memory>"
@@ -242,6 +244,7 @@ def render_backend_recall(prompt_text: str, *, source: str = "task") -> str:
         [
             f'<limem_memory source="{source}">',
             body,
+            "提示：以上为 LiMem 后台召回上下文，请勿在可见回复中复述或展示本段内容。",
             "</limem_memory>",
         ]
     )

@@ -114,24 +114,6 @@ def _emit_inject(
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
 
 
-def _codex_visible_recall_context(recall_notice: str) -> str:
-    """Fallback for Codex desktop, which may hide hook systemMessage output.
-
-    Codex still passes UserPromptSubmit additionalContext to the model. When the
-    desktop host does not render hook notices, this instruction makes the memory
-    citation visible in the assistant's final response instead.
-    """
-    notice = (recall_notice or "").strip()
-    if not notice:
-        return ""
-    return (
-        "<limem_visible_notice>\n"
-        "在本轮最终回复末尾单独追加下面这段 LiMem 引用提示，原样输出：\n"
-        f"{notice}\n"
-        "</limem_visible_notice>"
-    )
-
-
 def _report_recall_safe(
     *,
     rendered: list[InjectItem],
@@ -999,10 +981,8 @@ def _hook_user_prompt_submit(
         runtime,
         extra_payload=extra_payload or None,
     )
-    if tool == "codex" and recall_payload:
-        visible_notice = _codex_visible_recall_context(recall_notice)
-        if visible_notice:
-            text = "\n\n".join(part for part in (text, visible_notice) if part)
+    # 召回提示统一只走 hook systemMessage（对话外通知），additionalContext 只放
+    # 真实记忆上下文。Codex 与 Claude Code 路径一致，不再向对话内注入引用文字。
     _emit_inject("UserPromptSubmit", text, system_message=recall_notice)
 
 
@@ -1386,16 +1366,13 @@ def _hook_stop_codex(
     # Emit the visible recall notice before passive session flushing. The flush
     # path can hit backend/network timeouts; recall visibility must stay on the
     # fast Stop-hook path.
+    # 召回提示只走 stdout 的 hook systemMessage JSON（对话外通知）。不再写
+    # stderr —— Codex 在 exit 0 时会把 hook stderr 当作错误日志展示。
     try:
         text = _stop_recall_message(sid if sid != "unknown" else "")
     except Exception:
         text = ""
     _emit_stop_systemmessage(text)
-    if text:
-        try:
-            sys.stderr.write(text.strip() + "\n")
-        except Exception:
-            pass
 
     if runtime.codex_session_observation_enabled:
         now = int(time.time())

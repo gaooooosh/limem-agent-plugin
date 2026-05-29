@@ -161,6 +161,7 @@ class Daemon:
             "auto_init_project": self._h_auto_init_project,
             "report_recall": self._h_report_recall,
             "list_recent_recalls": self._h_list_recent_recalls,
+            "run_learner": self._h_run_learner,
             "seen_recall_keys": self._h_seen_recall_keys,
             "consume_pending_recall": self._h_consume_pending_recall,
             "shutdown": self._h_shutdown,
@@ -475,6 +476,16 @@ class Daemon:
             )
         return out
 
+    async def _h_run_learner(self, p: dict[str, Any]) -> dict[str, Any]:
+        """手动触发一次被动学习（默认 force，降低阈值、忽略去重）。"""
+        force = bool(p.get("force", True))
+        try:
+            count = await self._run_learner_once(force=force)
+        except Exception as e:  # noqa: BLE001
+            _log("run_learner_error", err=str(e))
+            return {"ran": False, "suggestions": 0, "error": str(e)[:120]}
+        return {"ran": True, "suggestions": int(count)}
+
     async def _h_shutdown(self, _p: dict[str, Any]) -> dict[str, Any]:
         self._shutdown.set()
         return {"ok": True}
@@ -648,7 +659,13 @@ class Daemon:
             return
         await self._run_learner_once()
 
-    async def _run_learner_once(self) -> None:
+    async def _run_learner_once(self, *, force: bool = False) -> int:
+        """跑一次被动学习分析；返回本次合并进 pending 的新建议数。
+
+        ``force=True``（手动触发）：阈值降到 1、忽略 batch_hash 去重、**不推进**
+        ``_last_processed_*`` 游标（让正常 idle 路径之后仍能处理同批事件），用于
+        ``limem learn-now`` / dash 主动生成建议。
+        """
         min_events = max(1, int(getattr(self.runtime, "passive_learning_min_events", 1) or 1))
         correction_events = [
             e for e in list(self._correction_buf)
@@ -658,19 +675,25 @@ class Daemon:
             e for e in list(self._post_tool_buf)
             if int(e.get("ts", 0) or 0) > int(getattr(self, "_last_processed_post_tool_ts", 0) or 0)
         ]
-        correction_ready = len(correction_events) >= max(2, min_events)
-        post_tool_ready = len(post_tool_events) >= max(
-            1,
-            int(getattr(self.runtime, "ngram_min_occurrences", 1) or 1),
-        )
+        if force:
+            correction_ready = len(correction_events) >= 1
+            post_tool_ready = len(post_tool_events) >= 1
+            ngram_min = 1
+        else:
+            correction_ready = len(correction_events) >= max(2, min_events)
+            post_tool_ready = len(post_tool_events) >= max(
+                1,
+                int(getattr(self.runtime, "ngram_min_occurrences", 1) or 1),
+            )
+            ngram_min = self.runtime.ngram_min_occurrences
         if not correction_ready and not post_tool_ready:
-            return
+            return 0
         analyzer_correction_events = correction_events if correction_ready else []
         analyzer_post_tool_events = post_tool_events if post_tool_ready else []
         batch_hash = self._passive_batch_hash(correction_events, post_tool_events)
-        if batch_hash in getattr(self, "_active_passive_batch_hashes", set()):
+        if not force and batch_hash in getattr(self, "_active_passive_batch_hashes", set()):
             self._passive_dirty = False
-            return
+            return 0
         # F2
         new = run_correction_analyzer(
             analyzer_correction_events,
@@ -681,7 +704,7 @@ class Daemon:
         new += run_ngram_analyzer(
             analyzer_post_tool_events,
             window_seconds=self.runtime.ngram_window_days * 86400,
-            min_occurrences=self.runtime.ngram_min_occurrences,
+            min_occurrences=ngram_min,
             min_accept_rate=self.runtime.ngram_min_accept_rate,
         )
         for s in new:
@@ -697,14 +720,21 @@ class Daemon:
             merged = archive_old(merged, max_active=self.runtime.suggestions_max_active)
             save_suggestions(merged)
             self.state.suggestion_count = len([s for s in merged if s.get("status") == "pending"])
-        if analyzer_correction_events:
-            self._last_processed_correction_ts = max(int(e.get("ts", 0) or 0) for e in correction_events)
-        if analyzer_post_tool_events:
-            self._last_processed_post_tool_ts = max(int(e.get("ts", 0) or 0) for e in post_tool_events)
-        self._active_passive_batch_hashes.add(batch_hash)
-        self._passive_dirty = False
+        # force 模式不推进游标 / 不锁 batch_hash / 不清 dirty，保留正常路径的处理机会
+        if not force:
+            if analyzer_correction_events:
+                self._last_processed_correction_ts = max(
+                    int(e.get("ts", 0) or 0) for e in correction_events
+                )
+            if analyzer_post_tool_events:
+                self._last_processed_post_tool_ts = max(
+                    int(e.get("ts", 0) or 0) for e in post_tool_events
+                )
+            self._active_passive_batch_hashes.add(batch_hash)
+            self._passive_dirty = False
         if learned:
             self.state.active_memories += learned
+        return len(new)
 
     def _passive_batch_hash(
         self,

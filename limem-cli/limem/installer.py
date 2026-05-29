@@ -19,6 +19,8 @@ from typing import Any
 import tomli_w
 import tomllib
 
+from .config import CODEX_PREV_NOTIFY_PATH
+
 # ---------- 路径常量 ----------
 
 CLAUDE_CONFIG_DIR = Path("~/.claude").expanduser()
@@ -209,11 +211,24 @@ def patch_claude_settings(
     return changed, notes
 
 
+def _limem_notify_command() -> list[str]:
+    """Codex notify 程序命令：优先绝对路径，回退裸 ``limem``。"""
+    limem_bin = shutil.which("limem") or "limem"
+    return [limem_bin, "notify-codex"]
+
+
+def _is_limem_notify(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    return any("notify-codex" in str(x) for x in value)
+
+
 def patch_codex_config(
     config_path: Path = CODEX_CONFIG_PATH,
     *,
     enable_hooks: bool = True,
     enable_mcp: bool = True,
+    enable_notify: bool = True,
 ) -> tuple[bool, list[str]]:
     notes: list[str] = []
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -252,6 +267,30 @@ def patch_codex_config(
             changed = True
             notes.append("codex mcp_servers +limem")
 
+    if enable_notify:
+        existing_notify = data.get("notify")
+        limem_notify = _limem_notify_command()
+        if _is_limem_notify(existing_notify):
+            # 已是 LiMem 包装器：idempotent，不重复备份
+            if existing_notify != limem_notify:
+                data["notify"] = limem_notify
+                changed = True
+                notes.append("codex notify: refreshed limem path")
+        else:
+            # 用户已有非 LiMem notify → 存 sidecar 供链式转发与还原
+            if isinstance(existing_notify, list) and existing_notify:
+                try:
+                    CODEX_PREV_NOTIFY_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    CODEX_PREV_NOTIFY_PATH.write_text(
+                        json.dumps(existing_notify, ensure_ascii=False)
+                    )
+                    notes.append("codex notify: saved user notify → sidecar (chained)")
+                except OSError:
+                    notes.append("codex notify: WARN could not save user notify sidecar")
+            data["notify"] = limem_notify
+            changed = True
+            notes.append("codex notify +limem (desktop toast)")
+
     if changed:
         if config_path.exists():
             bak = config_path.with_suffix(config_path.suffix + ".limem-bak")
@@ -260,6 +299,41 @@ def patch_codex_config(
         config_path.write_text(tomli_w.dumps(data))
 
     return changed, notes
+
+
+def restore_codex_notify(
+    config_path: Path = CODEX_CONFIG_PATH,
+) -> tuple[bool, list[str]]:
+    """卸载用：把 Codex notify 还原为用户原值（sidecar），无 sidecar 则删 notify 键。"""
+    notes: list[str] = []
+    if not config_path.exists():
+        return False, ["codex config not found"]
+    data = tomllib.loads(config_path.read_text())
+    if not _is_limem_notify(data.get("notify")):
+        return False, ["codex notify not managed by limem"]
+
+    prev: Any = None
+    try:
+        prev = json.loads(CODEX_PREV_NOTIFY_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        prev = None
+
+    if isinstance(prev, list) and prev:
+        data["notify"] = prev
+        notes.append("codex notify: restored user notify from sidecar")
+    else:
+        data.pop("notify", None)
+        notes.append("codex notify: removed limem notify")
+
+    bak = config_path.with_suffix(config_path.suffix + ".limem-bak")
+    shutil.copy2(config_path, bak)
+    notes.append(f"backup → {bak.name}")
+    config_path.write_text(tomli_w.dumps(data))
+    try:
+        CODEX_PREV_NOTIFY_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    return True, notes
 
 
 # ---------- Skills 铺设 ----------

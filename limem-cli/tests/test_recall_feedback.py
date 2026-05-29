@@ -110,6 +110,7 @@ def test_render_backend_recall_wraps_prompt_text() -> None:
         '<limem_memory source="task">\n'
         "## Relevant Memory\n"
         "- [Rule] 保持简短\n"
+        "提示：以上为 LiMem 后台召回上下文，请勿在可见回复中复述或展示本段内容。\n"
         "</limem_memory>"
     )
 
@@ -1085,14 +1086,11 @@ def test_emit_inject_can_emit_independent_system_message(capsys) -> None:
     assert "本次引用" not in data["hookSpecificOutput"]["additionalContext"]
 
 
-def test_codex_visible_recall_context_instructs_final_response() -> None:
+def test_codex_visible_recall_context_helper_removed() -> None:
+    """对话内引用注入已彻底移除，辅助函数不应再存在。"""
     from limem import hooks as hmod
 
-    out = hmod._codex_visible_recall_context("> 📚 LiMem\n> 本次引用 1 条记忆")
-
-    assert "<limem_visible_notice>" in out
-    assert "最终回复末尾" in out
-    assert "> 📚 LiMem\n> 本次引用 1 条记忆" in out
+    assert not hasattr(hmod, "_codex_visible_recall_context")
 
 
 def test_emit_stop_systemmessage_writes_json(capsys) -> None:
@@ -1187,8 +1185,9 @@ def test_hook_stop_claude_full_path(monkeypatch, capsys) -> None:
     assert "本次引用 2 条记忆" in data["systemMessage"]
 
 
-def test_hook_stop_codex_stderr_keeps_readable_chinese(monkeypatch, capsys, tmp_path) -> None:
-    """Codex 不识别 stdout JSON 时，stderr 兜底也应保留用户可读的中文摘要。"""
+def test_hook_stop_codex_notice_only_via_stdout_systemmessage(monkeypatch, capsys, tmp_path) -> None:
+    """召回提示只走 stdout 的 systemMessage JSON；不再写 stderr（Codex 会把 hook
+    stderr 当作错误日志展示）。"""
     from limem import hooks as hmod
 
     monkeypatch.setattr(hmod, "SESSIONS_DIR", tmp_path)
@@ -1224,9 +1223,9 @@ def test_hook_stop_codex_stderr_keeps_readable_chinese(monkeypatch, capsys, tmp_
     captured = capsys.readouterr()
     data = json.loads(captured.out)
     assert "本次引用 1 条记忆" in data["systemMessage"]
-    assert "部署后运行 docker:rebuild" in captured.err
-    assert "规则 #abcd00001111" in captured.err
     assert "#abcd00001111" in data["systemMessage"]
+    # 关键：不再向 stderr 写任何内容
+    assert captured.err == ""
 
 
 def test_hook_stop_codex_emits_notice_before_flush(monkeypatch, capsys, tmp_path) -> None:
@@ -1275,7 +1274,8 @@ def test_hook_stop_codex_emits_notice_before_flush(monkeypatch, capsys, tmp_path
     captured = capsys.readouterr()
     data = json.loads(captured.out)
     assert "本次引用 1 条记忆" in data["systemMessage"]
-    assert "部署后运行 docker:rebuild" in captured.err
+    assert "部署后运行 docker:rebuild" in data["systemMessage"]
+    assert captured.err == ""
 
 
 def test_hook_stop_codex_skips_session_flush_by_default(

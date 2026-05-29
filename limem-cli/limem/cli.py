@@ -313,6 +313,8 @@ def update(
 @click.option("--no-backend", is_flag=True, help="跳过后端连通性检查")
 def doctor(fix: bool, no_backend: bool) -> None:
     """自动诊断 LiMem 安装、配置、daemon、凭证与项目初始化状态。"""
+    from rich.markup import escape as rich_escape
+
     from .doctor import run_doctor
 
     report = run_doctor(fix=fix, backend=not no_backend)
@@ -330,11 +332,12 @@ def doctor(fix: bool, no_backend: bool) -> None:
     }
     for check in report.checks:
         style = colors.get(check.status, "white")
+        # 用户级文本必须 escape，避免里面的 [xxx] 被 Rich 当 markup 吞掉。
         t.add_row(
-            check.name,
+            rich_escape(check.name),
             f"[{style}]{check.status}[/{style}]",
-            check.detail,
-            check.fix,
+            rich_escape(check.detail),
+            rich_escape(check.fix),
         )
     console.print(t)
     if report.fixes:
@@ -1251,11 +1254,17 @@ def export(fmt: str, output: str | None, include_tombstoned: bool, no_fill_patte
 
 
 @main.command()
-@click.option("--logs", is_flag=True, help="切换到 logs 视图（tail events.ndjson）")
+@click.option(
+    "--view",
+    type=click.Choice(["recalls", "active", "activity", "suggestions"]),
+    default="recalls",
+    help="启动视图：实时召回 / 活跃记忆 / 活动流 / 待审批建议",
+)
+@click.option("--logs", is_flag=True, help="独立全屏 logs 视图（tail events.ndjson）")
 @click.option("--from-start", is_flag=True, help="logs 模式从头读")
 @click.option("--reset-suggestions", is_flag=True, help="清空 suggestions.json 后退出")
-def dash(logs: bool, from_start: bool, reset_suggestions: bool) -> None:
-    """TUI 面板：状态 + 候选审批 / logs viewer。"""
+def dash(view: str, logs: bool, from_start: bool, reset_suggestions: bool) -> None:
+    """TUI 面板：实时召回 / 活跃记忆 / 活动流 / 候选审批，多视图切换。"""
     from .dash.app import reset_suggestions as do_reset
     from .dash.app import run_dashboard, run_logs
 
@@ -1263,7 +1272,36 @@ def dash(logs: bool, from_start: bool, reset_suggestions: bool) -> None:
         sys.exit(do_reset())
     if logs:
         sys.exit(run_logs(tail=not from_start))
-    sys.exit(run_dashboard())
+    sys.exit(run_dashboard(start_view=view))
+
+
+@main.command("learn-now")
+def learn_now() -> None:
+    """立即触发一次被动学习（force 模式），把近期纠正/工具模式生成为待审批建议。"""
+    from . import daemon_client
+
+    if not daemon_client.ensure_or_spawn():
+        click.echo("daemon 不可达；先运行 `limem daemon start`", err=True)
+        sys.exit(1)
+    res = daemon_client.run_learner(force=True)
+    if not res or not res.get("ran"):
+        err = (res or {}).get("error", "")
+        click.echo(f"学习器未运行{('：' + err) if err else ''}", err=True)
+        sys.exit(1)
+    n = int(res.get("suggestions", 0))
+    click.echo(f"学习完成：新增 {n} 条候选建议。用 `limem dash` 审批。")
+
+
+@main.command("notify-codex", context_settings={"ignore_unknown_options": True})
+@click.argument("payload", nargs=-1, type=click.UNPROCESSED)
+def notify_codex(payload: tuple[str, ...]) -> None:
+    """Codex ``notify`` 程序入口：把本轮记忆召回摘要推送为原生桌面通知。
+
+    Codex 以单个 JSON 字符串作为参数调用本命令；永不非零退出。
+    """
+    from .notify import notify_codex_main
+
+    sys.exit(notify_codex_main(list(payload)))
 
 
 if __name__ == "__main__":

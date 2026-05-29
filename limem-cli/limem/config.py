@@ -37,6 +37,9 @@ SESSION_MUTE_PATH = USER_CACHE_DIR / "session_mute.json"
 RECENT_RECALLS_PATH = USER_CACHE_DIR / "recent_recalls.json"
 PENDING_RECALLS_PATH = USER_CACHE_DIR / "pending_recalls.json"
 
+# Codex notify 包装器 sidecar：保存用户原有 notify 程序，供链式转发与卸载还原。
+CODEX_PREV_NOTIFY_PATH = USER_CACHE_DIR / "codex_prev_notify.json"
+
 PROJECT_CONFIG_FILENAME = ".limem/local.json"
 
 
@@ -147,9 +150,13 @@ class RuntimeConfig:
     events_log_max_age_days: int = 7
     learner_period_seconds: int = 60
     learner_jaccard_threshold: float = 0.4
-    learner_correction_window_hours: int = 24
-    ngram_window_days: int = 7
-    ngram_min_occurrences: int = 5
+    # 被动学习采集窗口与阈值。保守组（当前）= 更少噪声；如需更多建议可调激进组：
+    # learner_correction_window_hours=24 / ngram_window_days=7 / ngram_min_occurrences=5。
+    # 这里放宽窗口并下调 ngram 触发次数，让低频但稳定的模式更容易形成建议；
+    # `limem learn-now` 可随时手动强制生成（force 模式阈值降到 1）。
+    learner_correction_window_hours: int = 48
+    ngram_window_days: int = 14
+    ngram_min_occurrences: int = 3
     ngram_min_accept_rate: float = 0.8
     suggestions_max_active: int = 500
     # PreToolUse / PostToolUse 配对窗口与采集截断（仅在 daemon 内存中使用）

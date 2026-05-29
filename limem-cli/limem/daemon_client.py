@@ -270,6 +270,24 @@ def list_recent_recalls(limit: int = 20) -> list[dict[str, Any]] | None:
     return r if isinstance(r, list) else None
 
 
+def run_learner(force: bool = True) -> dict[str, Any] | None:
+    """手动触发一次被动学习；daemon 不可达返回 None。
+
+    learner 可能做后端 ingest（auto_submit），耗时远超默认 call 超时，故用
+    write 级超时，避免 RPC 在分析中途超时返回 None。
+    """
+    try:
+        runtime = RuntimeConfig.load()
+        return call(
+            "run_learner",
+            {"force": force},
+            connect_timeout_ms=runtime.daemon_connect_timeout_ms,
+            call_timeout_ms=runtime.daemon_write_timeout_ms,
+        )
+    except DaemonUnavailable:
+        return None
+
+
 def seen_recall_keys(session_id: str) -> set[str]:
     """Return memory keys already injected in this session; empty on daemon failure."""
     if not session_id:

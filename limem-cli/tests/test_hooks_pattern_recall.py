@@ -293,10 +293,9 @@ def test_user_prompt_submit_uses_task_recall_not_query(monkeypatch, tmp_path, ca
     assert out["systemMessage"].startswith("> 📚 LiMem\n")
     assert "UserPromptSubmit" not in out["systemMessage"]
     assert "本次引用 1 条记忆" in out["systemMessage"]
-    memory_context, visible_notice = context.split("<limem_visible_notice>", 1)
-    assert "UserPromptSubmit" not in memory_context
-    assert "UserPromptSubmit" not in visible_notice
-    assert "> 📚 LiMem" in visible_notice
+    # 召回提示只走对话外 systemMessage，不再注入对话内 additionalContext。
+    assert "<limem_visible_notice>" not in context
+    assert "UserPromptSubmit" not in context
 
 
 def test_user_prompt_submit_auto_recall_keeps_seen_hard_items_and_task_recall(
@@ -384,9 +383,8 @@ def test_user_prompt_submit_auto_recall_keeps_seen_hard_items_and_task_recall(
     assert out["systemMessage"].startswith("> 📚 LiMem\n")
     assert "UserPromptSubmit" not in out["systemMessage"]
     assert "本次引用 3 条记忆" in out["systemMessage"]
-    memory_context, visible_notice = context.split("<limem_visible_notice>", 1)
-    assert "UserPromptSubmit" not in memory_context
-    assert "UserPromptSubmit" not in visible_notice
-    assert "> 📚 LiMem" in visible_notice
+    # 召回提示只走对话外 systemMessage，不再注入对话内 additionalContext。
+    assert "<limem_visible_notice>" not in context
+    assert "UserPromptSubmit" not in context
     assert len(reports) == 1
     assert [item["src"] for item in reports[0]["items"]] == ["hard", "hard", "task"]

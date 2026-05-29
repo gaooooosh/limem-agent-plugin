@@ -191,3 +191,31 @@ Retry persistence when backend connectivity is healthy; keep local tests coverin
 - Related Files: limem-cli/limem/hooks.py
 
 ---
+## [ERR-20260527-001] local_pytest_missing
+
+**Logged**: 2026-05-27T00:00:00+08:00
+**Priority**: low
+**Status**: pending
+**Area**: tests
+
+### Summary
+The system Python in this workspace does not have pytest installed, so direct `pytest` and `python3 -m pytest` test commands fail.
+
+### Error
+```text
+zsh:1: command not found: pytest
+/usr/bin/python3: No module named pytest
+```
+
+### Context
+- While adding `limem update` and `limem doctor`, the first focused test run used `pytest ...`.
+- `uv` is available at `/home/gaooooosh/.local/bin/uv`, and the project declares pytest in the `dev` extra.
+
+### Suggested Fix
+Use `uv run --extra dev pytest ...` from `limem-cli/` for local verification unless the active shell already has pytest installed.
+
+### Metadata
+- Reproducible: yes
+- Related Files: limem-cli/pyproject.toml
+
+---
